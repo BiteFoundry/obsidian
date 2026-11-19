@@ -1,0 +1,52 @@
+{
+  "name": "@bitefoundry/obsidian",
+  "version": "0.1.0",
+  "description": "Obsidian-native terminal workspace, interactive knowledge graph & AI agent toolkit — Local Vaults, Backlinks, Graph View, CLI, TUI, HTTP API & MCP",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BiteFoundry/obsidian.git"
+  },
+  "license": "MIT",
+  "bin": {
+    "obsidian": "bin/obsidian.js",
+    "obs": "bin/obs.js"
+  },
+  "files": [
+    "bin/obsidian.js",
+    "bin/obs.js",
+    "scripts/postinstall.mjs",
+    "docs/NPM.md",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "obsidian",
+    "obsidian-cli",
+    "obsidian-tui",
+    "obs",
+    "knowledge-graph",
+    "second-brain",
+    "pkm",
+    "markdown",
+    "wikilinks",
+    "backlinks",
+    "cli",
+    "tui",
+    "mcp"
+  ],
+  "scripts": {
+    "postinstall": "node scripts/postinstall.mjs",
+    "sync-version": "node scripts/sync-version.mjs",
+    "build:npm": "node scripts/build-npm.mjs"
+  },
+  "optionalDependencies": {
+    "@bitefoundry/obsidian-win32-x64": "0.1.0",
+    "@bitefoundry/obsidian-win32-arm64": "0.1.0",
+    "@bitefoundry/obsidian-darwin-x64": "0.1.0",
+    "@bitefoundry/obsidian-darwin-arm64": "0.1.0",
+    "@bitefoundry/obsidian-linux-x64": "0.1.0",
+    "@bitefoundry/obsidian-linux-arm64": "0.1.0"
+  }
+}

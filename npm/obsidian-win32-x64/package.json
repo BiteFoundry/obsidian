@@ -1,0 +1,20 @@
+{
+  "name": "@bitefoundry/obsidian-win32-x64",
+  "version": "0.1.0",
+  "description": "Prebuilt obsidian binary for Windows x64",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BiteFoundry/obsidian.git",
+    "directory": "npm/obsidian-win32-x64"
+  },
+  "license": "MIT",
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "bin"
+  ]
+}

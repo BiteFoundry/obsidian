@@ -1,0 +1,137 @@
+openapi: 3.1.0
+info:
+  title: "@bitefoundry/obsidian Local HTTP API"
+  version: "0.1.0"
+  description: Local HTTP JSON API for Obsidian vaults, FTS5 search, backlinks, knowledge graph, tasks, and daily notes (`obsidian serve`, default `:8792`).
+servers:
+  - url: http://127.0.0.1:8792
+paths:
+  /health:
+    get:
+      summary: Service health and active vault status
+      responses:
+        "200":
+          description: Healthy service metadata
+  /api/v1/vaults:
+    get:
+      summary: List auto-discovered and registered Obsidian vaults
+      responses:
+        "200":
+          description: Vault summaries
+  /api/v1/search:
+    get:
+      summary: Full-text FTS5 search with Korean/CJK LIKE fallback
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 25 }
+        - name: vault
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: Matching notes with snippets
+  /api/v1/notes:
+    get:
+      summary: List notes in the vault
+      parameters:
+        - name: folder
+          in: query
+          schema: { type: string }
+        - name: vault
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: Note summaries
+    post:
+      summary: Create a new Markdown note atomically
+      responses:
+        "201":
+          description: Created note
+  /api/v1/notes/{path}:
+    get:
+      summary: Read note Markdown, frontmatter, headings, tasks, backlinks & outgoing links
+      parameters:
+        - name: path
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Note detail
+  /api/v1/notes/append:
+    post:
+      summary: Append Markdown text to an existing note
+      responses:
+        "200":
+          description: Appended successfully
+  /api/v1/daily:
+    post:
+      summary: Open or create today's Daily Note and optionally append text
+      responses:
+        "200":
+          description: Daily note payload
+  /api/v1/backlinks:
+    get:
+      summary: Incoming linked mentions (backlinks) to a note
+      parameters:
+        - name: note
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Backlink entries with context snippets
+  /api/v1/graph:
+    get:
+      summary: Local BFS or global vault knowledge graph
+      parameters:
+        - name: note
+          in: query
+          schema: { type: string }
+        - name: depth
+          in: query
+          schema: { type: integer, default: 2 }
+      responses:
+        "200":
+          description: Graph nodes and edges
+  /api/v1/tags:
+    get:
+      summary: List tags with counts or find notes by tag
+      parameters:
+        - name: tag
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: Tag counts or tagged notes
+  /api/v1/tasks:
+    get:
+      summary: List Markdown checklist tasks
+      parameters:
+        - name: status
+          in: query
+          schema: { type: string, enum: [all, open, done] }
+        - name: note
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: Task entries
+  /api/v1/tasks/toggle:
+    post:
+      summary: Toggle a Markdown checkbox at a 1-based line number
+      responses:
+        "200":
+          description: Updated checkbox state
+  /api/v1/reindex:
+    post:
+      summary: Trigger incremental filesystem scan & SQLite FTS5 reindex
+      responses:
+        "200":
+          description: Index statistics

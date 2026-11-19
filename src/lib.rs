@@ -1,0 +1,13 @@
+pub mod cli;
+pub mod config;
+pub mod daemon;
+pub mod img_preview;
+pub mod mcp;
+pub mod models;
+pub mod serve;
+pub mod storage;
+pub mod sync;
+pub mod tui;
+pub mod ui;
+pub mod updater;
+pub mod vault;
