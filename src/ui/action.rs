@@ -55,6 +55,11 @@ pub enum Action {
     // Note Authoring & Mutations
     OpenQuickAppend,
     OpenNewNoteModal,
+    OpenNoteEditor,
+    SubmitNoteEdit {
+        note_path: String,
+        markdown: String,
+    },
     CreateNoteSubmit {
         title: String,
         folder: String,
@@ -114,6 +119,8 @@ pub enum Action {
     Newline,
     Backspace,
     Delete,
+    Undo,
+    Redo,
     CursorLeft,
     CursorRight,
     CursorUp,

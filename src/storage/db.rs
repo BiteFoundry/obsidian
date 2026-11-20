@@ -143,6 +143,16 @@ impl Storage {
         Ok(())
     }
 
+    /// Marks a single note's cached `mtime_ms` stale so the next `sync_vault` unconditionally re-indexes it.
+    pub fn invalidate_note_mtime(&self, vault_id: &str, rel_path: &str) -> Result<()> {
+        let conn = self.conn.lock().map_err(|_| anyhow!("Storage lock poisoned"))?;
+        conn.execute(
+            "UPDATE notes SET mtime_ms = -1 WHERE vault_id = ?1 AND rel_path = ?2",
+            params![vault_id, rel_path],
+        )?;
+        Ok(())
+    }
+
     /// Incrementally scans `vault.path` comparing `(mtime_ms, size_bytes)` against SQLite.
     /// Parses only added/modified `.md` files, removes deleted notes, and refreshes wikilink resolutions.
     pub fn sync_vault(&self, vault: &VaultProfile) -> Result<IndexStats> {

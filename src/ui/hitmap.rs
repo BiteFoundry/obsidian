@@ -2,7 +2,7 @@
 
 use ratatui::layout::{Position, Rect};
 
-use crate::models::SidebarTab;
+use crate::{models::SidebarTab, ui::app::Focus};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ButtonId {
@@ -18,6 +18,7 @@ pub enum ButtonId {
     ToggleWidth,
     QuickAppend,
     NewNote,
+    EditNote,
     EditExternal,
     LinkExtractor,
     ToggleHrefs,
@@ -33,6 +34,7 @@ pub enum ButtonId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HitTarget {
+    Pane(Focus),
     SidebarTab(SidebarTab),
     SidebarRow(usize),
     CanvasBlock(usize),

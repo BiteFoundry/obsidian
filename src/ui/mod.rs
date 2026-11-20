@@ -44,6 +44,7 @@ pub fn draw(frame: &mut Frame, app: &AppState, ui: &mut UiState) -> HitMap {
     ui.term_height = area.height;
     let mut hitmap = HitMap::new();
     ui.pending_pixel = None;
+    ui.cursor_pos = None;
 
     frame.render_widget(
         Block::default().style(Style::default().bg(ui.theme.bg_canvas).fg(ui.theme.fg)),
@@ -200,7 +201,7 @@ fn draw_workspace(
     frame: &mut Frame,
     area: Rect,
     app: &AppState,
-    ui: &UiState,
+    ui: &mut UiState,
     hitmap: &mut HitMap,
 ) {
     let show_left = ui.show_sidebar && area.width >= 60;
@@ -306,7 +307,7 @@ fn draw_status_bar(
             ("D Daily", Some(ButtonId::OpenDaily)),
             ("a Append", Some(ButtonId::QuickAppend)),
             ("n New", Some(ButtonId::NewNote)),
-            ("e Edit", Some(ButtonId::EditExternal)),
+            ("e Edit", Some(ButtonId::EditNote)),
             ("u Links", Some(ButtonId::LinkExtractor)),
             ("h Hrefs", Some(ButtonId::ToggleHrefs)),
             ("v Img", Some(ButtonId::ImagePreview)),

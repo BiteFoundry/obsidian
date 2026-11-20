@@ -17,6 +17,7 @@ pub enum KeyCommand {
     ToggleWidth,
     ToggleBookmark,
     QuickAppend,
+    EditNote,
     EditExternal,
     NewNote,
     DeleteNote,
@@ -66,6 +67,9 @@ impl KeyMap {
         if ctrl && matches!(key.code, KeyCode::Char('f') | KeyCode::Char('F')) {
             return Some(KeyCommand::OpenFilePicker);
         }
+        if ctrl && matches!(key.code, KeyCode::Char('e') | KeyCode::Char('E')) && !text_input {
+            return Some(KeyCommand::EditExternal);
+        }
         if ctrl && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V')) && !text_input {
             return Some(KeyCommand::PasteClipboard);
         }
@@ -100,7 +104,7 @@ impl KeyMap {
             KeyCode::Char('b') => Some(KeyCommand::ToggleBookmark),
             KeyCode::Char('a') => Some(KeyCommand::QuickAppend),
             KeyCode::Char('n') => Some(KeyCommand::NewNote),
-            KeyCode::Char('e') => Some(KeyCommand::EditExternal),
+            KeyCode::Char('e') => Some(KeyCommand::EditNote),
             KeyCode::Char('X') if shift => Some(KeyCommand::DeleteNote),
             KeyCode::Char('u') => Some(KeyCommand::OpenLinkExtractor),
             KeyCode::Char('h') => Some(KeyCommand::ToggleShowLinkUrls),
@@ -135,7 +139,8 @@ pub const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("D", "Open or create Today's Daily Note"),
             ("Space / x", "Toggle live Markdown checkbox right in the .md file"),
             ("Enter", "Follow [[wikilink]], open note, or jump to heading"),
-            ("a / n / e", "Quick Append / New Note / Edit in $EDITOR"),
+            ("a / n", "Quick Append / New Note"),
+            ("e / Ctrl+E", "Edit note in terminal / Open in external $EDITOR"),
             ("b / w / h", "Toggle Bookmark / Centered-Full Width / Inline Hrefs"),
         ],
     ),

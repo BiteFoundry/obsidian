@@ -50,6 +50,7 @@ pub fn key_to_action(
             KeyCommand::ToggleWidth => Action::TogglePageWidth,
             KeyCommand::ToggleBookmark => Action::ToggleBookmark,
             KeyCommand::QuickAppend => Action::OpenQuickAppend,
+            KeyCommand::EditNote => Action::OpenNoteEditor,
             KeyCommand::EditExternal => Action::RequestExternalEditor,
             KeyCommand::NewNote => Action::OpenNewNoteModal,
             KeyCommand::DeleteNote => Action::ConfirmDeleteNote,
@@ -73,6 +74,19 @@ pub fn key_to_action(
             || ctrl && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S'))
         {
             return Some(Action::OverlaySubmit);
+        }
+        if ctrl && !alt {
+            match key.code {
+                KeyCode::Char('z') | KeyCode::Char('Z') => return Some(Action::Undo),
+                KeyCode::Char('y') | KeyCode::Char('Y') => return Some(Action::Redo),
+                KeyCode::Char('e') | KeyCode::Char('E') => {
+                    return Some(Action::RequestExternalEditor);
+                }
+                KeyCode::Char('v') | KeyCode::Char('V') => {
+                    return Some(Action::PasteClipboard);
+                }
+                _ => {}
+            }
         }
         return match key.code {
             KeyCode::Esc => Some(Action::CloseOverlay),

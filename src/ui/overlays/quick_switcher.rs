@@ -103,6 +103,8 @@ impl QuickSwitcherOverlay {
             ("Open Today's Daily Note", "D", Action::OpenDailyNote),
             ("Interactive HTML Preview", "H", Action::OpenHtmlPreview),
             ("Create New Note", "n", Action::OpenNewNoteModal),
+            ("Edit Active Note in Terminal", "e", Action::OpenNoteEditor),
+            ("Edit Active Note in External $EDITOR", "Ctrl+E", Action::RequestExternalEditor),
             ("Quick Append to Active Note", "a", Action::OpenQuickAppend),
             ("Toggle Right Inspector (Backlinks)", "B", Action::ToggleInspector),
             ("Toggle Left Sidebar", "[", Action::ToggleSidebar),
@@ -155,6 +157,15 @@ impl QuickSwitcherOverlay {
             }
             Action::Input(ch) => {
                 self.query.push(*ch);
+                self.selected = 0;
+                OverlayOutcome::Handled
+            }
+            Action::Paste(text) => {
+                for ch in text.chars() {
+                    if ch != '\r' && ch != '\n' {
+                        self.query.push(ch);
+                    }
+                }
                 self.selected = 0;
                 OverlayOutcome::Handled
             }

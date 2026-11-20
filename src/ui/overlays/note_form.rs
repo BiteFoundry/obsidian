@@ -78,6 +78,17 @@ impl NoteFormOverlay {
                 self.active_buf().push(*ch);
                 OverlayOutcome::Handled
             }
+            Action::Paste(text) => {
+                let multiline = matches!(self.mode, NoteFormMode::QuickAppend { .. });
+                let buf = self.active_buf();
+                for ch in text.chars() {
+                    if ch == '\r' || (!multiline && ch == '\n') {
+                        continue;
+                    }
+                    buf.push(ch);
+                }
+                OverlayOutcome::Handled
+            }
             Action::Newline => {
                 if matches!(self.mode, NoteFormMode::QuickAppend { .. }) {
                     self.text.push('\n');

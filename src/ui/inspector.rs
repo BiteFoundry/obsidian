@@ -28,6 +28,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
         .style(Style::default().bg(theme.bg_sidebar).fg(theme.fg));
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
+    hitmap.add(area, HitTarget::Pane(Focus::Inspector));
 
     if inner.width < 10 || inner.height < 6 {
         return;

@@ -617,9 +617,17 @@ fn test_all_button_ids_registered_and_dispatched_on_mouse_click() {
     assert!(matches!(ui.overlay, Some(Overlay::NoteForm(_))));
     ui.close_overlay();
 
-    // 11. EditExternal
+    // 11. EditNote ([✎ Edit] opens in-terminal NoteEditor, NEVER external editor)
+    //     + EditExternal ([Ext $EDITOR] inside NoteEditor requests external $EDITOR)
     assert!(app.pending_external_editor.is_none());
+    click_button(&mut terminal, &mut app, &mut ui, ButtonId::EditNote);
+    assert!(
+        app.pending_external_editor.is_none(),
+        "[✎ Edit] must open in-terminal editor, not external $EDITOR"
+    );
+    assert!(matches!(ui.overlay, Some(Overlay::NoteEditor(_))));
     click_button(&mut terminal, &mut app, &mut ui, ButtonId::EditExternal);
+    assert!(ui.overlay.is_none());
     assert!(app.pending_external_editor.take().is_some());
 
     // 12. LinkExtractor
@@ -861,4 +869,249 @@ async fn test_html_preview_interactive_quickjs_native_serving_vault_files_and_au
     }
 
     app.html_server.shutdown();
+}
+
+#[test]
+fn test_in_terminal_note_editor_keybindings_save_roundtrip_and_mouse_wheel() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use obsidian_cli::ui::{
+        app::Focus,
+        event::key_to_action,
+        hitmap::{ButtonId, HitTarget},
+        overlays::Overlay,
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("EditorVault");
+    fs::create_dir_all(&root).unwrap();
+    seed_vault(&root);
+
+    // Add a tall note to verify mouse-wheel scrolling on the note reader & editor
+    let long_body = (1..=60)
+        .map(|i| format!("Paragraph {i}: Obsidian Markdown content line"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    fs::write(root.join("Long Note.md"), format!("# Long Note\n\n{long_body}\n")).unwrap();
+
+    let vault = vault_from_dir(&root, Some("EditorVault"));
+    let mut cfg = AppConfig::default();
+    cfg.upsert_vault(vault.clone(), true);
+
+    let storage = Storage::open_in_memory().unwrap();
+    storage.sync_vault(&vault).unwrap();
+
+    let (focus_tx, _focus_rx) = watch::channel(FocusTarget::default());
+    let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel::<SyncCommand>();
+    let sync_ctrl = SyncController::from_channels(focus_tx, cmd_tx);
+
+    let mut app = AppState::new(cfg.clone(), vault, storage, sync_ctrl);
+    let mut ui = UiState::from_config(&cfg);
+    app.reload_from_storage(&mut ui);
+    app.open_note(&mut ui, "Projects/Q4 Architecture RFC.md", false);
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 34)).unwrap();
+
+    // 1. Pressing `e` opens in-terminal NoteEditorOverlay (NOT external editor)
+    let act_e = key_to_action(
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+        ui.focus,
+        ui.canvas_mode,
+        &ui.keymap,
+        ui.is_text_input_active(),
+    )
+    .expect("'e' should map to OpenNoteEditor");
+    assert_eq!(act_e, Action::OpenNoteEditor);
+    app.dispatch(act_e, &mut ui);
+    assert!(
+        app.pending_external_editor.is_none(),
+        "'e' must never launch external editor"
+    );
+    assert!(matches!(ui.overlay, Some(Overlay::NoteEditor(_))));
+    assert!(ui.is_text_input_active());
+
+    // 2. Navigate past YAML frontmatter into Markdown body, then edit with UTF-8 / Korean,
+    //    Enter newline, Tab (2 spaces), Paste, Ctrl+Z undo, Ctrl+Y redo
+    for _ in 0..7 {
+        app.dispatch(Action::MoveDown, &mut ui);
+    }
+    app.dispatch(Action::CursorEnd, &mut ui);
+    app.dispatch(Action::Activate, &mut ui);
+    app.dispatch(Action::Tab, &mut ui);
+    for ch in "한글 노트 편집X".chars() {
+        app.dispatch(Action::Input(ch), &mut ui);
+    }
+
+    let act_undo = key_to_action(
+        KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL),
+        ui.focus,
+        ui.canvas_mode,
+        &ui.keymap,
+        ui.is_text_input_active(),
+    )
+    .expect("Ctrl+Z should map to Undo in NoteEditor");
+    assert_eq!(act_undo, Action::Undo);
+    app.dispatch(act_undo, &mut ui);
+
+    let act_redo = key_to_action(
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+        ui.focus,
+        ui.canvas_mode,
+        &ui.keymap,
+        ui.is_text_input_active(),
+    )
+    .expect("Ctrl+Y should map to Redo in NoteEditor");
+    assert_eq!(act_redo, Action::Redo);
+    app.dispatch(act_redo, &mut ui);
+    app.dispatch(Action::Undo, &mut ui); // remove trailing 'X'
+
+    app.dispatch(Action::Paste("\n#edited_in_tui\n- [ ] 새 작업".into()), &mut ui);
+
+    // Render editor and verify cursor_pos, pills, and mouse-wheel scrolling
+    terminal
+        .draw(|f| {
+            let _ = ui::draw(f, &app, &mut ui);
+        })
+        .unwrap();
+    assert!(ui.cursor_pos.is_some());
+    assert!(ui
+        .last_hitmap
+        .region_of(HitTarget::Button(ButtonId::ConfirmOk))
+        .is_some());
+    assert!(ui
+        .last_hitmap
+        .region_of(HitTarget::Button(ButtonId::EditExternal))
+        .is_some());
+    assert!(ui
+        .last_hitmap
+        .region_of(HitTarget::Button(ButtonId::ConfirmCancel))
+        .is_some());
+
+    // 3. Ctrl+S saves directly to disk, re-indexes vault, updates reader pane, closes overlay, shows toast
+    let act_save = key_to_action(
+        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+        ui.focus,
+        ui.canvas_mode,
+        &ui.keymap,
+        ui.is_text_input_active(),
+    )
+    .expect("Ctrl+S should map to OverlaySubmit in NoteEditor");
+    assert_eq!(act_save, Action::OverlaySubmit);
+    app.dispatch(act_save, &mut ui);
+
+    assert!(ui.overlay.is_none(), "Ctrl+S must close NoteEditorOverlay");
+    assert!(app.pending_external_editor.is_none());
+
+    let disk_content = fs::read_to_string(root.join("Projects/Q4 Architecture RFC.md")).unwrap();
+    assert!(disk_content.contains("  한글 노트 편집"));
+    assert!(disk_content.contains("#edited_in_tui"));
+    assert!(disk_content.contains("- [ ] 새 작업"));
+
+    let active = app.active_note.as_ref().unwrap();
+    assert!(active.raw_markdown.contains("한글 노트 편집"));
+    assert!(active.summary.tags.iter().any(|t| t == "edited_in_tui"));
+    assert!(app.tags.iter().any(|t| t.tag == "edited_in_tui"));
+    assert!(ui
+        .toasts
+        .current()
+        .is_some_and(|t| t.message.contains("Saved Projects/Q4 Architecture RFC.md")));
+
+    // 4. Ctrl+E requests external $EDITOR
+    let act_ctrl_e = key_to_action(
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+        ui.focus,
+        ui.canvas_mode,
+        &ui.keymap,
+        ui.is_text_input_active(),
+    )
+    .expect("Ctrl+E should map to RequestExternalEditor");
+    assert_eq!(act_ctrl_e, Action::RequestExternalEditor);
+    app.dispatch(act_ctrl_e, &mut ui);
+    let ext_path = app
+        .pending_external_editor
+        .take()
+        .expect("Ctrl+E must queue pending_external_editor");
+    assert!(ext_path.ends_with("Q4 Architecture RFC.md"));
+
+    // 5. Mouse wheel works on Note Reader, Sidebar, and NoteEditorOverlay
+    app.open_note(&mut ui, "Long Note.md", false);
+    ui.focus = Focus::Canvas;
+    terminal
+        .draw(|f| {
+            let _ = ui::draw(f, &app, &mut ui);
+        })
+        .unwrap();
+    let canvas_rect = ui
+        .last_hitmap
+        .region_of(HitTarget::Pane(Focus::Canvas))
+        .expect("Canvas pane registered");
+    let sidebar_rect = ui
+        .last_hitmap
+        .region_of(HitTarget::Pane(Focus::Sidebar))
+        .expect("Sidebar pane registered");
+
+    // Wheel over Note Reader scrolls canvas_scroll
+    assert_eq!(ui.canvas_scroll, 0);
+    app.dispatch(
+        Action::MouseScrollDown {
+            col: canvas_rect.x + 2,
+            row: canvas_rect.y + 4,
+        },
+        &mut ui,
+    );
+    assert_eq!(ui.canvas_scroll, 3);
+    app.dispatch(
+        Action::MouseScrollUp {
+            col: canvas_rect.x + 2,
+            row: canvas_rect.y + 4,
+        },
+        &mut ui,
+    );
+    assert_eq!(ui.canvas_scroll, 0);
+
+    // Wheel over Sidebar scrolls sidebar_selected even while Focus::Canvas is active
+    ui.sidebar_selected = 0;
+    app.dispatch(
+        Action::MouseScrollDown {
+            col: sidebar_rect.x + 2,
+            row: sidebar_rect.y + 4,
+        },
+        &mut ui,
+    );
+    assert_eq!(ui.sidebar_selected, 1);
+    app.dispatch(
+        Action::MouseScrollUp {
+            col: sidebar_rect.x + 2,
+            row: sidebar_rect.y + 4,
+        },
+        &mut ui,
+    );
+    assert_eq!(ui.sidebar_selected, 0);
+
+    // Wheel inside NoteEditorOverlay scrolls editor viewport
+    app.dispatch(Action::OpenNoteEditor, &mut ui);
+    terminal
+        .draw(|f| {
+            let _ = ui::draw(f, &app, &mut ui);
+        })
+        .unwrap();
+    app.dispatch(Action::MouseScrollDown { col: 50, row: 15 }, &mut ui);
+    terminal
+        .draw(|f| {
+            let _ = ui::draw(f, &app, &mut ui);
+        })
+        .unwrap();
+    match ui.overlay {
+        Some(Overlay::NoteEditor(ref ed)) => assert_eq!(ed.scroll_y, 3),
+        ref other => panic!("expected NoteEditor, got {other:?}"),
+    }
+    app.dispatch(Action::MouseScrollUp { col: 50, row: 15 }, &mut ui);
+    terminal
+        .draw(|f| {
+            let _ = ui::draw(f, &app, &mut ui);
+        })
+        .unwrap();
+    match ui.overlay {
+        Some(Overlay::NoteEditor(ref ed)) => assert_eq!(ed.scroll_y, 0),
+        ref other => panic!("expected NoteEditor, got {other:?}"),
+    }
 }

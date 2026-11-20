@@ -10,7 +10,7 @@ use bitefoundry_html::{sniff_content_kind, ContentKind, NativeHtmlServer};
 use chrono::Local;
 
 use crate::{
-    config::{AppConfig, DensityMode, PageWidthMode, VaultProfile},
+    config::{write_atomic, AppConfig, DensityMode, PageWidthMode, VaultProfile},
     img_preview::{
         decode_and_render_for_protocol, decode_and_render_halfblocks, detect_graphics_caps,
         RenderedTerminalImage, TerminalGraphicsCaps, TerminalImageProtocol,
@@ -34,6 +34,7 @@ use crate::{
             html_preview::{extract_note_html_candidates, HtmlPreviewOverlay},
             image_preview::ImagePreviewOverlay,
             links::LinkExtractorOverlay,
+            note_editor::NoteEditorOverlay,
             note_form::NoteFormOverlay,
             quick_switcher::QuickSwitcherOverlay,
             settings::SettingsOverlay,
@@ -113,6 +114,7 @@ pub struct UiState {
     pub active_tag_filter: Option<String>,
     pub canvas_selected_block: usize,
     pub canvas_scroll: usize,
+    pub canvas_follow_selected: bool,
     pub graph_global: bool,
     pub graph_depth: usize,
     pub graph_selected: usize,
@@ -122,6 +124,7 @@ pub struct UiState {
     pub toasts: ToastQueue,
     pub keymap: KeyMap,
     pub pending_pixel: Option<PendingPixelGraphic>,
+    pub cursor_pos: Option<(u16, u16)>,
     pub term_width: u16,
     pub term_height: u16,
     pub should_quit: bool,
@@ -146,6 +149,7 @@ impl UiState {
             active_tag_filter: None,
             canvas_selected_block: 0,
             canvas_scroll: 0,
+            canvas_follow_selected: true,
             graph_global: false,
             graph_depth: 2,
             graph_selected: 0,
@@ -155,6 +159,7 @@ impl UiState {
             toasts: ToastQueue::new(),
             keymap: KeyMap,
             pending_pixel: None,
+            cursor_pos: None,
             term_width: 120,
             term_height: 34,
             should_quit: false,
@@ -497,6 +502,7 @@ impl AppState {
                 ui.canvas_mode = CanvasMode::Note;
                 ui.canvas_selected_block = 0;
                 ui.canvas_scroll = 0;
+                ui.canvas_follow_selected = true;
                 ui.inspector_selected = 0;
                 self.refresh_graph(ui);
             }
@@ -567,16 +573,15 @@ impl AppState {
                     }
                     OverlayOutcome::NotHandled => {
                         ui.overlay = Some(ov);
-                        Some(action.clone())
+                        matches!(action, Action::Quit | Action::QuitConfirm)
+                            .then(|| action.clone())
                     }
                 }
             } else {
                 None
             };
             if let Some(next_act) = outcome {
-                if next_act != action || matches!(next_act, Action::Quit | Action::QuitConfirm) {
-                    self.dispatch_core(next_act, ui);
-                }
+                self.dispatch_core(next_act, ui);
             }
             return;
         }
@@ -666,7 +671,7 @@ impl AppState {
                         }
                     } else {
                         ui.canvas_selected_block = ui.canvas_selected_block.saturating_sub(1);
-                        ui.canvas_scroll = 0;
+                        ui.canvas_follow_selected = true;
                     }
                 }
                 Focus::Inspector => {
@@ -691,7 +696,7 @@ impl AppState {
                     } else if let Some(d) = &self.active_note {
                         let max_b = d.parsed.blocks.len().saturating_sub(1);
                         ui.canvas_selected_block = (ui.canvas_selected_block + 1).min(max_b);
-                        ui.canvas_scroll = 0;
+                        ui.canvas_follow_selected = true;
                     }
                 }
                 Focus::Inspector => {
@@ -706,10 +711,12 @@ impl AppState {
             },
 
             Action::PageUp => {
+                ui.canvas_follow_selected = false;
                 ui.canvas_scroll = ui.canvas_scroll.saturating_sub(10);
                 ui.canvas_selected_block = ui.canvas_selected_block.saturating_sub(5);
             }
             Action::PageDown => {
+                ui.canvas_follow_selected = false;
                 ui.canvas_scroll = ui.canvas_scroll.saturating_add(10);
                 if let Some(d) = &self.active_note {
                     let max_b = d.parsed.blocks.len().saturating_sub(1);
@@ -719,10 +726,12 @@ impl AppState {
             Action::JumpTop => {
                 ui.canvas_selected_block = 0;
                 ui.canvas_scroll = 0;
+                ui.canvas_follow_selected = true;
             }
             Action::JumpBottom => {
                 if let Some(d) = &self.active_note {
                     ui.canvas_selected_block = d.parsed.blocks.len().saturating_sub(1);
+                    ui.canvas_follow_selected = true;
                 }
             }
 
@@ -891,6 +900,7 @@ impl AppState {
                         ui.canvas_mode = CanvasMode::Note;
                         ui.canvas_selected_block = idx;
                         ui.canvas_scroll = 0;
+                        ui.canvas_follow_selected = true;
                         ui.focus = Focus::Canvas;
                     }
                 }
@@ -933,6 +943,48 @@ impl AppState {
                     .unwrap_or_default();
                 ui.open_overlay(Overlay::NoteForm(NoteFormOverlay::new_note(default_folder)));
             }
+            Action::OpenNoteEditor => {
+                if let Some(d) = &self.active_note {
+                    let rel_path = d.summary.rel_path.clone();
+                    let title = d.summary.title.clone();
+                    let raw = safe_vault_path(&self.active_vault.path, &rel_path)
+                        .ok()
+                        .and_then(|abs| fs::read_to_string(&abs).ok())
+                        .unwrap_or_else(|| d.raw_markdown.clone());
+                    ui.open_overlay(Overlay::NoteEditor(NoteEditorOverlay::new(
+                        rel_path, title, raw,
+                    )));
+                } else {
+                    ui.toasts.info("Open a note to edit");
+                }
+            }
+            Action::SubmitNoteEdit {
+                note_path,
+                markdown,
+            } => match safe_vault_path(&self.active_vault.path, &note_path) {
+                Ok(abs) => {
+                    let existing_crlf = fs::read_to_string(&abs)
+                        .map(|s| s.contains("\r\n"))
+                        .unwrap_or(false);
+                    let out = if existing_crlf {
+                        markdown.replace("\r\n", "\n").replace('\n', "\r\n")
+                    } else {
+                        markdown
+                    };
+                    match write_atomic(&abs, out.as_bytes()) {
+                        Ok(()) => {
+                            let _ = self
+                                .storage
+                                .invalidate_note_mtime(&self.active_vault.id, &note_path);
+                            let _ = self.storage.sync_vault(&self.active_vault);
+                            self.reload_from_storage(ui);
+                            ui.toasts.success(format!("Saved {note_path}"));
+                        }
+                        Err(e) => ui.toasts.error(format!("Save failed: {e}")),
+                    }
+                }
+                Err(e) => ui.toasts.error(format!("Invalid note path: {e}")),
+            },
             Action::CreateNoteSubmit {
                 title,
                 folder,
@@ -1035,32 +1087,46 @@ impl AppState {
                     }
                 }
             }
-            Action::PasteClipboard => match read_clipboard_image_png() {
-                Ok(Some((filename, bytes))) => {
-                    let name = if filename.trim().is_empty() {
-                        format!("pasted-{}.png", Local::now().format("%Y%m%d-%H%M%S"))
-                    } else {
-                        filename
-                    };
-                    match save_vault_attachment(&self.active_vault, &name, &bytes) {
-                        Ok((saved_name, _)) => {
-                            if let Some(d) = &self.active_note {
-                                if let Ok(abs) =
-                                    safe_vault_path(&self.active_vault.path, &d.summary.rel_path)
-                                {
-                                    let _ = append_to_note(&abs, &format!("\n![[{saved_name}]]"));
-                                    let _ = self.storage.sync_vault(&self.active_vault);
-                                    self.reload_from_storage(ui);
-                                    ui.toasts.success(format!("Pasted ![[{saved_name}]]"));
+            Action::PasteClipboard => {
+                if let Some(Overlay::NoteEditor(ref mut ed)) = ui.overlay {
+                    match arboard::Clipboard::new().and_then(|mut cb| cb.get_text()) {
+                        Ok(text) if !text.is_empty() => {
+                            ed.handle(&Action::Paste(text));
+                        }
+                        Ok(_) => ui.toasts.info("Clipboard is empty"),
+                        Err(e) => ui.toasts.warning(format!("Clipboard error: {e}")),
+                    }
+                } else {
+                    match read_clipboard_image_png() {
+                        Ok(Some((filename, bytes))) => {
+                            let name = if filename.trim().is_empty() {
+                                format!("pasted-{}.png", Local::now().format("%Y%m%d-%H%M%S"))
+                            } else {
+                                filename
+                            };
+                            match save_vault_attachment(&self.active_vault, &name, &bytes) {
+                                Ok((saved_name, _)) => {
+                                    if let Some(d) = &self.active_note {
+                                        if let Ok(abs) = safe_vault_path(
+                                            &self.active_vault.path,
+                                            &d.summary.rel_path,
+                                        ) {
+                                            let _ =
+                                                append_to_note(&abs, &format!("\n![[{saved_name}]]"));
+                                            let _ = self.storage.sync_vault(&self.active_vault);
+                                            self.reload_from_storage(ui);
+                                            ui.toasts.success(format!("Pasted ![[{saved_name}]]"));
+                                        }
+                                    }
                                 }
+                                Err(e) => ui.toasts.error(format!("Clipboard save failed: {e}")),
                             }
                         }
-                        Err(e) => ui.toasts.error(format!("Clipboard save failed: {e}")),
+                        Ok(None) => ui.toasts.info("No image found in clipboard"),
+                        Err(e) => ui.toasts.warning(format!("Clipboard error: {e}")),
                     }
                 }
-                Ok(None) => ui.toasts.info("No image found in clipboard"),
-                Err(e) => ui.toasts.warning(format!("Clipboard error: {e}")),
-            },
+            }
 
             Action::OpenLinkExtractor => {
                 if let Some(d) = &self.active_note {
@@ -1269,21 +1335,60 @@ impl AppState {
             Action::MouseScrollUp { col, row } => {
                 if ui.overlay.is_none()
                     && ui.canvas_mode == CanvasMode::Graph
-                    && ui.graph_sim.canvas_area.get().contains(ratatui::layout::Position::new(col, row))
+                    && ui
+                        .graph_sim
+                        .canvas_area
+                        .get()
+                        .contains(ratatui::layout::Position::new(col, row))
                 {
                     ui.graph_sim.zoom_by(1.14);
                 } else {
-                    self.dispatch_core(Action::MoveUp, ui);
+                    match self.scroll_pane_at(col, row, ui) {
+                        Focus::Sidebar => {
+                            ui.sidebar_selected = ui.sidebar_selected.saturating_sub(1);
+                        }
+                        Focus::Inspector => {
+                            ui.inspector_selected = ui.inspector_selected.saturating_sub(1);
+                        }
+                        Focus::Canvas | Focus::Overlay => {
+                            ui.canvas_follow_selected = false;
+                            ui.canvas_scroll = ui.canvas_scroll.saturating_sub(3);
+                        }
+                    }
                 }
             }
             Action::MouseScrollDown { col, row } => {
                 if ui.overlay.is_none()
                     && ui.canvas_mode == CanvasMode::Graph
-                    && ui.graph_sim.canvas_area.get().contains(ratatui::layout::Position::new(col, row))
+                    && ui
+                        .graph_sim
+                        .canvas_area
+                        .get()
+                        .contains(ratatui::layout::Position::new(col, row))
                 {
                     ui.graph_sim.zoom_by(1.0 / 1.14);
                 } else {
-                    self.dispatch_core(Action::MoveDown, ui);
+                    match self.scroll_pane_at(col, row, ui) {
+                        Focus::Sidebar => {
+                            let len = build_sidebar_entries(self, ui).len();
+                            if len > 0 {
+                                ui.sidebar_selected = (ui.sidebar_selected + 1).min(len - 1);
+                            }
+                        }
+                        Focus::Inspector => {
+                            if let Some(d) = &self.active_note {
+                                let total = d.backlinks.len() + d.outgoing_links.len();
+                                if total > 0 {
+                                    ui.inspector_selected =
+                                        (ui.inspector_selected + 1).min(total - 1);
+                                }
+                            }
+                        }
+                        Focus::Canvas | Focus::Overlay => {
+                            ui.canvas_follow_selected = false;
+                            ui.canvas_scroll = ui.canvas_scroll.saturating_add(3);
+                        }
+                    }
                 }
             }
 
@@ -1350,7 +1455,56 @@ impl AppState {
         }
     }
 
+    fn scroll_pane_at(&self, col: u16, row: u16, ui: &UiState) -> Focus {
+        match ui.last_hitmap.hit(row, col) {
+            Some(
+                HitTarget::SidebarTab(_)
+                | HitTarget::SidebarRow(_)
+                | HitTarget::Pane(Focus::Sidebar),
+            ) => Focus::Sidebar,
+            Some(
+                HitTarget::InspectorBacklink(_)
+                | HitTarget::InspectorOutgoing(_)
+                | HitTarget::Pane(Focus::Inspector),
+            ) => Focus::Inspector,
+            Some(
+                HitTarget::CanvasBlock(_)
+                | HitTarget::TaskCheckbox { .. }
+                | HitTarget::WikilinkBlock(_)
+                | HitTarget::ImageChip(_)
+                | HitTarget::HtmlChip(_)
+                | HitTarget::GraphCanvas
+                | HitTarget::GraphNode(_)
+                | HitTarget::Pane(Focus::Canvas),
+            ) => Focus::Canvas,
+            _ => match ui.focus {
+                Focus::Sidebar => Focus::Sidebar,
+                Focus::Inspector => Focus::Inspector,
+                _ => Focus::Canvas,
+            },
+        }
+    }
+
     fn handle_mouse_click(&mut self, col: u16, row: u16, ui: &mut UiState) {
+        if matches!(ui.overlay, Some(Overlay::NoteEditor(_))) {
+            match ui.last_hitmap.hit(row, col) {
+                Some(HitTarget::Button(ButtonId::ConfirmOk)) => {
+                    self.dispatch(Action::OverlaySubmit, ui);
+                }
+                Some(HitTarget::Button(ButtonId::EditExternal)) => {
+                    self.dispatch(Action::RequestExternalEditor, ui);
+                }
+                Some(HitTarget::Button(ButtonId::ConfirmCancel)) => {
+                    self.dispatch(Action::CloseOverlay, ui);
+                }
+                Some(HitTarget::OverlayBody) => {}
+                _ => {
+                    self.dispatch(Action::CloseOverlay, ui);
+                }
+            }
+            return;
+        }
+
         if matches!(ui.overlay, Some(Overlay::HtmlPreview(_))) {
             match ui.last_hitmap.hit(row, col) {
                 Some(HitTarget::Button(ButtonId::ConfirmCancel)) => {
@@ -1410,6 +1564,11 @@ impl AppState {
             return;
         };
         match target {
+            HitTarget::Pane(focus) => {
+                if focus != Focus::Overlay {
+                    ui.focus = focus;
+                }
+            }
             HitTarget::SidebarTab(tab) => self.dispatch_core(Action::SetSidebarTab(tab), ui),
             HitTarget::SidebarRow(idx) => {
                 ui.focus = Focus::Sidebar;
@@ -1488,7 +1647,8 @@ impl AppState {
                 ButtonId::ToggleWidth => self.dispatch_core(Action::TogglePageWidth, ui),
                 ButtonId::QuickAppend => self.dispatch_core(Action::OpenQuickAppend, ui),
                 ButtonId::NewNote => self.dispatch_core(Action::OpenNewNoteModal, ui),
-                ButtonId::EditExternal => self.dispatch_core(Action::RequestExternalEditor, ui),
+                ButtonId::EditNote => self.dispatch_core(Action::OpenNoteEditor, ui),
+                ButtonId::EditExternal => self.dispatch(Action::RequestExternalEditor, ui),
                 ButtonId::LinkExtractor => self.dispatch_core(Action::OpenLinkExtractor, ui),
                 ButtonId::ToggleHrefs => self.dispatch_core(Action::ToggleShowLinkUrls, ui),
                 ButtonId::ImagePreview => self.dispatch_core(Action::OpenImagePreview, ui),

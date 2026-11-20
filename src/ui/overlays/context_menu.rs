@@ -54,8 +54,13 @@ impl ContextMenuOverlay {
                 action: Action::OpenNewNoteModal,
             },
             ContextMenuItem {
-                label: "Edit in $EDITOR".into(),
+                label: "Edit Note in Terminal".into(),
                 shortcut: "e".into(),
+                action: Action::OpenNoteEditor,
+            },
+            ContextMenuItem {
+                label: "Edit in External $EDITOR".into(),
+                shortcut: "Ctrl+E".into(),
                 action: Action::RequestExternalEditor,
             },
             ContextMenuItem {
@@ -131,7 +136,7 @@ impl ContextMenuOverlay {
 
     pub fn draw(&self, frame: &mut Frame, area: Rect, ui: &UiState, hitmap: &mut HitMap) {
         let theme = &ui.theme;
-        let w = 36u16.min(area.width.saturating_sub(2));
+        let w = 39u16.min(area.width.saturating_sub(2));
         let h = (self.items.len() as u16 + 2).min(area.height.saturating_sub(2));
         let x = self.col.min(area.x + area.width.saturating_sub(w));
         let y = self.row.min(area.y + area.height.saturating_sub(h));
@@ -162,7 +167,7 @@ impl ContextMenuOverlay {
                     Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    format!("{:<22}", it.label),
+                    format!("{:<25}", it.label),
                     Style::default()
                         .fg(theme.fg_primary)
                         .add_modifier(if is_sel { Modifier::BOLD } else { Modifier::empty() }),

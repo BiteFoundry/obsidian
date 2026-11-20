@@ -28,6 +28,9 @@ struct Snapshot {
     cursor: usize,
 }
 
+/// Alias used by full-screen in-terminal Markdown editors (e.g. `NoteEditorOverlay`).
+pub type MultiLineComposer = ComposerState;
+
 #[derive(Debug, Clone)]
 pub struct ComposerState {
     text: String,
@@ -445,6 +448,12 @@ impl ComposerState {
         self.text.split('\n').count().max(1)
     }
 
+    /// Returns 1-based `(line, column)` of the cursor in logical lines/characters.
+    pub fn cursor_line_col(&self) -> (usize, usize) {
+        let (line, col) = line_col(&self.text, self.cursor);
+        (line + 1, col + 1)
+    }
+
     /// Renders the multiline soft-wrapped editor into `area`, returning the terminal cursor `(x, y)` when `focused`.
     pub fn draw_editor(
         &mut self,
@@ -549,7 +558,7 @@ pub fn save_clipboard_rgba_to_temp_png(
     Ok((path, png_bytes))
 }
 
-fn push_line_spans(
+pub(crate) fn push_line_spans(
     lines: &mut Vec<Line<'static>>,
     text: &str,
     start: usize,

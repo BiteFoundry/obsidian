@@ -38,12 +38,13 @@ struct RenderedLine {
     bg_override: Option<ratatui::style::Color>,
 }
 
-pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap: &mut HitMap) {
-    let theme = &ui.theme;
+pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiState, hitmap: &mut HitMap) {
+    let theme = ui.theme.clone();
     frame.render_widget(
         Block::default().style(Style::default().bg(theme.bg_canvas)),
         area,
     );
+    hitmap.add(area, HitTarget::Pane(Focus::Canvas));
 
     let Some(detail) = app.active_note.as_ref() else {
         let msg = vec![
@@ -88,11 +89,12 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
         .canvas_selected_block
         .min(detail.parsed.blocks.len().saturating_sub(1));
 
-    let lines = build_canvas_lines(detail, app, ui, theme, width, selected_block, focused);
+    let lines = build_canvas_lines(detail, app, ui, &theme, width, selected_block, focused);
 
     // Find visual line of the selected block so scrolling follows selection smoothly
     let total_lines = lines.len();
     let visible = content_area.height as usize;
+    let max_scroll = total_lines.saturating_sub(visible);
     let selected_visual_row = lines
         .iter()
         .position(|rl| rl.block_idx == Some(selected_block))
@@ -100,15 +102,16 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
 
     let scroll = if total_lines <= visible {
         0
-    } else if ui.canvas_scroll > 0 {
-        ui.canvas_scroll.min(total_lines.saturating_sub(visible))
+    } else if !ui.canvas_follow_selected {
+        ui.canvas_scroll.min(max_scroll)
     } else if selected_visual_row >= visible.saturating_sub(4) {
         selected_visual_row
             .saturating_sub(visible / 2)
-            .min(total_lines.saturating_sub(visible))
+            .min(max_scroll)
     } else {
         0
     };
+    ui.canvas_scroll = scroll;
 
     for (i, rl) in lines.iter().skip(scroll).take(visible).enumerate() {
         let y = content_area.y + i as u16;
@@ -210,7 +213,7 @@ fn build_canvas_lines(
             (width_label.to_string(), ui.page_width == PageWidthMode::Full, ButtonId::ToggleWidth),
             ("[a Append]".to_string(), false, ButtonId::QuickAppend),
             ("[n New]".to_string(), false, ButtonId::NewNote),
-            ("[e Edit]".to_string(), false, ButtonId::EditExternal),
+            ("[✎ Edit]".to_string(), false, ButtonId::EditNote),
             ("[u Links]".to_string(), false, ButtonId::LinkExtractor),
             ("[h Hrefs]".to_string(), ui.show_inline_hrefs, ButtonId::ToggleHrefs),
             (img_label, !detail.images.is_empty(), ButtonId::ImagePreview),

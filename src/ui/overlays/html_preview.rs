@@ -462,6 +462,14 @@ impl HtmlPreviewOverlay {
                     }
                     OverlayOutcome::Handled
                 }
+                Action::MouseScrollDown { .. } => {
+                    self.session.scroll_y = self.session.scroll_y.saturating_add(3);
+                    OverlayOutcome::Handled
+                }
+                Action::MouseScrollUp { .. } => {
+                    self.session.scroll_y = self.session.scroll_y.saturating_sub(3);
+                    OverlayOutcome::Handled
+                }
                 Action::MouseClick { col, row } => {
                     if !self.last_modal_rect.is_empty()
                         && !self.last_modal_rect.contains(Position::new(*col, *row))
