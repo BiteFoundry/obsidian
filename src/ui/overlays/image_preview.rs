@@ -83,9 +83,12 @@ impl ImagePreviewOverlay {
         rows: u16,
         proto: TerminalImageProtocol,
     ) -> String {
+        let (mtime_ns, size_bytes) = crate::vault::fs::file_mtime_ns_and_size(&target.abs_path);
         format!(
-            "modal:{}:{}:{}:{:?}",
+            "modal:{}:{}:{}:{}:{}:{:?}",
             target.abs_path.to_string_lossy(),
+            mtime_ns,
+            size_bytes,
             cols,
             rows,
             proto

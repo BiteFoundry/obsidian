@@ -796,7 +796,7 @@ fn build_canvas_lines(
                 // Render inline halfblock preview if cached
                 if app.cfg.inline_images {
                     if let Some(abs) = resolved_path {
-                        let cache_key = format!("inline:{}", abs.to_string_lossy());
+                        let cache_key = crate::vault::fs::inline_image_cache_key(abs);
                         if let Some(rendered) = app.preview_cache.get(&cache_key) {
                             for img_line in &rendered.lines {
                                 out.push(RenderedLine {

@@ -42,8 +42,13 @@ impl ConfirmOverlay {
 
     pub fn handle(&mut self, action: &Action) -> OverlayOutcome {
         match action {
-            Action::CloseOverlay | Action::Input('n') | Action::Input('N') => OverlayOutcome::Close,
-            Action::Input('y') | Action::Input('Y') => {
+            Action::CloseOverlay
+            | Action::Input('n')
+            | Action::Input('N')
+            | Action::OpenNewNoteModal => OverlayOutcome::Close,
+            Action::Input('y')
+            | Action::Input('Y')
+            | Action::CopySelectionOrMarkdown => {
                 OverlayOutcome::CloseAndDispatch(self.on_confirm.clone())
             }
             Action::Tab | Action::CursorLeft | Action::CursorRight => {

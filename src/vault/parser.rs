@@ -681,6 +681,17 @@ fn parse_callout_header(trimmed: &str) -> Option<(CalloutKind, String, bool)> {
     Some((kind, final_title, collapsed))
 }
 
+/// Parses a single Markdown task line, returning `(checked, clean_plain_text, raw_content_trimmed)`.
+pub fn parse_single_task_line(line: &str) -> Option<(bool, String, String)> {
+    let (_, checked, content) = parse_task_line(line)?;
+    let mut wikilinks = Vec::new();
+    let mut md_links = Vec::new();
+    let mut tags = BTreeSet::new();
+    let spans = parse_inline_spans(content, 1, &mut wikilinks, &mut md_links, &mut tags);
+    let clean_text = spans_to_plain(&spans);
+    Some((checked, clean_text, content.trim().to_string()))
+}
+
 fn parse_task_line(line: &str) -> Option<(usize, bool, &str)> {
     let indent = line.chars().take_while(|&c| c == ' ' || c == '\t').count();
     let trimmed = &line[indent..];

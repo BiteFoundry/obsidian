@@ -18,7 +18,7 @@ use crate::{
     vault::{
         fs::{
             append_to_note, create_note, ensure_daily_note, move_note, move_note_to_trash,
-            safe_vault_path, toggle_task_at_line,
+            rewrite_wikilinks_for_move, safe_vault_path, toggle_task_at_line_verified,
         },
         init_starter_vault, merged_vaults, native_obsidian_config_path, resolve_active_vault,
         vault_from_dir,
@@ -122,6 +122,12 @@ pub enum Commands {
         note: String,
         /// 1-based line number of the task checkbox.
         line: usize,
+        /// Optional expected task text at `line`; refuses to toggle if external edits shifted the line.
+        #[arg(long)]
+        expected_text: Option<String>,
+        /// Optional expected current checked state (`true`/`false`); refuses to toggle on mismatch.
+        #[arg(long)]
+        expected_checked: Option<bool>,
     },
     /// Control the lightweight background vault watcher & IPC daemon.
     Daemon {
@@ -228,12 +234,16 @@ pub async fn run(cli: Cli) -> Result<()> {
                 let vaults: Vec<VaultSummary> = merged_vaults(&cfg)
                     .into_iter()
                     .map(|v| {
+                        let exists = v.path.is_dir();
+                        if exists {
+                            let _ = storage.sync_vault(&v);
+                        }
                         let active = active_id.as_deref() == Some(v.id.as_str());
                         let note_count = storage.note_count(&v.id).unwrap_or(0);
                         VaultSummary {
                             id: v.id,
                             name: v.name,
-                            exists: v.path.is_dir(),
+                            exists,
                             path: v.path,
                             active,
                             discovered: v.discovered,
@@ -340,7 +350,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Some(Commands::Reindex) => {
             let vault = resolve_active_vault(&cfg, cli.vault.as_deref())?;
             let storage = Storage::open_default()?;
-            let stats = storage.sync_vault(&vault)?;
+            let stats = storage.reindex_vault(&vault)?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&stats)?);
             } else {
@@ -459,12 +469,39 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
                 NotesCmd::Move { src, dst } => {
                     let src_rel = storage.resolve_note_path(&vault.id, &src)?;
+                    let was_bookmarked = storage
+                        .get_note_summary(&vault.id, &src_rel)?
+                        .map(|s| s.is_bookmarked)
+                        .unwrap_or(false);
+                    let (all_paths_before, aliases_before) =
+                        storage.all_paths_and_aliases(&vault.id)?;
                     let new_rel = move_note(&vault.path, &src_rel, &dst)?;
+                    let updated_links_in_notes = rewrite_wikilinks_for_move(
+                        &vault.path,
+                        &src_rel,
+                        &new_rel,
+                        &all_paths_before,
+                        &aliases_before,
+                    )?;
                     storage.sync_vault(&vault)?;
+                    if was_bookmarked {
+                        let _ = storage.set_bookmark(&vault.id, &new_rel, true);
+                    }
                     if cli.json {
-                        println!("{}", serde_json::to_string_pretty(&json!({ "moved": true, "from": src_rel, "to": new_rel }))?);
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&json!({
+                                "moved": true,
+                                "from": src_rel,
+                                "to": new_rel,
+                                "updated_links_in_notes": updated_links_in_notes,
+                                "bookmark_preserved": was_bookmarked,
+                            }))?
+                        );
                     } else {
-                        println!("Moved {src_rel} -> {new_rel}");
+                        println!(
+                            "Moved {src_rel} -> {new_rel} (updated links in {updated_links_in_notes} note(s))"
+                        );
                     }
                     Ok(())
                 }
@@ -640,13 +677,23 @@ pub async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
 
-        Some(Commands::ToggleTask { note, line }) => {
+        Some(Commands::ToggleTask {
+            note,
+            line,
+            expected_text,
+            expected_checked,
+        }) => {
             let vault = resolve_active_vault(&cfg, cli.vault.as_deref())?;
             let storage = Storage::open_default()?;
             storage.sync_vault(&vault)?;
             let rel_path = storage.resolve_note_path(&vault.id, &note)?;
             let abs = safe_vault_path(&vault.path, &rel_path)?;
-            let checked = toggle_task_at_line(&abs, line)?;
+            let checked = toggle_task_at_line_verified(
+                &abs,
+                line,
+                expected_text.as_deref(),
+                expected_checked,
+            )?;
             storage.sync_vault(&vault)?;
             if cli.json {
                 println!(

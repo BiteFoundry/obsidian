@@ -26,7 +26,7 @@ use crate::{
         composer::read_clipboard_image_png,
         graph_view::GraphSim,
         hitmap::{ButtonId, HitMap, HitTarget},
-        inline_editor::{InlineEditEvent, InlineNoteEditor},
+        inline_editor::{ExternalConflict, InlineEditEvent, InlineNoteEditor},
         keymap::KeyMap,
         overlays::{
             confirm::ConfirmOverlay,
@@ -47,10 +47,11 @@ use crate::{
     },
     vault::{
         fs::{
-            append_to_note, create_note, ensure_daily_note, file_mtime_and_size,
-            hydrate_parsed_note_links, is_html_file_path, move_note_to_trash,
-            resolve_attachment_path, resolve_wikilink_target, safe_vault_path,
-            save_vault_attachment, scan_vault_html_files, toggle_task_at_line, VaultHtmlFile,
+            append_to_note, content_sha256_bytes, create_note, ensure_daily_note,
+            file_mtime_and_size, hydrate_parsed_note_links, inline_image_cache_key,
+            is_html_file_path, move_note_to_trash, resolve_attachment_path,
+            resolve_wikilink_target, safe_vault_path, save_vault_attachment,
+            scan_vault_html_files, toggle_task_at_line_verified, VaultHtmlFile,
         },
         merged_vaults,
         parser::parse_markdown,
@@ -76,6 +77,13 @@ pub struct PendingPixelGraphic {
     pub cache_key: String,
     pub rect: ratatui::layout::Rect,
     pub protocol: TerminalImageProtocol,
+}
+
+enum EditorDiskState {
+    Unchanged,
+    Modified { text: String, hash: [u8; 32] },
+    Deleted,
+    ReadError(String),
 }
 
 pub struct AppState {
@@ -231,6 +239,27 @@ impl AppState {
         }
     }
 
+    fn inspect_editor_disk_state(&self, note_path: &str, base_hash: [u8; 32]) -> EditorDiskState {
+        let abs = match safe_vault_path(&self.active_vault.path, note_path) {
+            Ok(p) => p,
+            Err(e) => return EditorDiskState::ReadError(e.to_string()),
+        };
+        match fs::read(&abs) {
+            Ok(bytes) => {
+                let hash = content_sha256_bytes(&bytes);
+                if hash == base_hash {
+                    EditorDiskState::Unchanged
+                } else {
+                    let text = String::from_utf8(bytes)
+                        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+                    EditorDiskState::Modified { text, hash }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => EditorDiskState::Deleted,
+            Err(e) => EditorDiskState::ReadError(e.to_string()),
+        }
+    }
+
     /// Refreshes in-memory vault note list, tags, tasks, active note detail, and graph from SQLite.
     pub fn reload_from_storage(&mut self, ui: &mut UiState) {
         let vid = self.active_vault.id.clone();
@@ -241,6 +270,65 @@ impl AppState {
             .storage
             .list_tasks(&vid, TaskFilter::All, None)
             .unwrap_or_default();
+
+        if let Some((ed_path, ed_base_hash, ed_dirty, prev_conflict)) = ui
+            .inline_editor
+            .as_ref()
+            .map(|e| (e.note_path.clone(), e.base_content_hash, e.dirty, e.external_conflict.clone()))
+        {
+            match self.inspect_editor_disk_state(&ed_path, ed_base_hash) {
+                EditorDiskState::Unchanged => {
+                    if ed_dirty {
+                        self.apply_live_inline_parse(ui);
+                    } else if let Ok(detail) = self.storage.load_note_detail(&self.active_vault, &ed_path) {
+                        self.cache_inline_images(&detail);
+                        self.active_note = Some(detail);
+                    }
+                }
+                EditorDiskState::Modified { text, hash } => {
+                    if !ed_dirty {
+                        if let Some(ref mut ed) = ui.inline_editor {
+                            ed.reload_from_disk(&text, hash);
+                        }
+                        if let Ok(detail) = self.storage.load_note_detail(&self.active_vault, &ed_path) {
+                            self.cache_inline_images(&detail);
+                            self.active_note = Some(detail);
+                        } else {
+                            self.apply_live_inline_parse(ui);
+                        }
+                        ui.toasts.info("Reloaded externally modified note");
+                    } else {
+                        if let Some(ref mut ed) = ui.inline_editor {
+                            ed.mark_conflict(ExternalConflict::Modified);
+                        }
+                        self.apply_live_inline_parse(ui);
+                        if prev_conflict != Some(ExternalConflict::Modified) {
+                            ui.toasts.warning(
+                                "External change detected — autosave paused; local edits preserved",
+                            );
+                        }
+                    }
+                }
+                EditorDiskState::Deleted => {
+                    if let Some(ref mut ed) = ui.inline_editor {
+                        ed.mark_conflict(ExternalConflict::Deleted);
+                    }
+                    self.apply_live_inline_parse(ui);
+                    if prev_conflict != Some(ExternalConflict::Deleted) {
+                        ui.toasts.warning(
+                            "File deleted or moved externally — autosave paused; old path will not be recreated",
+                        );
+                    }
+                }
+                EditorDiskState::ReadError(_) => {
+                    if ed_dirty {
+                        self.apply_live_inline_parse(ui);
+                    }
+                }
+            }
+            self.refresh_graph(ui);
+            return;
+        }
 
         let current_path = self
             .active_note
@@ -287,10 +375,12 @@ impl AppState {
             return;
         }
         for img in &detail.images {
-            let key = format!("inline:{}", img.abs_path.to_string_lossy());
+            let key = inline_image_cache_key(&img.abs_path);
             if self.preview_cache.contains_key(&key) {
                 continue;
             }
+            let prefix = format!("inline:{}:", img.abs_path.to_string_lossy());
+            self.preview_cache.retain(|k, _| !k.starts_with(&prefix));
             if let Ok(bytes) = fs::read(&img.abs_path) {
                 if sniff_content_kind(
                     Some(&img.mime_type),
@@ -349,6 +439,8 @@ impl AppState {
                     self.graphics_caps,
                 ) {
                     Ok(rendered) => {
+                        let prefix = format!("modal:{}:", target.abs_path.to_string_lossy());
+                        self.preview_cache.retain(|k, _| !k.starts_with(&prefix));
                         self.preview_cache.insert(key, rendered);
                         ov.error = None;
                     }
@@ -490,8 +582,8 @@ impl AppState {
             return;
         }
         // Flush any pending inline auto-save cleanly before switching notes
-        if ui.inline_editor.is_some() {
-            self.finish_inline_edit(ui);
+        if ui.inline_editor.is_some() && !self.finish_inline_edit(ui) {
+            return;
         }
         if push_history {
             if let Some(cur) = self.active_note.as_ref().map(|d| d.summary.rel_path.clone()) {
@@ -545,14 +637,30 @@ impl AppState {
         };
         let rel_path = d.summary.rel_path.clone();
         let title = d.summary.title.clone();
-        let raw = safe_vault_path(&self.active_vault.path, &rel_path)
+        let (raw, base_hash) = safe_vault_path(&self.active_vault.path, &rel_path)
             .ok()
-            .and_then(|abs| fs::read_to_string(&abs).ok())
-            .unwrap_or_else(|| d.raw_markdown.clone());
+            .and_then(|abs| fs::read(&abs).ok())
+            .map(|bytes| {
+                let hash = content_sha256_bytes(&bytes);
+                let text = String::from_utf8(bytes)
+                    .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+                (text, hash)
+            })
+            .unwrap_or_else(|| {
+                let text = d.raw_markdown.clone();
+                let hash = content_sha256_bytes(text.as_bytes());
+                (text, hash)
+            });
         let initial_scroll = ui.canvas_scroll.min(u16::MAX as usize) as u16;
         ui.canvas_mode = CanvasMode::Note;
         ui.focus = Focus::Canvas;
-        ui.inline_editor = Some(InlineNoteEditor::new(rel_path, title, &raw, initial_scroll));
+        ui.inline_editor = Some(InlineNoteEditor::with_base_hash(
+            rel_path,
+            title,
+            &raw,
+            base_hash,
+            initial_scroll,
+        ));
     }
 
     /// Re-parses the active note's Markdown in memory (< 0.2ms) on every keystroke so
@@ -638,14 +746,18 @@ impl AppState {
         }
     }
 
-    /// Atomically writes the inline editor buffer to disk (preserving CRLF) and updates ONLY that
-    /// single note in SQLite via `Storage::upsert_single_note` (< 5ms, zero full vault scan).
+    /// Atomically writes the inline editor buffer to disk (preserving CRLF) after verifying that
+    /// the file on disk still matches the baseline recorded on open or last save, and updates ONLY
+    /// that single note in SQLite via `Storage::upsert_single_note` (< 5ms, zero full vault scan).
     pub fn flush_inline_save(&mut self, ui: &mut UiState) -> bool {
-        let Some((note_path, disk_md)) = ui
-            .inline_editor
-            .as_ref()
-            .map(|ed| (ed.note_path.clone(), ed.disk_markdown()))
-        else {
+        let Some((note_path, disk_md, base_hash, is_dirty)) = ui.inline_editor.as_ref().map(|ed| {
+            (
+                ed.note_path.clone(),
+                ed.disk_markdown(),
+                ed.base_content_hash,
+                ed.dirty,
+            )
+        }) else {
             return false;
         };
 
@@ -660,6 +772,50 @@ impl AppState {
             }
         };
 
+        // Guard against overwriting concurrent external edits or resurrecting deleted/moved files.
+        match self.inspect_editor_disk_state(&note_path, base_hash) {
+            EditorDiskState::Unchanged => {}
+            EditorDiskState::Modified { text, hash } => {
+                if !is_dirty {
+                    if let Some(ref mut ed) = ui.inline_editor {
+                        ed.reload_from_disk(&text, hash);
+                    }
+                    let _ = self.storage.sync_vault(&self.active_vault);
+                    if let Ok(detail) = self.storage.load_note_detail(&self.active_vault, &note_path) {
+                        self.cache_inline_images(&detail);
+                        self.active_note = Some(detail);
+                    } else {
+                        self.apply_live_inline_parse(ui);
+                    }
+                    ui.toasts.info("Reloaded externally modified note");
+                    return false;
+                }
+                if let Some(ref mut ed) = ui.inline_editor {
+                    ed.mark_conflict(ExternalConflict::Modified);
+                }
+                ui.toasts.warning(
+                    "Save blocked: file changed externally on disk — external text preserved and local edits kept",
+                );
+                return false;
+            }
+            EditorDiskState::Deleted => {
+                if let Some(ref mut ed) = ui.inline_editor {
+                    ed.mark_conflict(ExternalConflict::Deleted);
+                }
+                ui.toasts.warning(
+                    "Save blocked: file was deleted or moved externally — old path not recreated",
+                );
+                return false;
+            }
+            EditorDiskState::ReadError(err) => {
+                if let Some(ref mut ed) = ui.inline_editor {
+                    ed.mark_error(err.clone());
+                }
+                ui.toasts.error(format!("Save check failed: {err}"));
+                return false;
+            }
+        }
+
         if let Err(e) = write_atomic(&abs, disk_md.as_bytes()) {
             if let Some(ref mut ed) = ui.inline_editor {
                 ed.mark_error(e.to_string());
@@ -668,6 +824,7 @@ impl AppState {
             return false;
         }
 
+        let new_hash = content_sha256_bytes(disk_md.as_bytes());
         let (mtime_ms, size_bytes) = file_mtime_and_size(&abs);
         if let Err(e) = self.storage.upsert_single_note(
             &self.active_vault,
@@ -684,7 +841,7 @@ impl AppState {
         }
 
         if let Some(ref mut ed) = ui.inline_editor {
-            ed.mark_saved();
+            ed.mark_saved_with_hash(new_hash);
         }
 
         // Sync live parsed AST + lightweight SQLite aggregates (NO disk scan!)
@@ -730,32 +887,38 @@ impl AppState {
     }
 
     /// Flushes any pending inline auto-save and exits cleanly back to the rendered reader view
-    /// at the exact same scroll offset on frame 0.
-    pub fn finish_inline_edit(&mut self, ui: &mut UiState) {
+    /// at the exact same scroll offset on frame 0. Returns `false` if save was blocked (e.g.
+    /// external conflict) so the editor stays open and local edits remain on screen.
+    pub fn finish_inline_edit(&mut self, ui: &mut UiState) -> bool {
         if ui.inline_editor.as_ref().is_some_and(|e| e.dirty) {
-            self.flush_inline_save(ui);
+            if !self.flush_inline_save(ui) {
+                return false;
+            }
         }
         if let Some(ed) = ui.inline_editor.take() {
+            let disk_changed = !matches!(
+                self.inspect_editor_disk_state(&ed.note_path, ed.base_content_hash),
+                EditorDiskState::Unchanged
+            );
             ui.canvas_scroll = ed.scroll_y as usize;
             ui.canvas_follow_selected = false;
             ui.focus = Focus::Canvas;
+            if disk_changed {
+                let _ = self.storage.sync_vault(&self.active_vault);
+                self.reload_from_storage(ui);
+            }
         }
+        true
     }
 
     pub fn handle_core_event(&mut self, ev: CoreEvent, ui: &mut UiState) {
-        let inline_dirty = ui.inline_editor.as_ref().is_some_and(|e| e.dirty);
         match ev {
             CoreEvent::VaultIndexed { stats } => {
-                let changed = stats.updated > 0 || stats.removed > 0 || self.notes.is_empty();
                 self.last_index_stats = Some(stats);
-                if changed && !inline_dirty {
-                    self.reload_from_storage(ui);
-                }
+                self.reload_from_storage(ui);
             }
             CoreEvent::NoteChanged { .. } => {
-                if !inline_dirty {
-                    self.reload_from_storage(ui);
-                }
+                self.reload_from_storage(ui);
             }
             CoreEvent::SyncStatus { summary, .. } => {
                 ui.toasts.info(summary);
@@ -823,8 +986,9 @@ impl AppState {
                     return;
                 }
                 Action::RequestExternalEditor => {
-                    self.finish_inline_edit(ui);
-                    self.dispatch_core(Action::RequestExternalEditor, ui);
+                    if self.finish_inline_edit(ui) {
+                        self.dispatch_core(Action::RequestExternalEditor, ui);
+                    }
                     return;
                 }
                 Action::PasteClipboard => {
@@ -874,25 +1038,43 @@ impl AppState {
 
     fn dispatch_core(&mut self, action: Action, ui: &mut UiState) {
         match action {
-            Action::Quit => {
-                if ui.inline_editor.as_ref().is_some_and(|e| e.dirty) {
-                    self.flush_inline_save(ui);
+            Action::Quit | Action::QuitConfirm => {
+                if let Some(note_path) = ui
+                    .inline_editor
+                    .as_ref()
+                    .filter(|e| e.dirty)
+                    .map(|e| e.note_path.clone())
+                {
+                    if !self.flush_inline_save(ui) {
+                        // Never recreate a deleted note, overwrite external edits, or drop a conflict draft on exit.
+                        if !matches!(ui.overlay, Some(Overlay::Confirm(_))) {
+                            ui.open_overlay(Overlay::Confirm(ConfirmOverlay::new(
+                                "Unsaved Conflict Draft",
+                                format!(
+                                    "'{}' changed or was deleted on disk. Discard local draft and quit?",
+                                    note_path
+                                ),
+                                "Discard & Quit",
+                                Action::ForceQuitDiscard,
+                            )));
+                        }
+                        return;
+                    }
                 }
                 ui.should_quit = true;
             }
-            Action::QuitConfirm => {
-                if ui.inline_editor.as_ref().is_some_and(|e| e.dirty) {
-                    self.flush_inline_save(ui);
-                }
+            Action::ForceQuitDiscard => {
+                // Explicitly confirmed discard of an unsaved conflict draft: exit without touching disk.
                 ui.should_quit = true;
             }
             Action::RefreshAll => {
-                if let Ok(stats) = self.storage.sync_vault(&self.active_vault) {
+                if let Ok(stats) = self.storage.reindex_vault(&self.active_vault) {
                     let msg = format!(
                         "Indexed {} notes ({} updated, {}ms)",
                         stats.total_notes, stats.updated, stats.elapsed_ms
                     );
                     self.last_index_stats = Some(stats);
+                    self.preview_cache.clear();
                     self.reload_from_storage(ui);
                     ui.toasts.success(msg);
                 }
@@ -1084,8 +1266,8 @@ impl AppState {
             Action::ToggleGraphView => {
                 ui.canvas_mode = match ui.canvas_mode {
                     CanvasMode::Note => {
-                        if ui.inline_editor.is_some() {
-                            self.finish_inline_edit(ui);
+                        if ui.inline_editor.is_some() && !self.finish_inline_edit(ui) {
+                            return;
                         }
                         self.refresh_graph(ui);
                         ui.graph_selected = 0;
@@ -1175,7 +1357,35 @@ impl AppState {
 
             Action::ToggleTaskAtLine { note_path, line_no } => {
                 if let Ok(abs) = safe_vault_path(&self.active_vault.path, &note_path) {
-                    match toggle_task_at_line(&abs, line_no) {
+                    let expected = self
+                        .active_note
+                        .as_ref()
+                        .filter(|d| d.summary.rel_path.eq_ignore_ascii_case(&note_path))
+                        .and_then(|d| {
+                            d.parsed
+                                .tasks
+                                .iter()
+                                .find(|t| t.line_no == line_no)
+                                .map(|t| (t.text.clone(), t.checked))
+                        })
+                        .or_else(|| {
+                            self.tasks
+                                .iter()
+                                .find(|t| {
+                                    t.note_path.eq_ignore_ascii_case(&note_path)
+                                        && t.line_no == line_no
+                                })
+                                .map(|t| (t.text.clone(), t.checked))
+                        });
+                    let expected_text = expected.as_ref().map(|(txt, _)| txt.as_str());
+                    let expected_checked = expected.as_ref().map(|(_, chk)| *chk);
+
+                    match toggle_task_at_line_verified(
+                        &abs,
+                        line_no,
+                        expected_text,
+                        expected_checked,
+                    ) {
                         Ok(checked) => {
                             let _ = self.storage.sync_vault(&self.active_vault);
                             self.reload_from_storage(ui);
@@ -1185,7 +1395,11 @@ impl AppState {
                                 "Reopened task [ ]"
                             });
                         }
-                        Err(e) => ui.toasts.error(format!("Task toggle failed: {e}")),
+                        Err(e) => {
+                            let _ = self.storage.sync_vault(&self.active_vault);
+                            self.reload_from_storage(ui);
+                            ui.toasts.warning(format!("Task toggle skipped: {e}"));
+                        }
                     }
                 }
             }
@@ -1493,6 +1707,11 @@ impl AppState {
                     ui.open_overlay(Overlay::QuickSwitcher(QuickSwitcherOverlay::new()));
                 }
                 OverlayKind::VaultSwitcher => {
+                    let mut vaults = merged_vaults(&self.cfg);
+                    if !vaults.iter().any(|v| v.id == self.active_vault.id) {
+                        vaults.insert(0, self.active_vault.clone());
+                    }
+                    self.vaults = vaults;
                     ui.open_overlay(Overlay::VaultSwitcher(VaultSwitcherOverlay::new(self)));
                 }
                 OverlayKind::Settings => {
@@ -1511,8 +1730,8 @@ impl AppState {
 
             Action::SwitchVault(vault_id) => {
                 if let Some(next) = self.vaults.iter().find(|v| v.id == vault_id).cloned() {
-                    if ui.inline_editor.is_some() {
-                        self.finish_inline_edit(ui);
+                    if ui.inline_editor.is_some() && !self.finish_inline_edit(ui) {
+                        return;
                     }
                     self.active_vault = next.clone();
                     self.cfg.active_vault = next.name.clone();
@@ -1918,7 +2137,9 @@ impl AppState {
                 ButtonId::QuickAppend => self.dispatch_core(Action::OpenQuickAppend, ui),
                 ButtonId::NewNote => self.dispatch_core(Action::OpenNewNoteModal, ui),
                 ButtonId::EditNote => self.dispatch_core(Action::OpenNoteEditor, ui),
-                ButtonId::FinishInlineEdit => self.finish_inline_edit(ui),
+                ButtonId::FinishInlineEdit => {
+                    self.finish_inline_edit(ui);
+                }
                 ButtonId::SaveInlineEdit => {
                     self.flush_inline_save(ui);
                 }

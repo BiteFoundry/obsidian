@@ -14,14 +14,29 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Local;
+use sha2::{Digest, Sha256};
 
 use crate::{
     config::{ensure_parent, write_atomic, VaultProfile},
     models::{InlineSpan, NoteBlock, NoteImageRef, ParsedNote},
-    vault::parser::{is_image_target, mime_type_for_path, upsert_frontmatter_in_markdown},
+    vault::parser::{
+        is_image_target, mime_type_for_path, parse_single_task_line, upsert_frontmatter_in_markdown,
+    },
 };
 
 const IGNORED_DIRS: &[&str] = &[".obsidian", ".git", ".trash", "node_modules"];
+
+/// Computes raw SHA-256 digest bytes for content comparison.
+pub fn content_sha256_bytes(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher.finalize().into()
+}
+
+/// Computes lowercase hex SHA-256 digest for content comparison.
+pub fn content_sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(content_sha256_bytes(bytes))
+}
 
 /// Metadata of a discovered `.md` note on disk.
 #[derive(Debug, Clone)]
@@ -31,6 +46,7 @@ pub struct DiskNoteEntry {
     pub title: String,
     pub folder: String,
     pub mtime_ms: i64,
+    pub mtime_ns: i64,
     pub size_bytes: i64,
 }
 
@@ -41,6 +57,7 @@ pub struct VaultHtmlFile {
     pub abs_path: PathBuf,
     pub title: String,
     pub folder: String,
+    pub mtime_ns: i64,
     pub size_bytes: i64,
 }
 
@@ -98,12 +115,13 @@ fn walk_html_dir_recursive(root: &Path, dir: &Path, out: &mut Vec<VaultHtmlFile>
             let rel_path = normalize_rel_path(rel);
             let title = name.to_string();
             let folder = folder_from_rel_path(&rel_path);
-            let size_bytes = entry.metadata().ok().map(|m| m.len() as i64).unwrap_or(0);
+            let (mtime_ns, size_bytes) = file_mtime_ns_and_size(&path);
             out.push(VaultHtmlFile {
                 rel_path,
                 abs_path: path,
                 title,
                 folder,
+                mtime_ns,
                 size_bytes,
             });
         }
@@ -154,13 +172,15 @@ fn walk_dir_recursive(root: &Path, dir: &Path, out: &mut Vec<DiskNoteEntry>) -> 
             let rel_path = normalize_rel_path(rel);
             let title = title_from_rel_path(&rel_path);
             let folder = folder_from_rel_path(&rel_path);
-            let (mtime_ms, size_bytes) = file_mtime_and_size(&path);
+            let (mtime_ns, size_bytes) = file_mtime_ns_and_size(&path);
+            let mtime_ms = mtime_ns / 1_000_000;
             out.push(DiskNoteEntry {
                 rel_path,
                 abs_path: path,
                 title,
                 folder,
                 mtime_ms,
+                mtime_ns,
                 size_bytes,
             });
         }
@@ -168,18 +188,35 @@ fn walk_dir_recursive(root: &Path, dir: &Path, out: &mut Vec<DiskNoteEntry>) -> 
     Ok(())
 }
 
-/// Reads `(mtime_ms, size_bytes)` from a file's filesystem metadata using the exact
-/// same clock conversion as `scan_vault_markdown_files`.
-pub fn file_mtime_and_size(path: &Path) -> (i64, i64) {
+/// Reads `(mtime_ns, size_bytes)` from a file's filesystem metadata with nanosecond precision.
+pub fn file_mtime_ns_and_size(path: &Path) -> (i64, i64) {
     let meta = fs::metadata(path).ok();
     let size_bytes = meta.as_ref().map(|m| m.len() as i64).unwrap_or(0);
-    let mtime_ms = meta
+    let mtime_ns = meta
         .as_ref()
         .and_then(|m| m.modified().ok())
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as i64)
+        .map(|d| d.as_nanos().min(i64::MAX as u128) as i64)
         .unwrap_or(0);
-    (mtime_ms, size_bytes)
+    (mtime_ns, size_bytes)
+}
+
+/// Reads `(mtime_ms, size_bytes)` from a file's filesystem metadata using the exact
+/// same clock conversion as `scan_vault_markdown_files`.
+pub fn file_mtime_and_size(path: &Path) -> (i64, i64) {
+    let (mtime_ns, size_bytes) = file_mtime_ns_and_size(path);
+    (mtime_ns / 1_000_000, size_bytes)
+}
+
+/// Builds a disk-versioned cache key for inline halfblock image previews.
+pub fn inline_image_cache_key(abs_path: &Path) -> String {
+    let (mtime_ns, size_bytes) = file_mtime_ns_and_size(abs_path);
+    format!(
+        "inline:{}:{}:{}",
+        abs_path.to_string_lossy(),
+        mtime_ns,
+        size_bytes
+    )
 }
 
 pub fn normalize_rel_path(rel: &Path) -> String {
@@ -439,6 +476,18 @@ fn resolve_spans(
 /// Surgically toggles a task checkbox (`- [ ]` <-> `- [x]`) at the exact 1-based `line_no`.
 /// Preserves existing line endings and writes atomically. Returns the new `checked` boolean.
 pub fn toggle_task_at_line(abs_path: &Path, line_no: usize) -> Result<bool> {
+    toggle_task_at_line_verified(abs_path, line_no, None, None)
+}
+
+/// Surgically toggles a task checkbox at `line_no` after verifying the current line on disk
+/// matches optional `expected_text` and/or `expected_checked`. Refuses to mutate the file
+/// when external edits shifted or altered the target line.
+pub fn toggle_task_at_line_verified(
+    abs_path: &Path,
+    line_no: usize,
+    expected_text: Option<&str>,
+    expected_checked: Option<bool>,
+) -> Result<bool> {
     if line_no == 0 {
         bail!("line_no must be >= 1");
     }
@@ -449,13 +498,33 @@ pub fn toggle_task_at_line(abs_path: &Path, line_no: usize) -> Result<bool> {
     let mut lines: Vec<String> = raw.lines().map(String::from).collect();
     if line_no > lines.len() {
         bail!(
-            "Line {} out of range (file has {} lines)",
+            "Task conflict: line {} out of range (file has {} lines)",
             line_no,
             lines.len()
         );
     }
 
     let line = &mut lines[line_no - 1];
+    let Some((was_checked, clean_text, raw_text)) = parse_single_task_line(line) else {
+        bail!("Line {line_no} does not contain a Markdown task checkbox: {line}");
+    };
+    if let Some(exp_text) = expected_text.map(str::trim).filter(|s| !s.is_empty()) {
+        if clean_text.trim() != exp_text && raw_text.trim() != exp_text {
+            bail!(
+                "Task conflict at line {line_no}: expected '{exp_text}', found '{clean_text}' (file modified externally)"
+            );
+        }
+    }
+    if let Some(exp_checked) = expected_checked {
+        if was_checked != exp_checked {
+            bail!(
+                "Task conflict at line {line_no}: checkbox state changed externally (expected {}, found {})",
+                if exp_checked { "[x]" } else { "[ ]" },
+                if was_checked { "[x]" } else { "[ ]" }
+            );
+        }
+    }
+
     let new_checked = if let Some(pos) = find_checkbox_marker(line, "[ ]") {
         line.replace_range(pos..pos + 3, "[x]");
         true
@@ -656,6 +725,238 @@ pub fn move_note(vault_root: &Path, src_rel: &str, dst_rel: &str) -> Result<Stri
     fs::rename(&src, &dst)
         .with_context(|| format!("Failed to move {} -> {}", src.display(), dst.display()))?;
     Ok(normalized_dst)
+}
+
+/// Rewrites incoming `[[wikilinks]]` across the vault after moving `old_rel` -> `new_rel`,
+/// preserving headings, aliases, embeds, and skipping fenced/inline code.
+/// Returns the number of note files updated on disk.
+pub fn rewrite_wikilinks_for_move(
+    vault_root: &Path,
+    old_rel: &str,
+    new_rel: &str,
+    all_paths_before_move: &[String],
+    aliases_by_path: &HashMap<String, Vec<String>>,
+) -> Result<usize> {
+    let mut all_paths_after: Vec<String> = all_paths_before_move
+        .iter()
+        .map(|p| {
+            if p.eq_ignore_ascii_case(old_rel) {
+                new_rel.to_string()
+            } else {
+                p.clone()
+            }
+        })
+        .collect();
+    if !all_paths_after
+        .iter()
+        .any(|p| p.eq_ignore_ascii_case(new_rel))
+    {
+        all_paths_after.push(new_rel.to_string());
+    }
+
+    let mut aliases_after = HashMap::new();
+    for (p, al) in aliases_by_path {
+        if p.eq_ignore_ascii_case(old_rel) {
+            aliases_after.insert(new_rel.to_string(), al.clone());
+        } else {
+            aliases_after.insert(p.clone(), al.clone());
+        }
+    }
+
+    // Choose Obsidian shortest unambiguous link target (stem if unique, else rel path without .md)
+    let new_stem = title_from_rel_path(new_rel);
+    let stem_count = all_paths_after
+        .iter()
+        .filter(|p| title_from_rel_path(p).eq_ignore_ascii_case(&new_stem))
+        .count();
+    let replacement_target = if stem_count == 1 {
+        new_stem
+    } else {
+        new_rel
+            .strip_suffix(".md")
+            .or_else(|| new_rel.strip_suffix(".MD"))
+            .unwrap_or(new_rel)
+            .to_string()
+    };
+
+    let entries = scan_vault_markdown_files(vault_root)?;
+    let mut updated_notes = 0usize;
+    for entry in entries {
+        let Ok(raw) = fs::read_to_string(&entry.abs_path) else {
+            continue;
+        };
+        if !raw.contains("[[") {
+            continue;
+        }
+        let Some(rewritten) = rewrite_markdown_wikilinks(
+            &raw,
+            old_rel,
+            new_rel,
+            &replacement_target,
+            all_paths_before_move,
+            &all_paths_after,
+            aliases_by_path,
+            &aliases_after,
+        ) else {
+            continue;
+        };
+        write_atomic(&entry.abs_path, rewritten.as_bytes())?;
+        updated_notes += 1;
+    }
+    Ok(updated_notes)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rewrite_markdown_wikilinks(
+    raw: &str,
+    old_rel: &str,
+    new_rel: &str,
+    replacement_target: &str,
+    all_paths_before: &[String],
+    all_paths_after: &[String],
+    aliases_before: &HashMap<String, Vec<String>>,
+    aliases_after: &HashMap<String, Vec<String>>,
+) -> Option<String> {
+    let line_ending = if raw.contains("\r\n") { "\r\n" } else { "\n" };
+    let had_trailing_newline = raw.ends_with('\n');
+    let mut out_lines = Vec::new();
+    let mut changed = false;
+    let mut in_fence: Option<(char, usize)> = None;
+
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if let Some((fc, flen)) = in_fence {
+            let close_len = trimmed.chars().take_while(|&c| c == fc).count();
+            if close_len >= flen && trimmed[close_len..].trim().is_empty() {
+                in_fence = None;
+            }
+            out_lines.push(line.to_string());
+            continue;
+        }
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            let fc = trimmed.chars().next().unwrap_or('`');
+            let flen = trimmed.chars().take_while(|&c| c == fc).count();
+            in_fence = Some((fc, flen));
+            out_lines.push(line.to_string());
+            continue;
+        }
+
+        let (new_line, line_changed) = rewrite_line_wikilinks(
+            line,
+            old_rel,
+            new_rel,
+            replacement_target,
+            all_paths_before,
+            all_paths_after,
+            aliases_before,
+            aliases_after,
+        );
+        if line_changed {
+            changed = true;
+        }
+        out_lines.push(new_line);
+    }
+
+    if !changed {
+        return None;
+    }
+    let mut out = out_lines.join(line_ending);
+    if had_trailing_newline {
+        out.push_str(line_ending);
+    }
+    Some(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rewrite_line_wikilinks(
+    line: &str,
+    old_rel: &str,
+    new_rel: &str,
+    replacement_target: &str,
+    all_paths_before: &[String],
+    all_paths_after: &[String],
+    aliases_before: &HashMap<String, Vec<String>>,
+    aliases_after: &HashMap<String, Vec<String>>,
+) -> (String, bool) {
+    let bytes = line.as_bytes();
+    let len = bytes.len();
+    let mut i = 0usize;
+    let mut out = String::with_capacity(len);
+    let mut changed = false;
+
+    while i < len {
+        // Preserve inline code spans verbatim
+        if bytes[i] == b'`' {
+            let start = i;
+            let ticks = bytes[i..].iter().take_while(|&&b| b == b'`').count();
+            i += ticks;
+            while i < len {
+                if bytes[i] == b'`' {
+                    let close_ticks = bytes[i..].iter().take_while(|&&b| b == b'`').count();
+                    i += close_ticks;
+                    if close_ticks == ticks {
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            out.push_str(&line[start..i]);
+            continue;
+        }
+
+        if i + 1 < len && bytes[i] == b'[' && bytes[i + 1] == b'[' {
+            if let Some(rel_close) = line[i + 2..].find("]]") {
+                let inner = &line[i + 2..i + 2 + rel_close];
+                let (target_and_heading, alias_opt) = match inner.split_once('|') {
+                    Some((lhs, rhs)) => (lhs, Some(rhs)),
+                    None => (inner, None),
+                };
+                let (target_raw, heading_opt) = match target_and_heading.split_once('#') {
+                    Some((lhs, rhs)) => (lhs, Some(rhs)),
+                    None => (target_and_heading, None),
+                };
+
+                let resolved_before =
+                    resolve_wikilink_target(target_raw, all_paths_before, aliases_before);
+                let resolved_after =
+                    resolve_wikilink_target(target_raw, all_paths_after, aliases_after);
+
+                if resolved_before
+                    .as_deref()
+                    .is_some_and(|p| p.eq_ignore_ascii_case(old_rel))
+                    && !resolved_after
+                        .as_deref()
+                        .is_some_and(|p| p.eq_ignore_ascii_case(new_rel))
+                {
+                    out.push_str("[[");
+                    out.push_str(replacement_target);
+                    if let Some(h) = heading_opt {
+                        out.push('#');
+                        out.push_str(h);
+                    }
+                    if let Some(a) = alias_opt {
+                        out.push('|');
+                        out.push_str(a);
+                    }
+                    out.push_str("]]");
+                    changed = true;
+                    i += 2 + rel_close + 2;
+                    continue;
+                }
+
+                out.push_str(&line[i..i + 2 + rel_close + 2]);
+                i += 2 + rel_close + 2;
+                continue;
+            }
+        }
+
+        let ch = line[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+
+    (out, changed)
 }
 
 /// Reads Obsidian's `.obsidian/daily-notes.json` (when present) to determine daily notes folder & format.

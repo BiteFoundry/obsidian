@@ -20,20 +20,30 @@ use ratatui::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::ui::{
-    action::Action,
-    composer::{normalize, text_layout, truncate_display, MultiLineComposer},
-    hitmap::{ButtonId, HitMap, HitTarget},
-    theme::Theme,
+use crate::{
+    ui::{
+        action::Action,
+        composer::{normalize, text_layout, truncate_display, MultiLineComposer},
+        hitmap::{ButtonId, HitMap, HitTarget},
+        theme::Theme,
+    },
+    vault::fs::content_sha256_bytes,
 };
 
 /// Debounce window before automatically flushing inline edits to disk + SQLite.
 pub const INLINE_AUTOSAVE_DEBOUNCE_MS: u64 = 250;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExternalConflict {
+    Modified,
+    Deleted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InlineSaveStatus {
     Saved,
     Editing,
+    Conflict(ExternalConflict),
     Error(String),
 }
 
@@ -49,6 +59,8 @@ pub struct InlineNoteEditor {
     pub note_path: String,
     pub note_title: String,
     pub original_crlf: bool,
+    pub base_content_hash: [u8; 32],
+    pub external_conflict: Option<ExternalConflict>,
     pub composer: MultiLineComposer,
     pub scroll_y: u16,
     pub follow_cursor: bool,
@@ -67,6 +79,23 @@ impl InlineNoteEditor {
         raw_markdown: &str,
         initial_scroll_y: u16,
     ) -> Self {
+        let base_content_hash = content_sha256_bytes(raw_markdown.as_bytes());
+        Self::with_base_hash(
+            note_path,
+            note_title,
+            raw_markdown,
+            base_content_hash,
+            initial_scroll_y,
+        )
+    }
+
+    pub fn with_base_hash(
+        note_path: impl Into<String>,
+        note_title: impl Into<String>,
+        raw_markdown: &str,
+        base_content_hash: [u8; 32],
+        initial_scroll_y: u16,
+    ) -> Self {
         let original_crlf = raw_markdown.contains("\r\n");
         let normalized = normalize(raw_markdown);
         let mut composer = MultiLineComposer::new();
@@ -78,6 +107,8 @@ impl InlineNoteEditor {
             note_path: note_path.into(),
             note_title: note_title.into(),
             original_crlf,
+            base_content_hash,
+            external_conflict: None,
             composer,
             scroll_y: initial_scroll_y,
             follow_cursor: initial_scroll_y == 0,
@@ -90,16 +121,52 @@ impl InlineNoteEditor {
         }
     }
 
+    /// Cleanly reloads editor text from disk after an external modification (when buffer is clean).
+    pub fn reload_from_disk(&mut self, raw_markdown: &str, disk_hash: [u8; 32]) {
+        let (prev_line, _) = self.cursor_line_col();
+        let prev_scroll = self.scroll_y;
+        self.original_crlf = raw_markdown.contains("\r\n");
+        self.base_content_hash = disk_hash;
+        self.external_conflict = None;
+        let normalized = normalize(raw_markdown);
+        self.composer.load_text_cursor_start(&normalized);
+        if prev_line > 1 {
+            self.composer.set_cursor_line(prev_line - 1);
+        }
+        self.scroll_y = prev_scroll;
+        self.dirty = false;
+        self.dirty_since = None;
+        self.save_status = InlineSaveStatus::Saved;
+    }
+
     pub fn mark_dirty(&mut self) {
         self.dirty = true;
-        self.dirty_since = Some(Instant::now());
-        self.save_status = InlineSaveStatus::Editing;
+        if let Some(conflict) = self.external_conflict.clone() {
+            // Keep autosave paused while an external conflict is active.
+            self.dirty_since = None;
+            self.save_status = InlineSaveStatus::Conflict(conflict);
+        } else {
+            self.dirty_since = Some(Instant::now());
+            self.save_status = InlineSaveStatus::Editing;
+        }
     }
 
     pub fn mark_saved(&mut self) {
         self.dirty = false;
         self.dirty_since = None;
+        self.external_conflict = None;
         self.save_status = InlineSaveStatus::Saved;
+    }
+
+    pub fn mark_saved_with_hash(&mut self, hash: [u8; 32]) {
+        self.base_content_hash = hash;
+        self.mark_saved();
+    }
+
+    pub fn mark_conflict(&mut self, conflict: ExternalConflict) {
+        self.external_conflict = Some(conflict.clone());
+        self.dirty_since = None;
+        self.save_status = InlineSaveStatus::Conflict(conflict);
     }
 
     pub fn mark_error(&mut self, err: impl Into<String>) {
@@ -108,6 +175,7 @@ impl InlineNoteEditor {
 
     pub fn is_autosave_due(&self) -> bool {
         self.dirty
+            && self.external_conflict.is_none()
             && self
                 .dirty_since
                 .is_some_and(|t| t.elapsed() >= Duration::from_millis(INLINE_AUTOSAVE_DEBOUNCE_MS))
@@ -411,6 +479,12 @@ impl InlineNoteEditor {
         let (status_full, status_short, status_color) = match &self.save_status {
             InlineSaveStatus::Saved => ("✓ Live Saved", "✓ Saved", theme.success),
             InlineSaveStatus::Editing => ("● Editing...", "● Editing", theme.warning),
+            InlineSaveStatus::Conflict(ExternalConflict::Modified) => {
+                ("⚠ Conflict: modified on disk", "⚠ Conflict", theme.error)
+            }
+            InlineSaveStatus::Conflict(ExternalConflict::Deleted) => {
+                ("⚠ Conflict: deleted/moved", "⚠ Deleted", theme.error)
+            }
             InlineSaveStatus::Error(_) => ("⚠ Error", "⚠ Err", theme.error),
         };
 

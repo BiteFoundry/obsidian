@@ -34,8 +34,9 @@ use crate::{
     storage::Storage,
     vault::{
         fs::{
-            append_to_note, create_note, ensure_daily_note, move_note_to_trash, safe_vault_path,
-            toggle_task_at_line, update_note_frontmatter,
+            append_to_note, create_note, ensure_daily_note, file_mtime_and_size,
+            move_note_to_trash, safe_vault_path, toggle_task_at_line_verified,
+            update_note_frontmatter,
         },
         merged_vaults, resolve_active_vault,
     },
@@ -158,7 +159,7 @@ impl McpServer {
         }
     }
 
-    fn resolve_vault(&self, args: &Value) -> Result<VaultProfile> {
+    fn resolve_vault_unsynced(&self, args: &Value) -> Result<VaultProfile> {
         match args
             .get("vault")
             .and_then(|v| v.as_str())
@@ -166,12 +167,14 @@ impl McpServer {
             .filter(|s| !s.is_empty())
         {
             None => Ok(self.default_vault.clone()),
-            Some(spec) => {
-                let v = resolve_active_vault(&self.cfg, Some(spec))?;
-                let _ = self.storage.sync_vault(&v);
-                Ok(v)
-            }
+            Some(spec) => resolve_active_vault(&self.cfg, Some(spec)),
         }
+    }
+
+    fn resolve_vault(&self, args: &Value) -> Result<VaultProfile> {
+        let vault = self.resolve_vault_unsynced(args)?;
+        let _ = self.storage.sync_vault(&vault);
+        Ok(vault)
     }
 
     pub fn dispatch_tool(&self, name: &str, args: &Value) -> Result<Value> {
@@ -180,12 +183,16 @@ impl McpServer {
                 let vaults: Vec<VaultSummary> = merged_vaults(&self.cfg)
                     .into_iter()
                     .map(|v| {
+                        let exists = v.path.is_dir();
+                        if exists {
+                            let _ = self.storage.sync_vault(&v);
+                        }
                         let active = v.id == self.default_vault.id;
                         let count = self.storage.note_count(&v.id).unwrap_or(0);
                         VaultSummary {
                             id: v.id,
                             name: v.name,
-                            exists: v.path.is_dir(),
+                            exists,
                             path: v.path,
                             active,
                             discovered: v.discovered,
@@ -382,9 +389,25 @@ impl McpServer {
                     .and_then(|v| v.as_u64())
                     .ok_or_else(|| anyhow!("Missing integer argument 'line' (1-based line number)"))?
                     as usize;
+                let expected_text = args.get("expected_text").and_then(|v| v.as_str());
+                let expected_checked = args.get("expected_checked").and_then(|v| v.as_bool());
+                let expected_mtime_ms = args.get("expected_mtime_ms").and_then(|v| v.as_i64());
                 let rel_path = self.storage.resolve_note_path(&vault.id, note)?;
                 let abs = safe_vault_path(&vault.path, &rel_path)?;
-                let checked = toggle_task_at_line(&abs, line)?;
+                if let Some(exp_mtime) = expected_mtime_ms {
+                    let (actual_mtime, _) = file_mtime_and_size(&abs);
+                    if actual_mtime != exp_mtime {
+                        bail!(
+                            "Task conflict: note '{rel_path}' modified externally (expected mtime_ms {exp_mtime}, found {actual_mtime})"
+                        );
+                    }
+                }
+                let checked = toggle_task_at_line_verified(
+                    &abs,
+                    line,
+                    expected_text,
+                    expected_checked,
+                )?;
                 let _ = self.storage.sync_vault(&vault);
                 Ok(json!({ "rel_path": rel_path, "line": line, "checked": checked }))
             }
@@ -394,8 +417,8 @@ impl McpServer {
                 Ok(json!({ "count": orphans.len(), "orphans": orphans }))
             }
             "reindex_vault" => {
-                let vault = self.resolve_vault(args)?;
-                let stats = self.storage.sync_vault(&vault)?;
+                let vault = self.resolve_vault_unsynced(args)?;
+                let stats = self.storage.reindex_vault(&vault)?;
                 Ok(serde_json::to_value(stats)?)
             }
             other => bail!("Unknown MCP tool: {other}"),
@@ -593,12 +616,15 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "toggle_task",
-            "Surgically toggle a Markdown checkbox (- [ ] <-> - [x]) at an exact 1-based line number.",
+            "Surgically toggle a Markdown checkbox (- [ ] <-> - [x]) at an exact 1-based line number, optionally verifying expected text/state to guard against shifted lines.",
             json!({
                 "type": "object",
                 "properties": {
                     "note": { "type": "string", "description": "Note path, title, or alias." },
                     "line": { "type": "integer", "description": "1-based line number of the task checkbox." },
+                    "expected_text": { "type": "string", "description": "Optional expected task text at this line; refuses toggle on mismatch." },
+                    "expected_checked": { "type": "boolean", "description": "Optional expected current checked state; refuses toggle on mismatch." },
+                    "expected_mtime_ms": { "type": "integer", "description": "Optional expected note mtime_ms; refuses toggle if file changed." },
                     "vault": { "type": "string", "description": "Optional vault name, ID, or path." }
                 },
                 "required": ["note", "line"]

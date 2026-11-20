@@ -35,7 +35,10 @@ use crate::{
     models::{TaskFilter, VaultSummary},
     storage::Storage,
     vault::{
-        fs::{append_to_note, create_note, ensure_daily_note, safe_vault_path, toggle_task_at_line},
+        fs::{
+            append_to_note, create_note, ensure_daily_note, file_mtime_and_size, safe_vault_path,
+            toggle_task_at_line_verified,
+        },
         merged_vaults, resolve_active_vault,
     },
 };
@@ -113,16 +116,21 @@ fn check_auth(state: &ServeState, headers: &HeaderMap) -> Result<(), Response> {
     }
 }
 
-fn resolve_req_vault(state: &ServeState, vault_param: Option<&str>) -> Result<VaultProfile, Response> {
+fn resolve_req_vault_unsynced(
+    state: &ServeState,
+    vault_param: Option<&str>,
+) -> Result<VaultProfile, Response> {
     match vault_param.map(str::trim).filter(|s| !s.is_empty()) {
         None => Ok(state.default_vault.clone()),
-        Some(spec) => {
-            let v = resolve_active_vault(&state.cfg, Some(spec))
-                .map_err(|e| err_resp(StatusCode::NOT_FOUND, &e.to_string()))?;
-            let _ = state.storage.sync_vault(&v);
-            Ok(v)
-        }
+        Some(spec) => resolve_active_vault(&state.cfg, Some(spec))
+            .map_err(|e| err_resp(StatusCode::NOT_FOUND, &e.to_string())),
     }
+}
+
+fn resolve_req_vault(state: &ServeState, vault_param: Option<&str>) -> Result<VaultProfile, Response> {
+    let vault = resolve_req_vault_unsynced(state, vault_param)?;
+    let _ = state.storage.sync_vault(&vault);
+    Ok(vault)
 }
 
 fn err_resp(status: StatusCode, msg: &str) -> Response {
@@ -130,6 +138,7 @@ fn err_resp(status: StatusCode, msg: &str) -> Response {
 }
 
 async fn handle_health(State(state): State<Arc<ServeState>>) -> impl IntoResponse {
+    let _ = state.storage.sync_vault(&state.default_vault);
     let notes = state.storage.note_count(&state.default_vault.id).unwrap_or(0);
     Json(json!({
         "ok": true,
@@ -151,12 +160,16 @@ async fn handle_list_vaults(
     let vaults: Vec<VaultSummary> = merged_vaults(&state.cfg)
         .into_iter()
         .map(|v| {
+            let exists = v.path.is_dir();
+            if exists {
+                let _ = state.storage.sync_vault(&v);
+            }
             let active = v.id == state.default_vault.id;
             let count = state.storage.note_count(&v.id).unwrap_or(0);
             VaultSummary {
                 id: v.id,
                 name: v.name,
-                exists: v.path.is_dir(),
+                exists,
                 path: v.path,
                 active,
                 discovered: v.discovered,
@@ -515,6 +528,9 @@ async fn handle_tasks(
 struct ToggleTaskReq {
     note: String,
     line: usize,
+    expected_text: Option<String>,
+    expected_checked: Option<bool>,
+    expected_mtime_ms: Option<i64>,
     vault: Option<String>,
 }
 
@@ -538,7 +554,23 @@ async fn handle_toggle_task(
         Ok(p) => p,
         Err(e) => return err_resp(StatusCode::BAD_REQUEST, &e.to_string()),
     };
-    match toggle_task_at_line(&abs, req.line) {
+    if let Some(expected_mtime) = req.expected_mtime_ms {
+        let (actual_mtime, _) = file_mtime_and_size(&abs);
+        if actual_mtime != expected_mtime {
+            return err_resp(
+                StatusCode::CONFLICT,
+                &format!(
+                    "Task conflict: note '{rel_path}' modified externally (expected mtime_ms {expected_mtime}, found {actual_mtime})"
+                ),
+            );
+        }
+    }
+    match toggle_task_at_line_verified(
+        &abs,
+        req.line,
+        req.expected_text.as_deref(),
+        req.expected_checked,
+    ) {
         Ok(checked) => {
             let _ = state.storage.sync_vault(&vault);
             Json(json!({
@@ -549,7 +581,15 @@ async fn handle_toggle_task(
             }))
             .into_response()
         }
-        Err(e) => err_resp(StatusCode::BAD_REQUEST, &e.to_string()),
+        Err(e) => {
+            let msg = e.to_string();
+            let status = if msg.starts_with("Task conflict") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            err_resp(status, &msg)
+        }
     }
 }
 
@@ -565,11 +605,11 @@ async fn handle_reindex(
         .as_ref()
         .and_then(|v| v.0.get("vault"))
         .and_then(|v| v.as_str());
-    let vault = match resolve_req_vault(&state, vault_spec) {
+    let vault = match resolve_req_vault_unsynced(&state, vault_spec) {
         Ok(v) => v,
         Err(r) => return r,
     };
-    match state.storage.sync_vault(&vault) {
+    match state.storage.reindex_vault(&vault) {
         Ok(stats) => Json(json!({ "ok": true, "stats": stats })).into_response(),
         Err(e) => err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }

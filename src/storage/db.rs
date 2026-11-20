@@ -25,9 +25,9 @@ use crate::{
     },
     vault::{
         fs::{
-            folder_from_rel_path, hydrate_parsed_note_links, resolve_note_identifier,
-            resolve_wikilink_target, safe_vault_path, scan_vault_markdown_files,
-            title_from_rel_path,
+            content_sha256_hex, file_mtime_ns_and_size, folder_from_rel_path,
+            hydrate_parsed_note_links, resolve_note_identifier, resolve_wikilink_target,
+            safe_vault_path, scan_vault_markdown_files, title_from_rel_path,
         },
         parser::parse_markdown,
     },
@@ -82,7 +82,9 @@ impl Storage {
                 body_plain TEXT NOT NULL DEFAULT '',
                 word_count INTEGER NOT NULL DEFAULT 0,
                 mtime_ms INTEGER NOT NULL DEFAULT 0,
+                mtime_ns INTEGER NOT NULL DEFAULT 0,
                 size_bytes INTEGER NOT NULL DEFAULT 0,
+                content_hash TEXT NOT NULL DEFAULT '',
                 is_bookmarked INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (vault_id, rel_path)
             );
@@ -141,14 +143,66 @@ impl Storage {
             ",
         )
         .context("Failed to initialize SQLite schema")?;
+
+        // Forward-compatible migration for existing index.db files created before mtime_ns/content_hash.
+        let _ = conn.execute(
+            "ALTER TABLE notes ADD COLUMN mtime_ns INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE notes ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''",
+            [],
+        );
         Ok(())
+    }
+
+    /// Computes a deterministic fingerprint of the vault's indexed note state in SQLite,
+    /// allowing long-lived watchers to detect cross-process updates (e.g. CLI/HTTP/MCP/Daemon).
+    pub fn vault_index_fingerprint(&self, vault_id: &str) -> Result<String> {
+        let conn = self.conn.lock().map_err(|_| anyhow!("Storage lock poisoned"))?;
+        let mut stmt = conn.prepare(
+            "SELECT rel_path, mtime_ms, mtime_ns, size_bytes, word_count, is_bookmarked, content_hash
+             FROM notes
+             WHERE vault_id = ?1
+             ORDER BY rel_path ASC",
+        )?;
+        let rows = stmt.query_map(params![vault_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, String>(6)?,
+            ))
+        })?;
+        let mut acc = String::new();
+        for row in rows {
+            let (rp, mt_ms, mt_ns, sz, wc, bm, hash) = row?;
+            acc.push_str(&rp);
+            acc.push(':');
+            acc.push_str(&mt_ms.to_string());
+            acc.push(':');
+            acc.push_str(&mt_ns.to_string());
+            acc.push(':');
+            acc.push_str(&sz.to_string());
+            acc.push(':');
+            acc.push_str(&wc.to_string());
+            acc.push(':');
+            acc.push_str(&bm.to_string());
+            acc.push(':');
+            acc.push_str(&hash);
+            acc.push('\n');
+        }
+        Ok(content_sha256_hex(acc.as_bytes()))
     }
 
     /// Marks a single note's cached `mtime_ms` stale so the next `sync_vault` unconditionally re-indexes it.
     pub fn invalidate_note_mtime(&self, vault_id: &str, rel_path: &str) -> Result<()> {
         let conn = self.conn.lock().map_err(|_| anyhow!("Storage lock poisoned"))?;
         conn.execute(
-            "UPDATE notes SET mtime_ms = -1 WHERE vault_id = ?1 AND rel_path = ?2",
+            "UPDATE notes SET mtime_ms = -1, mtime_ns = -1, content_hash = '' WHERE vault_id = ?1 AND rel_path = ?2",
             params![vault_id, rel_path],
         )?;
         Ok(())
@@ -171,6 +225,12 @@ impl Storage {
         let title = title_from_rel_path(rel_path);
         let folder = folder_from_rel_path(rel_path);
         let parsed = parse_markdown(rel_path, &title, raw_markdown);
+        let content_hash = content_sha256_hex(raw_markdown.as_bytes());
+        let mtime_ns = safe_vault_path(&vault.path, rel_path)
+            .ok()
+            .filter(|p| p.is_file())
+            .map(|p| file_mtime_ns_and_size(&p).0)
+            .unwrap_or_else(|| mtime_ms.saturating_mul(1_000_000));
 
         let mut conn = self.conn.lock().map_err(|_| anyhow!("Storage lock poisoned"))?;
         let tx = conn.transaction()?;
@@ -196,7 +256,9 @@ impl Storage {
             &folder,
             &parsed,
             mtime_ms,
+            mtime_ns,
             size_bytes,
+            &content_hash,
             is_bookmarked,
         )?;
 
@@ -249,32 +311,49 @@ impl Storage {
         Ok(())
     }
 
-    /// Incrementally scans `vault.path` comparing `(mtime_ms, size_bytes)` against SQLite.
-    /// Parses only added/modified `.md` files, removes deleted notes, and refreshes wikilink resolutions.
+    /// Incrementally scans `vault.path` comparing `(mtime_ms, mtime_ns, size_bytes)` and content hash
+    /// against SQLite. Skips unreadable/locked files without overwriting their last good index row,
+    /// removes deleted notes, and refreshes wikilink resolutions.
     pub fn sync_vault(&self, vault: &VaultProfile) -> Result<IndexStats> {
+        self.sync_vault_with_options(vault, false)
+    }
+
+    /// Explicit full verification scan (always verifies content hashes even on large vaults).
+    pub fn reindex_vault(&self, vault: &VaultProfile) -> Result<IndexStats> {
+        self.sync_vault_with_options(vault, true)
+    }
+
+    pub fn sync_vault_with_options(
+        &self,
+        vault: &VaultProfile,
+        force_hash_check: bool,
+    ) -> Result<IndexStats> {
         let start = Instant::now();
         let disk_entries = scan_vault_markdown_files(&vault.path)?;
         let vault_id = vault.id.as_str();
 
         let mut conn = self.conn.lock().map_err(|_| anyhow!("Storage lock poisoned"))?;
 
-        // Load existing (rel_path -> (mtime_ms, size_bytes, is_bookmarked))
-        let mut existing: HashMap<String, (i64, i64, bool)> = HashMap::new();
+        // Load existing (rel_path -> (mtime_ms, mtime_ns, size_bytes, content_hash, is_bookmarked))
+        let mut existing: HashMap<String, (i64, i64, i64, String, bool)> = HashMap::new();
         {
             let mut stmt = conn.prepare(
-                "SELECT rel_path, mtime_ms, size_bytes, is_bookmarked FROM notes WHERE vault_id = ?1",
+                "SELECT rel_path, mtime_ms, mtime_ns, size_bytes, content_hash, is_bookmarked
+                 FROM notes WHERE vault_id = ?1",
             )?;
             let rows = stmt.query_map(params![vault_id], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, i64>(2)?,
-                    row.get::<_, i64>(3)? != 0,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)? != 0,
                 ))
             })?;
             for r in rows {
-                let (rp, mt, sz, bm) = r?;
-                existing.insert(rp, (mt, sz, bm));
+                let (rp, mt_ms, mt_ns, sz, hash, bm) = r?;
+                existing.insert(rp, (mt_ms, mt_ns, sz, hash, bm));
             }
         }
 
@@ -285,17 +364,43 @@ impl Storage {
             .cloned()
             .collect();
 
-        let mut to_update = Vec::new();
+        let mut to_upsert: Vec<(&crate::vault::fs::DiskNoteEntry, String, String, bool)> =
+            Vec::new();
         for entry in &disk_entries {
             match existing.get(&entry.rel_path) {
-                Some(&(mt, sz, _)) if mt == entry.mtime_ms && sz == entry.size_bytes => {}
-                _ => to_update.push(entry),
+                Some((mt_ms, mt_ns, sz, stored_hash, is_bm))
+                    if *mt_ms == entry.mtime_ms
+                        && *mt_ns == entry.mtime_ns
+                        && *sz == entry.size_bytes =>
+                {
+                    if force_hash_check {
+                        let Ok(bytes) = fs::read(&entry.abs_path) else {
+                            // Unreadable / locked file: keep last successful index intact.
+                            continue;
+                        };
+                        let disk_hash = content_sha256_hex(&bytes);
+                        if stored_hash.is_empty() || *stored_hash != disk_hash {
+                            let raw = decode_utf8_lossy(bytes);
+                            to_upsert.push((entry, raw, disk_hash, *is_bm));
+                        }
+                    }
+                }
+                existing_row => {
+                    let Ok(bytes) = fs::read(&entry.abs_path) else {
+                        // Unreadable / locked file: never poison SQLite with empty content.
+                        continue;
+                    };
+                    let disk_hash = content_sha256_hex(&bytes);
+                    let is_bm = existing_row.map(|t| t.4).unwrap_or(false);
+                    let raw = decode_utf8_lossy(bytes);
+                    to_upsert.push((entry, raw, disk_hash, is_bm));
+                }
             }
         }
 
-        let needs_link_resolution = !to_update.is_empty() || !removed_paths.is_empty();
-        let updated_count = to_update.len();
+        let updated_count = to_upsert.len();
         let removed_count = removed_paths.len();
+        let needs_link_resolution = updated_count > 0 || removed_count > 0;
 
         let tx = conn.transaction()?;
 
@@ -327,14 +432,9 @@ impl Storage {
             )?;
         }
 
-        // Upsert added/modified notes
-        for entry in &to_update {
-            let raw = fs::read_to_string(&entry.abs_path).unwrap_or_default();
-            let parsed = parse_markdown(&entry.rel_path, &entry.title, &raw);
-            let is_bookmarked = existing
-                .get(&entry.rel_path)
-                .map(|t| t.2)
-                .unwrap_or(false);
+        // Upsert added/modified notes (only files that were successfully read from disk)
+        for (entry, raw, disk_hash, is_bookmarked) in &to_upsert {
+            let parsed = parse_markdown(&entry.rel_path, &entry.title, raw);
             upsert_note_in_tx(
                 &tx,
                 vault_id,
@@ -343,8 +443,10 @@ impl Storage {
                 &entry.folder,
                 &parsed,
                 entry.mtime_ms,
+                entry.mtime_ns,
                 entry.size_bytes,
-                is_bookmarked,
+                disk_hash,
+                *is_bookmarked,
             )?;
         }
 
@@ -564,8 +666,9 @@ impl Storage {
     pub fn load_note_detail(&self, vault: &VaultProfile, note_ref: &str) -> Result<NoteDetail> {
         let rel_path = self.resolve_note_path(&vault.id, note_ref)?;
         let abs_path = safe_vault_path(&vault.path, &rel_path)?;
-        let raw_markdown = fs::read_to_string(&abs_path)
+        let raw_bytes = fs::read(&abs_path)
             .with_context(|| format!("Failed to read note: {}", abs_path.display()))?;
+        let raw_markdown = decode_utf8_lossy(raw_bytes);
         let title = title_from_rel_path(&rel_path);
         let mut parsed = parse_markdown(&rel_path, &title, &raw_markdown);
 
@@ -1324,6 +1427,11 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
     out
 }
 
+fn decode_utf8_lossy(bytes: Vec<u8>) -> String {
+    String::from_utf8(bytes)
+        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn upsert_note_in_tx(
     tx: &rusqlite::Transaction<'_>,
@@ -1333,7 +1441,9 @@ fn upsert_note_in_tx(
     folder: &str,
     parsed: &ParsedNote,
     mtime_ms: i64,
+    mtime_ns: i64,
     size_bytes: i64,
+    content_hash: &str,
     is_bookmarked: bool,
 ) -> Result<()> {
     let fm_json = serde_json::to_string(&parsed.frontmatter).unwrap_or_else(|_| "{}".into());
@@ -1344,8 +1454,8 @@ fn upsert_note_in_tx(
     tx.execute(
         "INSERT INTO notes (
             vault_id, rel_path, title, folder, frontmatter_json, aliases_json,
-            body_plain, word_count, mtime_ms, size_bytes, is_bookmarked
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            body_plain, word_count, mtime_ms, mtime_ns, size_bytes, content_hash, is_bookmarked
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
          ON CONFLICT(vault_id, rel_path) DO UPDATE SET
             title = excluded.title,
             folder = excluded.folder,
@@ -1354,7 +1464,9 @@ fn upsert_note_in_tx(
             body_plain = excluded.body_plain,
             word_count = excluded.word_count,
             mtime_ms = excluded.mtime_ms,
-            size_bytes = excluded.size_bytes",
+            mtime_ns = excluded.mtime_ns,
+            size_bytes = excluded.size_bytes,
+            content_hash = excluded.content_hash",
         params![
             vault_id,
             rel_path,
@@ -1365,7 +1477,9 @@ fn upsert_note_in_tx(
             parsed.body_plain,
             parsed.word_count as i64,
             mtime_ms,
+            mtime_ns,
             size_bytes,
+            content_hash,
             i64::from(is_bookmarked),
         ],
     )?;

@@ -13,6 +13,7 @@ pub enum Action {
     // Lifecycle
     Quit,
     QuitConfirm,
+    ForceQuitDiscard,
     RefreshAll,
 
     // Navigation & Focus
