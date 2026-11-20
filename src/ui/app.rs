@@ -32,7 +32,9 @@ use crate::{
             confirm::ConfirmOverlay,
             context_menu::ContextMenuOverlay,
             file_picker::FilePickerOverlay,
-            html_preview::{extract_note_html_candidates, HtmlPreviewOverlay},
+            html_preview::{
+                extract_note_html_candidates, HtmlPreviewOverlay, HtmlPreviewSource,
+            },
             image_preview::ImagePreviewOverlay,
             links::LinkExtractorOverlay,
             note_form::NoteFormOverlay,
@@ -327,6 +329,7 @@ impl AppState {
                 }
             }
             self.refresh_graph(ui);
+            self.refresh_open_html_preview(ui);
             return;
         }
 
@@ -353,6 +356,46 @@ impl AppState {
             self.active_note = None;
         }
         self.refresh_graph(ui);
+        self.refresh_open_html_preview(ui);
+    }
+
+    fn refresh_open_html_preview(&self, ui: &mut UiState) {
+        let Some(Overlay::HtmlPreview(ref mut ov)) = ui.overlay else {
+            return;
+        };
+        match ov.source.clone() {
+            HtmlPreviewSource::File(abs_path) => match fs::read(&abs_path) {
+                Ok(bytes) => {
+                    let html = String::from_utf8_lossy(&bytes).into_owned();
+                    ov.reload_html_if_changed(html);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    ov.session.last_status = Some("HTML file deleted or moved on disk".to_string());
+                }
+                Err(_) => {}
+            },
+            HtmlPreviewSource::NoteBlock {
+                note_rel_path,
+                block_idx,
+            } => {
+                if let Some(detail) = self.active_note.as_ref() {
+                    if detail.summary.rel_path.eq_ignore_ascii_case(&note_rel_path) {
+                        let candidates = extract_note_html_candidates(
+                            detail,
+                            Some(self.active_vault.path.as_path()),
+                        );
+                        if let Some(cand) = candidates
+                            .iter()
+                            .find(|c| c.block_idx == Some(block_idx))
+                            .or_else(|| candidates.first())
+                        {
+                            ov.reload_html_if_changed(cand.html.clone());
+                        }
+                    }
+                }
+            }
+            HtmlPreviewSource::Inline => {}
+        }
     }
 
     pub fn refresh_graph(&mut self, ui: &mut UiState) {
@@ -425,11 +468,10 @@ impl AppState {
                 {
                     let html = String::from_utf8_lossy(&bytes).into_owned();
                     let src = target.abs_path.display().to_string();
-                    return Some(HtmlPreviewOverlay::new(
-                        target.display_name.clone(),
-                        src,
-                        html,
-                    ));
+                    return Some(
+                        HtmlPreviewOverlay::new(target.display_name.clone(), src, html)
+                            .with_source(HtmlPreviewSource::File(target.abs_path.clone())),
+                    );
                 }
                 match decode_and_render_for_protocol(
                     &bytes,
@@ -521,9 +563,10 @@ impl AppState {
                     .unwrap_or(rel_or_target)
                     .to_string();
                 let source = abs_path.display().to_string();
-                ui.open_overlay(Overlay::HtmlPreview(HtmlPreviewOverlay::new(
-                    title, source, html,
-                )));
+                ui.open_overlay(Overlay::HtmlPreview(
+                    HtmlPreviewOverlay::new(title, source, html)
+                        .with_source(HtmlPreviewSource::File(abs_path)),
+                ));
                 true
             }
             Err(e) => {
@@ -556,11 +599,24 @@ impl AppState {
                     .iter()
                     .find(|c| c.block_idx == Some(target_idx))
                     .unwrap_or(&candidates[0]);
-                ui.open_overlay(Overlay::HtmlPreview(HtmlPreviewOverlay::new(
-                    chosen.title.clone(),
-                    chosen.source_label.clone(),
-                    chosen.html.clone(),
-                )));
+                let preview_source = if let Some(abs) = chosen.file_path.clone() {
+                    HtmlPreviewSource::File(abs)
+                } else if let Some(b_idx) = chosen.block_idx {
+                    HtmlPreviewSource::NoteBlock {
+                        note_rel_path: detail.summary.rel_path.clone(),
+                        block_idx: b_idx,
+                    }
+                } else {
+                    HtmlPreviewSource::Inline
+                };
+                ui.open_overlay(Overlay::HtmlPreview(
+                    HtmlPreviewOverlay::new(
+                        chosen.title.clone(),
+                        chosen.source_label.clone(),
+                        chosen.html.clone(),
+                    )
+                    .with_source(preview_source),
+                ));
                 return;
             }
         }
@@ -1630,11 +1686,12 @@ impl AppState {
                                     let html = String::from_utf8_lossy(&bytes).into_owned();
                                     let src = target.abs_path.display().to_string();
                                     let name = target.display_name.clone();
-                                    ui.open_overlay(Overlay::HtmlPreview(HtmlPreviewOverlay::new(
-                                        name.clone(),
-                                        src,
-                                        html,
-                                    )));
+                                    ui.open_overlay(Overlay::HtmlPreview(
+                                        HtmlPreviewOverlay::new(name.clone(), src, html)
+                                            .with_source(HtmlPreviewSource::File(
+                                                target.abs_path.clone(),
+                                            )),
+                                    ));
                                     ui.toasts.info(format!(
                                         "Detected HTML in '{name}' — routed to interactive HTML preview"
                                     ));

@@ -1,6 +1,6 @@
 [package]
 name = "obsidian-cli"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Obsidian-native terminal workspace, interactive knowledge graph & AI agent toolkit — Local Vaults, Backlinks, Graph View, CLI, TUI, HTTP API & MCP"
 license = "MIT"
@@ -27,6 +27,7 @@ dirs = "5"
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 hex = "0.4"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+notify = "8"
 notify-rust = "4"
 open = "5"
 rand = "0.8"

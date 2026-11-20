@@ -25,13 +25,21 @@ use crate::{
     },
     vault::{
         fs::{
-            content_sha256_hex, file_mtime_ns_and_size, folder_from_rel_path,
-            hydrate_parsed_note_links, resolve_note_identifier, resolve_wikilink_target,
-            safe_vault_path, scan_vault_markdown_files, title_from_rel_path,
+            canonical_rel_path_in_vault, content_sha256_hex, file_mtime_ns_and_size,
+            folder_from_rel_path, has_symlink_component_in_vault, hydrate_parsed_note_links,
+            resolve_note_identifier, resolve_wikilink_target, safe_vault_path,
+            scan_vault_markdown_files, title_from_rel_path,
         },
         parser::parse_markdown,
     },
 };
+
+/// Result of an incremental path-scoped sync batch.
+#[derive(Debug, Clone, Default)]
+pub struct PathSyncOutcome {
+    pub stats: IndexStats,
+    pub locked_paths: Vec<String>,
+}
 
 #[derive(Clone)]
 pub struct Storage {
@@ -156,6 +164,14 @@ impl Storage {
         Ok(())
     }
 
+    /// Returns SQLite's `PRAGMA data_version`, an O(1) counter that increments whenever
+    /// any *other* database connection commits a write to `index.db` (e.g. bookmarks or CLI writes).
+    pub fn data_version(&self) -> Result<i64> {
+        let conn = self.conn.lock().map_err(|_| anyhow!("Storage lock poisoned"))?;
+        let ver: i64 = conn.query_row("PRAGMA data_version", [], |r| r.get(0))?;
+        Ok(ver)
+    }
+
     /// Computes a deterministic fingerprint of the vault's indexed note state in SQLite,
     /// allowing long-lived watchers to detect cross-process updates (e.g. CLI/HTTP/MCP/Daemon).
     pub fn vault_index_fingerprint(&self, vault_id: &str) -> Result<String> {
@@ -242,6 +258,7 @@ impl Storage {
                 |r| Ok((r.get::<_, i64>(0)? != 0, r.get::<_, String>(1)?)),
             )
             .optional()?;
+        let is_new = prev.is_none();
         let is_bookmarked = prev.as_ref().map(|(bm, _)| *bm).unwrap_or(false);
         let prev_aliases_json = prev.map(|(_, aj)| aj);
         let new_aliases_json =
@@ -262,53 +279,361 @@ impl Storage {
             is_bookmarked,
         )?;
 
-        // Load vault paths + aliases from SQLite (pure index read, no disk I/O)
-        let mut all_paths: Vec<String> = Vec::new();
-        let mut aliases_by_path: HashMap<String, Vec<String>> = HashMap::new();
-        {
-            let mut stmt =
-                tx.prepare("SELECT rel_path, aliases_json FROM notes WHERE vault_id = ?1")?;
-            let rows = stmt.query_map(params![vault_id], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })?;
-            for r in rows {
-                let (rp, aj) = r?;
-                let aliases: Vec<String> = serde_json::from_str(&aj).unwrap_or_default();
-                if !aliases.is_empty() {
-                    aliases_by_path.insert(rp.clone(), aliases);
-                }
-                all_paths.push(rp);
-            }
+        let mut affected_sources = HashSet::new();
+        affected_sources.insert(rel_path.to_string());
+        let mut affected_targets = HashSet::new();
+        if aliases_changed && !is_new {
+            affected_targets.insert(rel_path.to_string());
         }
-
-        // Resolve outgoing links ONLY for this single note (or all unresolved/targeted links if aliases changed)
-        let mut link_rows: Vec<(i64, String)> = Vec::new();
-        {
-            let sql = if aliases_changed {
-                "SELECT id, target_raw FROM links
-                 WHERE vault_id = ?1 AND (source_path = ?2 OR target_resolved_path = ?2 OR target_resolved_path IS NULL)"
-            } else {
-                "SELECT id, target_raw FROM links WHERE vault_id = ?1 AND source_path = ?2"
-            };
-            let mut stmt = tx.prepare(sql)?;
-            let rows = stmt.query_map(params![vault_id, rel_path], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-            })?;
-            for r in rows {
-                link_rows.push(r?);
-            }
+        let mut stem_candidates = HashSet::new();
+        if is_new {
+            stem_candidates.insert(title.to_ascii_lowercase());
         }
-
-        if !link_rows.is_empty() {
-            let mut upd = tx.prepare("UPDATE links SET target_resolved_path = ?1 WHERE id = ?2")?;
-            for (id, target_raw) in link_rows {
-                let resolved = resolve_wikilink_target(&target_raw, &all_paths, &aliases_by_path);
-                upd.execute(params![resolved, id])?;
-            }
-        }
+        resolve_affected_links_in_tx(
+            &tx,
+            vault_id,
+            &affected_sources,
+            &affected_targets,
+            is_new || aliases_changed,
+            &stem_candidates,
+        )?;
 
         tx.commit()?;
         Ok(())
+    }
+
+    /// Returns lightweight aggregate `IndexStats` from SQLite without scanning the filesystem.
+    pub fn index_stats(
+        &self,
+        vault: &VaultProfile,
+        scanned: usize,
+        updated: usize,
+        removed: usize,
+        elapsed_ms: u64,
+    ) -> Result<IndexStats> {
+        let conn = self.conn.lock().map_err(|_| anyhow!("Storage lock poisoned"))?;
+        index_stats_on_conn(&conn, vault, scanned, updated, removed, elapsed_ms)
+    }
+
+    /// Incrementally syncs only the specified Markdown relative paths and removed directory prefixes
+    /// (zero full-vault directory scan and zero full-vault link sweep).
+    ///
+    /// - Reuses `upsert_single_note` for single live Markdown creations/modifications.
+    /// - Evaluates actual on-disk path state at batch end so atomic replaces and renames converge cleanly.
+    /// - Skips transiently locked/unreadable files (reporting them in `locked_paths`) without poisoning SQLite.
+    /// - Deletes removed notes and re-resolves only affected wikilinks/backlinks.
+    pub fn sync_paths(
+        &self,
+        vault: &VaultProfile,
+        rel_paths: &[String],
+        removed_dir_prefixes: &[String],
+    ) -> Result<PathSyncOutcome> {
+        let start = Instant::now();
+        let vault_id = vault.id.as_str();
+        let canonical_root = fs::canonicalize(&vault.path).ok();
+
+        let mut candidate_paths: Vec<String> = Vec::with_capacity(rel_paths.len());
+        let mut seen_candidates: HashSet<String> = HashSet::new();
+        for rp in rel_paths {
+            let clean = rp.trim().replace('\\', "/").trim_start_matches('/').to_string();
+            if !clean.is_empty() && seen_candidates.insert(clean.clone()) {
+                candidate_paths.push(clean);
+            }
+        }
+
+        // Expand any removed/renamed-away directory prefixes against indexed notes in SQLite.
+        if !removed_dir_prefixes.is_empty() {
+            let conn = self.conn.lock().map_err(|_| anyhow!("Storage lock poisoned"))?;
+            let mut stmt = if cfg!(windows) {
+                conn.prepare(
+                    "SELECT rel_path FROM notes
+                     WHERE vault_id = ?1 AND (LOWER(folder) = LOWER(?2) OR LOWER(folder) LIKE LOWER(?3))",
+                )?
+            } else {
+                conn.prepare(
+                    "SELECT rel_path FROM notes
+                     WHERE vault_id = ?1 AND (folder = ?2 OR folder LIKE ?3)",
+                )?
+            };
+            for prefix in removed_dir_prefixes {
+                let p = prefix
+                    .trim()
+                    .replace('\\', "/")
+                    .trim_matches('/')
+                    .to_string();
+                if p.is_empty() {
+                    continue;
+                }
+                let like_pat = format!("{p}/%");
+                let rows = stmt.query_map(params![vault_id, p, like_pat], |r| r.get::<_, String>(0))?;
+                for r in rows {
+                    let rp = r?;
+                    if seen_candidates.insert(rp.clone()) {
+                        candidate_paths.push(rp);
+                    }
+                }
+            }
+        }
+
+        if candidate_paths.is_empty() {
+            let stats = self.index_stats(vault, 0, 0, 0, start.elapsed().as_millis() as u64)?;
+            return Ok(PathSyncOutcome {
+                stats,
+                locked_paths: Vec::new(),
+            });
+        }
+
+        // Inspect actual on-disk state for each candidate path outside the SQLite lock.
+        struct LiveNoteDisk {
+            rel_path: String,
+            raw: String,
+            mtime_ms: i64,
+            mtime_ns: i64,
+            size_bytes: i64,
+            content_hash: String,
+        }
+
+        let mut live_notes: Vec<LiveNoteDisk> = Vec::new();
+        let mut live_seen: HashSet<String> = HashSet::new();
+        let mut removed_paths: Vec<String> = Vec::new();
+        let mut removed_seen: HashSet<String> = HashSet::new();
+        let mut locked_paths: Vec<String> = Vec::new();
+
+        for rel in &candidate_paths {
+            let Ok(abs) = safe_vault_path(&vault.path, rel) else {
+                continue;
+            };
+            if has_symlink_component_in_vault(&vault.path, rel) {
+                if removed_seen.insert(rel.clone()) {
+                    removed_paths.push(rel.clone());
+                }
+                continue;
+            }
+            match fs::symlink_metadata(&abs) {
+                Ok(meta) if meta.file_type().is_file() && !meta.file_type().is_symlink() => {
+                    // Detect case-only renames on case-insensitive filesystems (Windows/macOS).
+                    let disk_rel = if cfg!(windows) || cfg!(target_os = "macos") {
+                        canonical_rel_path_in_vault(&vault.path, canonical_root.as_deref(), &abs)
+                            .unwrap_or_else(|| rel.clone())
+                    } else {
+                        rel.clone()
+                    };
+                    if disk_rel != *rel && removed_seen.insert(rel.clone()) {
+                        removed_paths.push(rel.clone());
+                    }
+                    if !live_seen.insert(disk_rel.clone()) {
+                        continue;
+                    }
+                    let (mtime_ns, size_bytes) = file_mtime_ns_and_size(&abs);
+                    let mtime_ms = mtime_ns / 1_000_000;
+                    match fs::read(&abs) {
+                        Ok(bytes) => {
+                            let content_hash = content_sha256_hex(&bytes);
+                            let raw = decode_utf8_lossy(bytes);
+                            live_notes.push(LiveNoteDisk {
+                                rel_path: disk_rel,
+                                raw,
+                                mtime_ms,
+                                mtime_ns,
+                                size_bytes,
+                                content_hash,
+                            });
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                            if removed_seen.insert(disk_rel.clone()) {
+                                removed_paths.push(disk_rel);
+                            }
+                        }
+                        Err(_) => {
+                            locked_paths.push(disk_rel);
+                        }
+                    }
+                }
+                Ok(_) => {
+                    // Symlink or directory at note path: not an indexable regular file.
+                    if removed_seen.insert(rel.clone()) {
+                        removed_paths.push(rel.clone());
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    if removed_seen.insert(rel.clone()) {
+                        removed_paths.push(rel.clone());
+                    }
+                }
+                Err(_) => {
+                    locked_paths.push(rel.clone());
+                }
+            }
+        }
+
+        // Fast path: single live Markdown create/modify -> directly reuse `upsert_single_note`.
+        if removed_paths.is_empty() && live_notes.len() == 1 {
+            let note = &live_notes[0];
+            let unchanged = {
+                let conn = self.conn.lock().map_err(|_| anyhow!("Storage lock poisoned"))?;
+                conn.query_row(
+                    "SELECT mtime_ms, mtime_ns, size_bytes, content_hash
+                     FROM notes WHERE vault_id = ?1 AND rel_path = ?2",
+                    params![vault_id, note.rel_path],
+                    |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, i64>(1)?,
+                            r.get::<_, i64>(2)?,
+                            r.get::<_, String>(3)?,
+                        ))
+                    },
+                )
+                .optional()?
+                .is_some_and(|(ms, ns, sz, hash)| {
+                    ms == note.mtime_ms
+                        && ns == note.mtime_ns
+                        && sz == note.size_bytes
+                        && hash == note.content_hash
+                })
+            };
+            let updated = if unchanged {
+                0
+            } else {
+                self.upsert_single_note(
+                    vault,
+                    &note.rel_path,
+                    &note.raw,
+                    note.mtime_ms,
+                    note.size_bytes,
+                )?;
+                1
+            };
+            let stats = self.index_stats(
+                vault,
+                candidate_paths.len(),
+                updated,
+                0,
+                start.elapsed().as_millis() as u64,
+            )?;
+            return Ok(PathSyncOutcome {
+                stats,
+                locked_paths,
+            });
+        }
+
+        let mut conn = self.conn.lock().map_err(|_| anyhow!("Storage lock poisoned"))?;
+        let tx = conn.transaction()?;
+
+        let mut updated_count = 0usize;
+        let mut removed_count = 0usize;
+        let mut affected_sources: HashSet<String> = HashSet::new();
+        let mut affected_targets: HashSet<String> = HashSet::new();
+        let mut stem_candidates: HashSet<String> = HashSet::new();
+        let mut resolve_unresolved = false;
+
+        for rel in &removed_paths {
+            let existed: bool = tx
+                .query_row(
+                    "SELECT 1 FROM notes WHERE vault_id = ?1 AND rel_path = ?2",
+                    params![vault_id, rel],
+                    |_| Ok(true),
+                )
+                .optional()?
+                .unwrap_or(false);
+            if existed {
+                delete_note_in_tx(&tx, vault_id, rel)?;
+                removed_count += 1;
+                affected_targets.insert(rel.clone());
+                stem_candidates.insert(title_from_rel_path(rel).to_ascii_lowercase());
+                resolve_unresolved = true;
+            }
+        }
+
+        for note in &live_notes {
+            let prev: Option<(i64, i64, i64, String, bool, String)> = tx
+                .query_row(
+                    "SELECT mtime_ms, mtime_ns, size_bytes, content_hash, is_bookmarked, aliases_json
+                     FROM notes WHERE vault_id = ?1 AND rel_path = ?2",
+                    params![vault_id, note.rel_path],
+                    |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, i64>(1)?,
+                            r.get::<_, i64>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, i64>(4)? != 0,
+                            r.get::<_, String>(5)?,
+                        ))
+                    },
+                )
+                .optional()?;
+
+            if let Some((ms, ns, sz, ref hash, _, _)) = prev {
+                if ms == note.mtime_ms
+                    && ns == note.mtime_ns
+                    && sz == note.size_bytes
+                    && *hash == note.content_hash
+                {
+                    continue;
+                }
+            }
+
+            let is_new = prev.is_none();
+            let is_bookmarked = prev.as_ref().map(|t| t.4).unwrap_or(false);
+            let prev_aliases_json = prev.map(|t| t.5);
+            let title = title_from_rel_path(&note.rel_path);
+            let folder = folder_from_rel_path(&note.rel_path);
+            let parsed = parse_markdown(&note.rel_path, &title, &note.raw);
+            let new_aliases_json =
+                serde_json::to_string(&parsed.aliases).unwrap_or_else(|_| "[]".into());
+            let aliases_changed = prev_aliases_json.as_deref() != Some(new_aliases_json.as_str());
+
+            upsert_note_in_tx(
+                &tx,
+                vault_id,
+                &note.rel_path,
+                &title,
+                &folder,
+                &parsed,
+                note.mtime_ms,
+                note.mtime_ns,
+                note.size_bytes,
+                &note.content_hash,
+                is_bookmarked,
+            )?;
+
+            updated_count += 1;
+            affected_sources.insert(note.rel_path.clone());
+            if is_new {
+                resolve_unresolved = true;
+                stem_candidates.insert(title.to_ascii_lowercase());
+            } else if aliases_changed {
+                resolve_unresolved = true;
+                affected_targets.insert(note.rel_path.clone());
+            }
+        }
+
+        if updated_count > 0 || removed_count > 0 {
+            resolve_affected_links_in_tx(
+                &tx,
+                vault_id,
+                &affected_sources,
+                &affected_targets,
+                resolve_unresolved,
+                &stem_candidates,
+            )?;
+        }
+
+        let stats = index_stats_on_conn(
+            &tx,
+            vault,
+            candidate_paths.len(),
+            updated_count,
+            removed_count,
+            start.elapsed().as_millis() as u64,
+        )?;
+        tx.commit()?;
+
+        Ok(PathSyncOutcome {
+            stats,
+            locked_paths,
+        })
     }
 
     /// Incrementally scans `vault.path` comparing `(mtime_ms, mtime_ns, size_bytes)` and content hash
@@ -406,30 +731,7 @@ impl Storage {
 
         // Remove deleted notes
         for rel in &removed_paths {
-            tx.execute(
-                "DELETE FROM notes WHERE vault_id = ?1 AND rel_path = ?2",
-                params![vault_id, rel],
-            )?;
-            tx.execute(
-                "DELETE FROM links WHERE vault_id = ?1 AND source_path = ?2",
-                params![vault_id, rel],
-            )?;
-            tx.execute(
-                "DELETE FROM tags WHERE vault_id = ?1 AND note_path = ?2",
-                params![vault_id, rel],
-            )?;
-            tx.execute(
-                "DELETE FROM headings WHERE vault_id = ?1 AND note_path = ?2",
-                params![vault_id, rel],
-            )?;
-            tx.execute(
-                "DELETE FROM tasks WHERE vault_id = ?1 AND note_path = ?2",
-                params![vault_id, rel],
-            )?;
-            tx.execute(
-                "DELETE FROM notes_fts WHERE vault_id = ?1 AND rel_path = ?2",
-                params![vault_id, rel],
-            )?;
+            delete_note_in_tx(&tx, vault_id, rel)?;
         }
 
         // Upsert added/modified notes (only files that were successfully read from disk)
@@ -491,49 +793,17 @@ impl Storage {
             }
         }
 
-        let total_notes: usize = tx
-            .query_row(
-                "SELECT COUNT(*) FROM notes WHERE vault_id = ?1",
-                params![vault_id],
-                |r| r.get::<_, i64>(0),
-            )?
-            .max(0) as usize;
-        let total_links: usize = tx
-            .query_row(
-                "SELECT COUNT(*) FROM links WHERE vault_id = ?1",
-                params![vault_id],
-                |r| r.get::<_, i64>(0),
-            )?
-            .max(0) as usize;
-        let total_tags: usize = tx
-            .query_row(
-                "SELECT COUNT(DISTINCT tag) FROM tags WHERE vault_id = ?1",
-                params![vault_id],
-                |r| r.get::<_, i64>(0),
-            )?
-            .max(0) as usize;
-        let total_tasks: usize = tx
-            .query_row(
-                "SELECT COUNT(*) FROM tasks WHERE vault_id = ?1",
-                params![vault_id],
-                |r| r.get::<_, i64>(0),
-            )?
-            .max(0) as usize;
-
+        let stats = index_stats_on_conn(
+            &tx,
+            vault,
+            disk_entries.len(),
+            updated_count,
+            removed_count,
+            start.elapsed().as_millis() as u64,
+        )?;
         tx.commit()?;
 
-        Ok(IndexStats {
-            vault_id: vault.id.clone(),
-            vault_name: vault.display_name().to_string(),
-            scanned: disk_entries.len(),
-            updated: updated_count,
-            removed: removed_count,
-            total_notes,
-            total_links,
-            total_tags,
-            total_tasks,
-            elapsed_ms: start.elapsed().as_millis() as u64,
-        })
+        Ok(stats)
     }
 
     pub fn note_count(&self, vault_id: &str) -> Result<usize> {
@@ -1430,6 +1700,193 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
 fn decode_utf8_lossy(bytes: Vec<u8>) -> String {
     String::from_utf8(bytes)
         .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+}
+
+fn delete_note_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    vault_id: &str,
+    rel_path: &str,
+) -> Result<()> {
+    tx.execute(
+        "DELETE FROM notes WHERE vault_id = ?1 AND rel_path = ?2",
+        params![vault_id, rel_path],
+    )?;
+    tx.execute(
+        "DELETE FROM links WHERE vault_id = ?1 AND source_path = ?2",
+        params![vault_id, rel_path],
+    )?;
+    tx.execute(
+        "DELETE FROM tags WHERE vault_id = ?1 AND note_path = ?2",
+        params![vault_id, rel_path],
+    )?;
+    tx.execute(
+        "DELETE FROM headings WHERE vault_id = ?1 AND note_path = ?2",
+        params![vault_id, rel_path],
+    )?;
+    tx.execute(
+        "DELETE FROM tasks WHERE vault_id = ?1 AND note_path = ?2",
+        params![vault_id, rel_path],
+    )?;
+    tx.execute(
+        "DELETE FROM notes_fts WHERE vault_id = ?1 AND rel_path = ?2",
+        params![vault_id, rel_path],
+    )?;
+    Ok(())
+}
+
+fn index_stats_on_conn(
+    conn: &Connection,
+    vault: &VaultProfile,
+    scanned: usize,
+    updated: usize,
+    removed: usize,
+    elapsed_ms: u64,
+) -> Result<IndexStats> {
+    let vault_id = vault.id.as_str();
+    let total_notes: usize = conn
+        .query_row(
+            "SELECT COUNT(*) FROM notes WHERE vault_id = ?1",
+            params![vault_id],
+            |r| r.get::<_, i64>(0),
+        )?
+        .max(0) as usize;
+    let total_links: usize = conn
+        .query_row(
+            "SELECT COUNT(*) FROM links WHERE vault_id = ?1",
+            params![vault_id],
+            |r| r.get::<_, i64>(0),
+        )?
+        .max(0) as usize;
+    let total_tags: usize = conn
+        .query_row(
+            "SELECT COUNT(DISTINCT tag) FROM tags WHERE vault_id = ?1",
+            params![vault_id],
+            |r| r.get::<_, i64>(0),
+        )?
+        .max(0) as usize;
+    let total_tasks: usize = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE vault_id = ?1",
+            params![vault_id],
+            |r| r.get::<_, i64>(0),
+        )?
+        .max(0) as usize;
+    Ok(IndexStats {
+        vault_id: vault.id.clone(),
+        vault_name: vault.display_name().to_string(),
+        scanned,
+        updated,
+        removed,
+        total_notes,
+        total_links,
+        total_tags,
+        total_tasks,
+        elapsed_ms,
+    })
+}
+
+fn resolve_affected_links_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    vault_id: &str,
+    affected_sources: &HashSet<String>,
+    affected_targets: &HashSet<String>,
+    resolve_unresolved: bool,
+    stem_candidates: &HashSet<String>,
+) -> Result<()> {
+    if affected_sources.is_empty()
+        && affected_targets.is_empty()
+        && !resolve_unresolved
+        && stem_candidates.is_empty()
+    {
+        return Ok(());
+    }
+
+    let mut all_paths: Vec<String> = Vec::new();
+    let mut aliases_by_path: HashMap<String, Vec<String>> = HashMap::new();
+    {
+        let mut stmt = tx.prepare("SELECT rel_path, aliases_json FROM notes WHERE vault_id = ?1")?;
+        let rows = stmt.query_map(params![vault_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for r in rows {
+            let (rp, aj) = r?;
+            let aliases: Vec<String> = serde_json::from_str(&aj).unwrap_or_default();
+            if !aliases.is_empty() {
+                aliases_by_path.insert(rp.clone(), aliases);
+            }
+            all_paths.push(rp);
+        }
+    }
+
+    let mut target_set = affected_targets.clone();
+    if !stem_candidates.is_empty() {
+        for rp in &all_paths {
+            if stem_candidates.contains(&title_from_rel_path(rp).to_ascii_lowercase()) {
+                target_set.insert(rp.clone());
+            }
+        }
+    }
+
+    let mut seen_link_ids: HashSet<i64> = HashSet::new();
+    let mut link_rows: Vec<(i64, String)> = Vec::new();
+
+    if !affected_sources.is_empty() {
+        let mut stmt = tx.prepare(
+            "SELECT id, target_raw FROM links WHERE vault_id = ?1 AND source_path = ?2",
+        )?;
+        for src in affected_sources {
+            let rows = stmt.query_map(params![vault_id, src], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for r in rows {
+                let (id, target_raw) = r?;
+                if seen_link_ids.insert(id) {
+                    link_rows.push((id, target_raw));
+                }
+            }
+        }
+    }
+
+    if !target_set.is_empty() {
+        let mut stmt = tx.prepare(
+            "SELECT id, target_raw FROM links WHERE vault_id = ?1 AND target_resolved_path = ?2",
+        )?;
+        for tgt in &target_set {
+            let rows = stmt.query_map(params![vault_id, tgt], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for r in rows {
+                let (id, target_raw) = r?;
+                if seen_link_ids.insert(id) {
+                    link_rows.push((id, target_raw));
+                }
+            }
+        }
+    }
+
+    if resolve_unresolved {
+        let mut stmt = tx.prepare(
+            "SELECT id, target_raw FROM links WHERE vault_id = ?1 AND target_resolved_path IS NULL",
+        )?;
+        let rows = stmt.query_map(params![vault_id], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for r in rows {
+            let (id, target_raw) = r?;
+            if seen_link_ids.insert(id) {
+                link_rows.push((id, target_raw));
+            }
+        }
+    }
+
+    if !link_rows.is_empty() {
+        let mut upd = tx.prepare("UPDATE links SET target_resolved_path = ?1 WHERE id = ?2")?;
+        for (id, target_raw) in link_rows {
+            let resolved = resolve_wikilink_target(&target_raw, &all_paths, &aliases_by_path);
+            upd.execute(params![resolved, id])?;
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

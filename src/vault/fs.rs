@@ -26,6 +26,113 @@ use crate::{
 
 const IGNORED_DIRS: &[&str] = &[".obsidian", ".git", ".trash", "node_modules"];
 
+/// Returns `true` when a directory segment is excluded by Obsidian vault traversal rules.
+pub fn is_ignored_dir_name(name: &str) -> bool {
+    IGNORED_DIRS.iter().any(|&ig| name.eq_ignore_ascii_case(ig)) || name.starts_with('.')
+}
+
+/// Returns `true` when `path` ends with `.md` (case-insensitive).
+pub fn is_markdown_file_path(path: &str) -> bool {
+    let fname = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    fname.len() > 3 && fname.to_ascii_lowercase().ends_with(".md")
+}
+
+/// Strips Windows verbatim prefix (`\\?\`) and normalizes path separators for root prefix checks.
+fn clean_fs_path_components(path: &Path) -> String {
+    let raw = path.to_string_lossy().replace('\\', "/");
+    let stripped = raw.strip_prefix("//?/").unwrap_or(&raw);
+    stripped.trim_end_matches('/').to_string()
+}
+
+/// Converts an absolute filesystem `path` inside `vault_root` (or `canonical_root`) into a
+/// normalized POSIX relative path, returning `None` if outside the vault or inside an ignored/dot directory.
+pub fn rel_path_in_vault(
+    vault_root: &Path,
+    canonical_root: Option<&Path>,
+    path: &Path,
+) -> Option<String> {
+    let rel_raw = path
+        .strip_prefix(vault_root)
+        .ok()
+        .or_else(|| canonical_root.and_then(|c| path.strip_prefix(c).ok()))
+        .map(normalize_rel_path)
+        .or_else(|| {
+            let p_str = clean_fs_path_components(path);
+            let roots = [Some(vault_root), canonical_root];
+            for root in roots.into_iter().flatten() {
+                let r_str = clean_fs_path_components(root);
+                if r_str.is_empty() {
+                    continue;
+                }
+                let matched_rest = if cfg!(windows) {
+                    let p_low = p_str.to_ascii_lowercase();
+                    let r_low = r_str.to_ascii_lowercase();
+                    if p_low.starts_with(&r_low)
+                        && p_str.as_bytes().get(r_str.len()) == Some(&b'/')
+                    {
+                        Some(&p_str[r_str.len() + 1..])
+                    } else {
+                        None
+                    }
+                } else if p_str.starts_with(&r_str)
+                    && p_str.as_bytes().get(r_str.len()) == Some(&b'/')
+                {
+                    Some(&p_str[r_str.len() + 1..])
+                } else {
+                    None
+                };
+                if let Some(rest) = matched_rest {
+                    return Some(rest.trim_start_matches('/').to_string());
+                }
+            }
+            None
+        })?;
+
+    if rel_raw.is_empty() {
+        return None;
+    }
+
+    let mut segments = rel_raw.split('/').peekable();
+    while let Some(seg) = segments.next() {
+        if seg.is_empty() || seg == "." || seg == ".." {
+            return None;
+        }
+        let is_last = segments.peek().is_none();
+        if !is_last && is_ignored_dir_name(seg) {
+            return None;
+        }
+    }
+    Some(rel_raw)
+}
+
+/// Returns `true` if any path component of `rel_path` inside `vault_root` is a symlink.
+pub fn has_symlink_component_in_vault(vault_root: &Path, rel_path: &str) -> bool {
+    let mut cur = vault_root.to_path_buf();
+    for seg in rel_path.split('/') {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        cur.push(seg);
+        if let Ok(meta) = fs::symlink_metadata(&cur) {
+            if meta.file_type().is_symlink() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Resolves the canonical on-disk relative path inside `vault_root` when the target exists.
+/// Useful on case-insensitive filesystems (Windows/macOS) to detect case-only renames.
+pub fn canonical_rel_path_in_vault(
+    vault_root: &Path,
+    canonical_root: Option<&Path>,
+    abs_path: &Path,
+) -> Option<String> {
+    let canon = fs::canonicalize(abs_path).ok()?;
+    rel_path_in_vault(vault_root, canonical_root, &canon)
+}
+
 /// Computes raw SHA-256 digest bytes for content comparison.
 pub fn content_sha256_bytes(bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
@@ -86,6 +193,20 @@ pub fn scan_vault_html_files(vault_root: &Path) -> Result<Vec<VaultHtmlFile>> {
     Ok(out)
 }
 
+/// Walks a single subdirectory inside `vault_root` recursively for `.html`/`.htm`/`.xhtml` files.
+pub fn scan_vault_html_subdir(vault_root: &Path, subdir: &Path) -> Result<Vec<VaultHtmlFile>> {
+    let is_real_dir = fs::symlink_metadata(subdir)
+        .map(|m| m.file_type().is_dir() && !m.file_type().is_symlink())
+        .unwrap_or(false);
+    if !is_real_dir {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    walk_html_dir_recursive(vault_root, subdir, &mut out)?;
+    out.sort_by(|a, b| a.rel_path.to_ascii_lowercase().cmp(&b.rel_path.to_ascii_lowercase()));
+    Ok(out)
+}
+
 fn walk_html_dir_recursive(root: &Path, dir: &Path, out: &mut Vec<VaultHtmlFile>) -> Result<()> {
     let entries = match fs::read_dir(dir) {
         Ok(rd) => rd,
@@ -102,9 +223,7 @@ fn walk_html_dir_recursive(root: &Path, dir: &Path, out: &mut Vec<VaultHtmlFile>
             continue;
         }
         if ft.is_dir() {
-            if IGNORED_DIRS.iter().any(|&ig| name.eq_ignore_ascii_case(ig))
-                || name.starts_with('.')
-            {
+            if is_ignored_dir_name(&name) {
                 continue;
             }
             walk_html_dir_recursive(root, &path, out)?;
@@ -140,6 +259,20 @@ pub fn scan_vault_markdown_files(vault_root: &Path) -> Result<Vec<DiskNoteEntry>
     Ok(out)
 }
 
+/// Walks a single subdirectory inside `vault_root` recursively for `.md` files.
+pub fn scan_vault_markdown_subdir(vault_root: &Path, subdir: &Path) -> Result<Vec<DiskNoteEntry>> {
+    let is_real_dir = fs::symlink_metadata(subdir)
+        .map(|m| m.file_type().is_dir() && !m.file_type().is_symlink())
+        .unwrap_or(false);
+    if !is_real_dir {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    walk_dir_recursive(vault_root, subdir, &mut out)?;
+    out.sort_by(|a, b| a.rel_path.to_ascii_lowercase().cmp(&b.rel_path.to_ascii_lowercase()));
+    Ok(out)
+}
+
 fn walk_dir_recursive(root: &Path, dir: &Path, out: &mut Vec<DiskNoteEntry>) -> Result<()> {
     let entries = match fs::read_dir(dir) {
         Ok(rd) => rd,
@@ -156,14 +289,12 @@ fn walk_dir_recursive(root: &Path, dir: &Path, out: &mut Vec<DiskNoteEntry>) -> 
             continue;
         }
         if ft.is_dir() {
-            if IGNORED_DIRS.iter().any(|&ig| name.eq_ignore_ascii_case(ig))
-                || name.starts_with('.')
-            {
+            if is_ignored_dir_name(&name) {
                 continue;
             }
             walk_dir_recursive(root, &path, out)?;
         } else if ft.is_file() {
-            if !name.to_ascii_lowercase().ends_with(".md") {
+            if !is_markdown_file_path(&name) {
                 continue;
             }
             let Ok(rel) = path.strip_prefix(root) else {

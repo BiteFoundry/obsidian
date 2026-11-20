@@ -11,7 +11,7 @@
 
 use std::fmt;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use bitefoundry_html::{
     looks_like_html_bytes, HtmlEffect, HtmlTheme, HtmlViewSession,
@@ -51,6 +51,19 @@ pub struct HtmlCandidate {
     pub source_label: String,
     pub html: String,
     pub block_idx: Option<usize>,
+    pub file_path: Option<PathBuf>,
+}
+
+/// Tracks where an open `HtmlPreviewOverlay` loaded its HTML from so live disk updates can refresh it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum HtmlPreviewSource {
+    #[default]
+    Inline,
+    File(PathBuf),
+    NoteBlock {
+        note_rel_path: String,
+        block_idx: usize,
+    },
 }
 
 /// Returns `true` if a fenced code block language tag denotes HTML.
@@ -164,6 +177,7 @@ pub fn extract_note_html_candidates(
                     source_label: format!("```{} · line {}", language.trim(), line_no),
                     html: code.clone(),
                     block_idx: Some(b_idx),
+                    file_path: None,
                 });
             }
             NoteBlock::Paragraph { line_no, .. } => {
@@ -174,6 +188,7 @@ pub fn extract_note_html_candidates(
                             source_label: format!("inline HTML · line {line_no}"),
                             html: raw,
                             block_idx: Some(b_idx),
+                            file_path: None,
                         });
                     }
                 }
@@ -192,6 +207,7 @@ pub fn extract_note_html_candidates(
                                     source_label: abs.display().to_string(),
                                     html,
                                     block_idx: Some(b_idx),
+                                    file_path: Some(abs),
                                 });
                             }
                         }
@@ -221,6 +237,7 @@ pub fn extract_note_html_candidates(
                                 source_label: abs.display().to_string(),
                                 html,
                                 block_idx: None,
+                                file_path: Some(abs),
                             });
                         }
                     }
@@ -273,6 +290,7 @@ pub struct HtmlPreviewOverlay {
     pub session: HtmlViewSession,
     pub title: String,
     pub source_label: String,
+    pub source: HtmlPreviewSource,
     pub last_modal_rect: Rect,
     pub last_content_rect: Rect,
     pub last_total_lines: usize,
@@ -285,6 +303,7 @@ impl fmt::Debug for HtmlPreviewOverlay {
         f.debug_struct("HtmlPreviewOverlay")
             .field("title", &self.title)
             .field("source_label", &self.source_label)
+            .field("source", &self.source)
             .field("raw_mode", &self.session.raw_mode)
             .field("scroll_y", &self.session.scroll_y)
             .field("focused_control", &self.session.focused_control)
@@ -325,12 +344,46 @@ impl HtmlPreviewOverlay {
             session,
             title: resolved_title,
             source_label: source_label.into(),
+            source: HtmlPreviewSource::Inline,
             last_modal_rect: Rect::default(),
             last_content_rect: Rect::default(),
             last_total_lines: 0,
             last_visible_lines: 0,
             pending_scroll_to_focus: false,
         }
+    }
+
+    pub fn with_source(mut self, source: HtmlPreviewSource) -> Self {
+        self.source = source;
+        self
+    }
+
+    /// Rebuilds the preview session when backing HTML changed on disk, preserving view mode and scroll.
+    pub fn reload_html_if_changed(&mut self, html: String) -> bool {
+        if self.session.raw_html() == html {
+            return false;
+        }
+        let was_raw = self.session.raw_mode;
+        let prev_scroll = self.session.scroll_y;
+        let mut session = HtmlViewSession::new(
+            if self.title.trim().is_empty() {
+                None
+            } else {
+                Some(self.title.clone())
+            },
+            html,
+        );
+        if let Some(t) = session.title() {
+            if !t.trim().is_empty() {
+                self.title = t.to_string();
+            }
+        }
+        let _ = session.take_pending_effects();
+        session.raw_mode = was_raw;
+        session.scroll_y = prev_scroll;
+        session.last_status = Some("Reloaded updated HTML".to_string());
+        self.session = session;
+        true
     }
 
     pub fn is_editing_input(&self) -> bool {

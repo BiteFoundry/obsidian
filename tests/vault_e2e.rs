@@ -2357,3 +2357,155 @@ fn test_attachment_preview_cache_refreshes_on_external_overwrite_and_move_preser
             .is_bookmarked
     );
 }
+
+#[tokio::test]
+async fn test_realtime_watcher_html_preview_reload_rapid_saves_backlinks_and_dirty_draft() {
+    use std::time::Duration;
+
+    use obsidian_cli::{
+        config::write_atomic,
+        sync::{spawn_vault_watcher_with_options, WatcherMode, WatcherOptions},
+        ui::overlays::Overlay,
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("RealtimeVault");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("Alpha.md"),
+        "---\ntags: [init]\n---\n# Alpha\n\nLinks to [[FutureNote]].\n\n- [ ] Alpha initial\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("Report.html"),
+        "<!DOCTYPE html><html><head><title>Report V1</title></head><body><h1>V1_HTML_BODY</h1></body></html>",
+    )
+    .unwrap();
+
+    let db_file = tmp.path().join("rt.db");
+    let vault = vault_from_dir(&root, Some("RealtimeVault"));
+    let storage = Storage::open(&db_file).unwrap();
+    let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
+    let (sync_ctrl, diag) = spawn_vault_watcher_with_options(
+        vault.clone(),
+        storage.clone(),
+        2_500,
+        ev_tx,
+        WatcherOptions::default(),
+    );
+    assert_eq!(diag.mode(), WatcherMode::Native);
+
+    let mut cfg = AppConfig::default();
+    cfg.upsert_vault(vault.clone(), true);
+    let mut app = AppState::new(cfg.clone(), vault.clone(), storage.clone(), sync_ctrl);
+    let mut ui = UiState::from_config(&cfg);
+
+    let init_ev = tokio::time::timeout(Duration::from_secs(3), ev_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    app.handle_core_event(init_ev, &mut ui);
+    app.open_note(&mut ui, "Alpha.md", false);
+
+    // 1. Open HTML preview on Report.html, then atomically replace Report.html externally -> live reload!
+    assert!(app.open_html_file(&mut ui, "Report.html"));
+    write_atomic(
+        &root.join("Report.html"),
+        b"<!DOCTYPE html><html><head><title>Report V2</title></head><body><h1>V2_REPLACED_HTML</h1></body></html>",
+    )
+    .unwrap();
+    let ev_html = tokio::time::timeout(Duration::from_secs(3), ev_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    app.handle_core_event(ev_html, &mut ui);
+    match ui.overlay.as_ref() {
+        Some(Overlay::HtmlPreview(ov)) => {
+            assert!(ov.session.raw_html().contains("V2_REPLACED_HTML"));
+            assert_eq!(
+                ov.session.last_status.as_deref(),
+                Some("Reloaded updated HTML")
+            );
+        }
+        other => panic!("expected refreshed HtmlPreview overlay, got {other:?}"),
+    }
+    ui.close_overlay();
+
+    // 2. Rapid consecutive saves on Alpha.md coalesce cleanly to final state
+    for i in 1..=8 {
+        write_atomic(
+            &root.join("Alpha.md"),
+            format!(
+                "---\ntags: [init, rapid]\n---\n# Alpha\n\nRAPID_SAVE_{i}\n\nLinks to [[FutureNote]].\n\n- [ ] Alpha task {i}\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(8)).await;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let rem = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let ev = tokio::time::timeout(rem, ev_rx.recv()).await.unwrap().unwrap();
+        app.handle_core_event(ev, &mut ui);
+        if app
+            .active_note
+            .as_ref()
+            .is_some_and(|d| d.raw_markdown.contains("RAPID_SAVE_8"))
+        {
+            break;
+        }
+    }
+    assert_eq!(storage.search_notes(&vault.id, "RAPID_SAVE_8", 10).unwrap().len(), 1);
+    assert!(storage.list_tags(&vault.id).unwrap().iter().any(|t| t.tag == "rapid"));
+
+    // 3. Create FutureNote.md -> Alpha's unresolved link resolves and FutureNote gets backlink;
+    //    then rename FutureNote.md -> RenamedNote.md -> old path cleaned up from search & links!
+    fs::write(root.join("FutureNote.md"), "# FutureNote\n\nFUTURE_BODY_77\n").unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let rem = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let ev = tokio::time::timeout(rem, ev_rx.recv()).await.unwrap().unwrap();
+        app.handle_core_event(ev, &mut ui);
+        if storage.get_backlinks(&vault.id, "FutureNote.md").unwrap().len() == 1 {
+            break;
+        }
+    }
+    fs::rename(root.join("FutureNote.md"), root.join("RenamedNote.md")).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let rem = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let ev = tokio::time::timeout(rem, ev_rx.recv()).await.unwrap().unwrap();
+        app.handle_core_event(ev, &mut ui);
+        let hits_old = storage.search_notes(&vault.id, "FutureNote", 10).unwrap();
+        let hits_new = storage.search_notes(&vault.id, "FUTURE_BODY_77", 10).unwrap();
+        if hits_old.iter().all(|h| h.rel_path != "FutureNote.md")
+            && hits_new.len() == 1
+            && hits_new[0].rel_path == "RenamedNote.md"
+        {
+            break;
+        }
+    }
+    assert!(storage.get_backlinks(&vault.id, "FutureNote.md").unwrap().is_empty());
+
+    // 4. Dirty inline editor + external atomic edit preserves both local draft and external disk bytes
+    app.dispatch(Action::OpenNoteEditor, &mut ui);
+    app.dispatch(Action::Input('X'), &mut ui);
+    assert!(ui.inline_editor.as_ref().unwrap().dirty);
+    write_atomic(
+        &root.join("Alpha.md"),
+        b"# Alpha\n\nEXTERNAL_CONCURRENT_EDIT_555\n",
+    )
+    .unwrap();
+    let ev_conf = tokio::time::timeout(Duration::from_secs(3), ev_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    app.handle_core_event(ev_conf, &mut ui);
+    let ed = ui.inline_editor.as_ref().unwrap();
+    assert!(ed.external_conflict.is_some());
+    assert!(ed.composer.text().contains('X'));
+    assert!(fs::read_to_string(root.join("Alpha.md"))
+        .unwrap()
+        .contains("EXTERNAL_CONCURRENT_EDIT_555"));
+}
