@@ -129,7 +129,7 @@ pub async fn run_tui(
 
     let mut reader = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(250));
-    let mut physics_tick = tokio::time::interval(Duration::from_millis(25));
+    let mut physics_tick = tokio::time::interval(Duration::from_millis(33));
     physics_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {

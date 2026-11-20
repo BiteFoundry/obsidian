@@ -51,6 +51,7 @@ pub struct GraphSim {
     pub last_mouse: Option<(u16, u16)>,
     pub hovered_node: Option<usize>,
     pub energy: f64,
+    pub settle_frames: u16,
     pub canvas_area: Cell<Rect>,
     graph_sig: (Option<String>, usize, usize),
 }
@@ -70,6 +71,7 @@ impl Default for GraphSim {
             last_mouse: None,
             hovered_node: None,
             energy: 0.0,
+            settle_frames: 0,
             canvas_area: Cell::new(Rect::default()),
             graph_sig: (None, 0, 0),
         }
@@ -78,7 +80,7 @@ impl Default for GraphSim {
 
 impl GraphSim {
     pub fn is_active(&self) -> bool {
-        self.dragging_node.is_some() || self.energy > 0.0008
+        self.dragging_node.is_some() || (self.energy > 0.0012 && self.settle_frames < 55)
     }
 
     pub fn sync_from_graph(&mut self, graph: &GraphData) {
@@ -97,6 +99,7 @@ impl GraphSim {
         self.panning = false;
         self.hovered_node = None;
         self.energy = 0.0;
+        self.settle_frames = 0;
     }
 
     pub fn reset_view(&mut self, graph: &GraphData) {
@@ -109,6 +112,7 @@ impl GraphSim {
         self.drag_moved = false;
         self.panning = false;
         self.energy = 0.0;
+        self.settle_frames = 0;
     }
 
     pub fn world_to_view(&self, wx: f64, wy: f64) -> (f64, f64) {
@@ -127,7 +131,7 @@ impl GraphSim {
         let vy = (row.saturating_sub(area.y) as f64) / (area.height.saturating_sub(1) as f64);
         let wx = 0.5 + (vx - 0.5 - self.pan_x) / self.zoom;
         let wy = 0.5 + (vy - 0.5 - self.pan_y) / self.zoom;
-        Some((wx.clamp(-0.6, 1.6), wy.clamp(-0.6, 1.6)))
+        Some((wx.clamp(0.04, 0.96), wy.clamp(0.06, 0.94)))
     }
 
     pub fn move_dragged_node(&mut self, graph: &GraphData, col: u16, row: u16) {
@@ -141,10 +145,8 @@ impl GraphSim {
             self.positions.insert(node.id.clone(), (wx, wy));
             self.velocities.insert(node.id.clone(), (0.0, 0.0));
             self.drag_moved = true;
-            self.energy = 1.0;
-            // Two quick substeps so connected neighbors react immediately while dragging
-            self.step_physics(graph);
-            self.step_physics(graph);
+            self.energy = 0.02;
+            self.settle_frames = 0;
         }
     }
 
@@ -153,15 +155,16 @@ impl GraphSim {
         if area.width < 2 || area.height < 2 {
             return;
         }
-        self.pan_x = (self.pan_x + (dcol as f64) / (area.width as f64)).clamp(-1.5, 1.5);
-        self.pan_y = (self.pan_y + (drow as f64) / (area.height as f64)).clamp(-1.5, 1.5);
+        self.pan_x = (self.pan_x + (dcol as f64) / (area.width as f64)).clamp(-1.2, 1.2);
+        self.pan_y = (self.pan_y + (drow as f64) / (area.height as f64)).clamp(-1.2, 1.2);
     }
 
     pub fn zoom_by(&mut self, factor: f64) {
         self.zoom = (self.zoom * factor).clamp(0.45, 3.2);
     }
 
-    /// Single damped spring-repulsion physics step. Dragged node stays anchored to cursor.
+    /// Calm, heavily damped spring-repulsion step (zero overshoot, zero jitter).
+    /// Dragged node stays anchored to cursor; connected neighbors glide smoothly.
     pub fn step_physics(&mut self, graph: &GraphData) {
         let n = graph.nodes.len();
         if n == 0 {
@@ -177,20 +180,35 @@ impl GraphSim {
             .and_then(|idx| graph.nodes.get(idx))
             .map(|gn| gn.id.as_str());
 
+        if dragged_id.is_none() {
+            self.settle_frames = self.settle_frames.saturating_add(1);
+            if self.settle_frames >= 55 {
+                self.velocities.clear();
+                self.energy = 0.0;
+                return;
+            }
+        } else {
+            self.settle_frames = 0;
+        }
+
         let ids: Vec<&str> = graph.nodes.iter().map(|gn| gn.id.as_str()).collect();
         let mut forces: HashMap<&str, (f64, f64)> =
             ids.iter().map(|&id| (id, (0.0, 0.0))).collect();
 
-        // 1. Pairwise repulsion (horizontal bias for readable labels)
+        // 1. Softly-capped short-range repulsion (prevents overlap without ever exploding)
         for i in 0..ids.len() {
             for j in (i + 1)..ids.len() {
                 let Some(&(x1, y1)) = self.positions.get(ids[i]) else { continue };
                 let Some(&(x2, y2)) = self.positions.get(ids[j]) else { continue };
                 let dx = x1 - x2;
-                let dy = (y1 - y2) * 1.3;
-                let dist_sq = (dx * dx + dy * dy).max(0.003);
-                let dist = dist_sq.sqrt();
-                let rep = 0.0024 / dist_sq;
+                let dy = (y1 - y2) * 1.25;
+                let dist_sq = dx * dx + dy * dy;
+                // Only repel when within 0.32 normalized units
+                if dist_sq > 0.1024 {
+                    continue;
+                }
+                let dist = dist_sq.max(0.008).sqrt();
+                let rep = (0.00045 / dist_sq.max(0.012)).min(0.012);
                 let fx = (dx / dist) * rep;
                 let fy = (dy / dist) * rep * 0.78;
                 if let Some(f) = forces.get_mut(ids[i]) {
@@ -204,15 +222,15 @@ impl GraphSim {
             }
         }
 
-        // 2. Hooke's law spring attraction along edges
+        // 2. Gentle Hooke's law spring along edges
         for edge in &graph.edges {
             let Some(&(x1, y1)) = self.positions.get(&edge.source) else { continue };
             let Some(&(x2, y2)) = self.positions.get(&edge.target) else { continue };
             let dx = x2 - x1;
             let dy = y2 - y1;
             let dist = (dx * dx + dy * dy).sqrt().max(0.01);
-            let ideal = 0.26;
-            let pull = (dist - ideal) * 0.14;
+            let ideal = 0.25;
+            let pull = ((dist - ideal) * 0.055).clamp(-0.014, 0.014);
             let fx = (dx / dist) * pull;
             let fy = (dy / dist) * pull;
             if let Some(f) = forces.get_mut(edge.source.as_str()) {
@@ -225,7 +243,7 @@ impl GraphSim {
             }
         }
 
-        // 3. Gentle center gravity + velocity integration with damping
+        // 3. Gentle centering pull + heavy viscous damping (0.64) + strict speed cap (0.018)
         let mut max_speed = 0.0f64;
         for &id in &ids {
             if dragged_id == Some(id) {
@@ -234,28 +252,28 @@ impl GraphSim {
             }
             let Some(&(px, py)) = self.positions.get(id) else { continue };
             let (fx, fy) = forces.get(id).copied().unwrap_or((0.0, 0.0));
-            let gx = (0.5 - px) * 0.012;
-            let gy = (0.5 - py) * 0.012;
+            let gx = (0.5 - px) * 0.006;
+            let gy = (0.5 - py) * 0.006;
 
             let (vx0, vy0) = self.velocities.get(id).copied().unwrap_or((0.0, 0.0));
-            let vx = ((vx0 + fx + gx) * 0.78).clamp(-0.055, 0.055);
-            let vy = ((vy0 + fy + gy) * 0.78).clamp(-0.055, 0.055);
+            let vx = ((vx0 + fx + gx) * 0.64).clamp(-0.018, 0.018);
+            let vy = ((vy0 + fy + gy) * 0.64).clamp(-0.018, 0.018);
             let speed = (vx * vx + vy * vy).sqrt();
             if speed > max_speed {
                 max_speed = speed;
             }
 
-            let nx = (px + vx).clamp(-0.5, 1.5);
-            let ny = (py + vy).clamp(-0.5, 1.5);
+            let nx = (px + vx).clamp(0.05, 0.95);
+            let ny = (py + vy).clamp(0.07, 0.93);
             self.positions.insert(id.to_string(), (nx, ny));
             self.velocities.insert(id.to_string(), (vx, vy));
         }
 
-        if self.dragging_node.is_some() {
-            self.energy = max_speed.max(0.02);
+        self.energy = if self.dragging_node.is_some() {
+            max_speed.max(0.008)
         } else {
-            self.energy = max_speed;
-        }
+            max_speed
+        };
     }
 }
 
