@@ -1572,3 +1572,84 @@ fn test_graph_stability_click_hover_cursor_centered_wheel_zoom_pan_and_keys() {
             .is_some());
     }
 }
+
+#[test]
+fn test_inline_editor_delta_undo_redo_survives_autosave_and_ctrl_s_with_sqlite_index() {
+    use std::time::{Duration, Instant};
+
+    use obsidian_cli::ui::inline_editor::InlineSaveStatus;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("UndoSaveVault");
+    fs::create_dir_all(&root).unwrap();
+    seed_vault(&root);
+
+    let note_rel = "Projects/Q4 Architecture RFC.md";
+    let note_abs = root.join(note_rel);
+    let original_disk = fs::read_to_string(&note_abs).unwrap();
+
+    let vault = vault_from_dir(&root, Some("UndoSaveVault"));
+    let mut cfg = AppConfig::default();
+    cfg.upsert_vault(vault.clone(), true);
+    let storage = Storage::open_in_memory().unwrap();
+    storage.sync_vault(&vault).unwrap();
+    let (focus_tx, _focus_rx) = watch::channel(FocusTarget::default());
+    let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel::<SyncCommand>();
+    let mut app = AppState::new(cfg.clone(), vault.clone(), storage, SyncController::from_channels(focus_tx, cmd_tx));
+    let mut ui = UiState::from_config(&cfg);
+    app.reload_from_storage(&mut ui);
+    app.open_note(&mut ui, note_rel, false);
+
+    let trigger_autosave = |app: &mut AppState, ui: &mut UiState| {
+        ui.inline_editor.as_mut().unwrap().dirty_since =
+            Some(Instant::now() - Duration::from_millis(300));
+        app.dispatch(Action::InlineEditTick, ui);
+    };
+
+    // Enter inline edit mode below YAML frontmatter and paste Korean + emoji + tag.
+    app.dispatch(Action::OpenNoteEditor, &mut ui);
+    for _ in 0..7 {
+        app.dispatch(Action::CursorDown, &mut ui);
+    }
+    app.dispatch(Action::CursorEnd, &mut ui);
+    let cursor_before_paste = ui.inline_editor.as_ref().unwrap().composer.cursor();
+    app.dispatch(Action::Paste("\n## 한글 요약 🚀 #undodelta".into()), &mut ui);
+    let cursor_after_paste = ui.inline_editor.as_ref().unwrap().composer.cursor();
+
+    // 1. Autosave persists file + SQLite index without clearing Undo history.
+    trigger_autosave(&mut app, &mut ui);
+    assert_eq!(ui.inline_editor.as_ref().unwrap().save_status, InlineSaveStatus::Saved);
+    assert!(fs::read_to_string(&note_abs).unwrap().contains("## 한글 요약 🚀 #undodelta"));
+    assert!(app.tags.iter().any(|t| t.tag == "undodelta"));
+    assert_eq!(app.storage.search_notes(&vault.id, "한글 요약", 10).unwrap().len(), 1);
+
+    // 2. Append '!', save via Ctrl+S, move cursor away, then Undo across both saves.
+    app.dispatch(Action::Input('!'), &mut ui);
+    app.dispatch(Action::SaveInlineEdit, &mut ui);
+    assert!(fs::read_to_string(&note_abs).unwrap().contains("#undodelta!"));
+
+    app.dispatch(Action::CursorHome, &mut ui);
+    app.dispatch(Action::Undo, &mut ui);
+    assert_eq!(ui.inline_editor.as_ref().unwrap().composer.cursor(), cursor_after_paste);
+
+    app.dispatch(Action::Undo, &mut ui);
+    let ed = ui.inline_editor.as_ref().unwrap();
+    assert_eq!((ed.composer.cursor(), ed.disk_markdown()), (cursor_before_paste, original_disk.clone()));
+
+    app.dispatch(Action::SaveInlineEdit, &mut ui);
+    assert_eq!(fs::read_to_string(&note_abs).unwrap(), original_disk);
+    assert!(!app.tags.iter().any(|t| t.tag == "undodelta"));
+    assert!(app.storage.search_notes(&vault.id, "한글 요약", 10).unwrap().is_empty());
+
+    // 3. Redo + autosave restores disk and SQLite index; new edit discards remaining redo ('!').
+    app.dispatch(Action::Redo, &mut ui);
+    trigger_autosave(&mut app, &mut ui);
+    assert!(fs::read_to_string(&note_abs).unwrap().contains("## 한글 요약 🚀 #undodelta"));
+    assert!(app.tags.iter().any(|t| t.tag == "undodelta"));
+
+    app.dispatch(Action::Input('?'), &mut ui);
+    app.dispatch(Action::Redo, &mut ui);
+    app.dispatch(Action::SaveInlineEdit, &mut ui);
+    let final_disk = fs::read_to_string(&note_abs).unwrap();
+    assert!(final_disk.contains("#undodelta?") && !final_disk.contains("#undodelta!"));
+}
