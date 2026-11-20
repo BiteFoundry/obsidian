@@ -1,12 +1,12 @@
 //! Obsidian-Native 3-Pane Terminal UI layout & root renderer.
 //!
 //! Layout:
-//! - Top Minimal Bar (`1` row): `◆ Vault ▾  /  folder / Note Title` | `[Graph G]` `[Daily D]` `[Backlinks B]` `[? Help]`
+//! - Top Minimal Bar (`1` row): `[◧] ◆ Vault ▾  /  folder / Note Title` | `[Graph G]` `[Daily D]` `[Backlinks B]` `[Cfg ,]` `[? Help]`
 //! - Main 3-Pane Workspace:
 //!   - Left Sidebar (collapsible `[` / `Ctrl+B`): `1 Files · 2 Tags · 3 Bookmarks · 4 Outline · 5 Tasks`
 //!   - Center Canvas: Mode A (Live Note Reader/Canvas) or Mode B (Interactive Knowledge Graph View `G`)
 //!   - Right Inspector Pane (`B` toggle): Linked Mentions (Backlinks), Outgoing Links, Local Graph Mini-Stats
-//! - Status Footer (`1` row): subtle keybind strip or live Toast notification.
+//! - Status Footer (`1` row): clickable keybind pills + clickable reindex stats, or live Toast notification.
 
 pub mod action;
 pub mod app;
@@ -30,7 +30,7 @@ use ratatui::{
     widgets::{Block, Paragraph},
     Frame,
 };
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::ui::{
     app::{AppState, CanvasMode, UiState},
@@ -40,8 +40,10 @@ use crate::ui::{
 
 pub fn draw(frame: &mut Frame, app: &AppState, ui: &mut UiState) -> HitMap {
     let area = frame.area();
+    ui.term_width = area.width;
+    ui.term_height = area.height;
     let mut hitmap = HitMap::new();
-    ui.pending_pixel.set(None);
+    ui.pending_pixel = None;
 
     frame.render_widget(
         Block::default().style(Style::default().bg(ui.theme.bg_canvas).fg(ui.theme.fg)),
@@ -63,10 +65,11 @@ pub fn draw(frame: &mut Frame, app: &AppState, ui: &mut UiState) -> HitMap {
 
     draw_top_bar(frame, vertical[0], app, ui, &mut hitmap);
     draw_workspace(frame, vertical[1], app, ui, &mut hitmap);
-    draw_status_bar(frame, vertical[2], app, ui);
+    draw_status_bar(frame, vertical[2], app, ui, &mut hitmap);
 
-    if let Some(overlay) = &ui.overlay {
+    if let Some(mut overlay) = ui.overlay.take() {
         overlay.draw(frame, area, app, ui, &mut hitmap);
+        ui.overlay = Some(overlay);
     }
 
     ui.last_hitmap = hitmap.clone();
@@ -86,9 +89,32 @@ fn draw_top_bar(
         area,
     );
 
+    // Sidebar toggle pill on far left
+    let sidebar_pill = "[◧]";
+    let sidebar_w = sidebar_pill.width() as u16;
+    let sidebar_style = if ui.show_sidebar {
+        Style::default()
+            .fg(theme.accent)
+            .bg(theme.bg_header)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.fg_muted).bg(theme.bg_header)
+    };
+    hitmap.add_line(
+        area.x,
+        area.y,
+        sidebar_w,
+        HitTarget::Button(ButtonId::ToggleSidebar),
+    );
+
     let vault_label = format!(" ◆ {} ▾ ", app.active_vault.display_name());
-    let vault_w = unicode_width::UnicodeWidthStr::width(vault_label.as_str()) as u16;
-    hitmap.add_line(area.x, area.y, vault_w, HitTarget::Button(ButtonId::VaultSwitcher));
+    let vault_w = vault_label.width() as u16;
+    hitmap.add_line(
+        area.x + sidebar_w,
+        area.y,
+        vault_w,
+        HitTarget::Button(ButtonId::VaultSwitcher),
+    );
 
     let (folder, title) = match &app.active_note {
         Some(d) => (d.summary.folder.as_str(), d.summary.title.as_str()),
@@ -96,30 +122,35 @@ fn draw_top_bar(
     };
 
     // Right-aligned action pills
-    let pills: [(&str, bool, ButtonId); 4] = [
+    let pills: [(&str, bool, ButtonId); 5] = [
         ("Graph G", ui.canvas_mode == CanvasMode::Graph, ButtonId::ToggleGraph),
         ("Daily D", false, ButtonId::OpenDaily),
         ("Backlinks B", ui.show_inspector, ButtonId::ToggleInspector),
+        ("Cfg ,", false, ButtonId::Settings),
         ("? Help", false, ButtonId::Help),
     ];
 
     let right_width: u16 = pills
         .iter()
-        .map(|(txt, _, _)| (txt.len() + 3) as u16)
+        .map(|(txt, _, _)| (txt.width() + 3) as u16)
         .sum::<u16>()
         + 1;
 
+    let left_prefix_w = (sidebar_w + vault_w) as usize;
     let left_avail = area.width.saturating_sub(right_width + 2) as usize;
-    let mut left_spans = vec![Span::styled(
-        vault_label,
-        Style::default()
-            .fg(theme.accent)
-            .bg(theme.bg_header)
-            .add_modifier(Modifier::BOLD),
-    )];
+    let mut left_spans = vec![
+        Span::styled(sidebar_pill, sidebar_style),
+        Span::styled(
+            vault_label,
+            Style::default()
+                .fg(theme.accent)
+                .bg(theme.bg_header)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
 
-    if left_avail > vault_w as usize + 6 {
-        let crumb_budget = left_avail.saturating_sub(vault_w as usize + 3);
+    if left_avail > left_prefix_w + 6 {
+        let crumb_budget = left_avail.saturating_sub(left_prefix_w + 3);
         left_spans.push(Span::styled(" / ", theme.subtle_style()));
         if !folder.is_empty() && crumb_budget > 20 {
             left_spans.push(Span::styled(
@@ -146,7 +177,7 @@ fn draw_top_bar(
         let mut rx = area.x + area.width.saturating_sub(right_width);
         for (label, active, btn) in pills {
             let text = format!("[{label}]");
-            let w = text.len() as u16;
+            let w = text.width() as u16;
             let style = if active {
                 Style::default()
                     .fg(theme.bg_canvas)
@@ -218,8 +249,19 @@ fn draw_workspace(
     }
 }
 
-fn draw_status_bar(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState) {
+fn draw_status_bar(
+    frame: &mut Frame,
+    area: Rect,
+    app: &AppState,
+    ui: &UiState,
+    hitmap: &mut HitMap,
+) {
     let theme = &ui.theme;
+    frame.render_widget(
+        Block::default().style(Style::default().bg(theme.bg_header)),
+        area,
+    );
+
     if let Some(toast) = ui.toasts.current() {
         let color = match toast.kind {
             ToastKind::Success => theme.success,
@@ -238,35 +280,74 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState) 
         return;
     }
 
-    let hint = match ui.canvas_mode {
-        CanvasMode::Graph => {
-            " G Note  ·  l Local/Global  ·  +/- Depth  ·  j/k Select  ·  Enter Open  ·  Ctrl+O Switcher  ·  Ctrl+, Theme "
-        }
-        CanvasMode::Note => {
-            " Ctrl+O Switch  ·  G Graph  ·  D Daily  ·  Space Task  ·  Enter Follow Link  ·  a Append  ·  n New  ·  u Links  ·  Ctrl+, Theme "
-        }
-    };
-
     let stats_right = format!(
-        " {} notes · {} tags ",
+        " ↻ {} notes · {} tags ",
         app.notes.len(),
         app.tags.len()
     );
-    let stats_w = stats_right.len() as u16;
-    let left_w = area.width.saturating_sub(stats_w) as usize;
-    let line = Line::from(vec![
-        Span::styled(truncate_width(hint, left_w), theme.muted_style()),
-    ]);
+    let stats_w = stats_right.width() as u16;
+    let left_limit = if area.width > stats_w + 10 {
+        area.x + area.width.saturating_sub(stats_w)
+    } else {
+        area.x + area.width
+    };
+
+    let items: &[(&str, Option<ButtonId>)] = match ui.canvas_mode {
+        CanvasMode::Graph => &[
+            ("G Note", Some(ButtonId::ToggleGraph)),
+            ("l Local/Global", Some(ButtonId::GraphToggleScope)),
+            ("+/- Depth", None),
+            ("Ctrl+O Switch", Some(ButtonId::QuickSwitcher)),
+            ("Ctrl+, Theme", Some(ButtonId::Settings)),
+        ],
+        CanvasMode::Note => &[
+            ("Ctrl+O Switch", Some(ButtonId::QuickSwitcher)),
+            ("G Graph", Some(ButtonId::ToggleGraph)),
+            ("D Daily", Some(ButtonId::OpenDaily)),
+            ("a Append", Some(ButtonId::QuickAppend)),
+            ("n New", Some(ButtonId::NewNote)),
+            ("e Edit", Some(ButtonId::EditExternal)),
+            ("u Links", Some(ButtonId::LinkExtractor)),
+            ("h Hrefs", Some(ButtonId::ToggleHrefs)),
+            ("v Img", Some(ButtonId::ImagePreview)),
+            ("H HTML", Some(ButtonId::HtmlPreview)),
+            ("Ctrl+, Theme", Some(ButtonId::Settings)),
+        ],
+    };
+
+    let mut cur_x = area.x.saturating_add(1);
+    let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
+    for (idx, &(label, btn_opt)) in items.iter().enumerate() {
+        let sep = if idx > 0 { " · " } else { "" };
+        let sep_w = sep.width() as u16;
+        let lbl_w = label.width() as u16;
+        if cur_x.saturating_add(sep_w).saturating_add(lbl_w) > left_limit {
+            break;
+        }
+        if !sep.is_empty() {
+            spans.push(Span::styled(sep.to_string(), theme.subtle_style()));
+            cur_x += sep_w;
+        }
+        spans.push(Span::styled(label.to_string(), theme.muted_style()));
+        if let Some(btn) = btn_opt {
+            hitmap.add_line(cur_x, area.y, lbl_w, HitTarget::Button(btn));
+        }
+        cur_x += lbl_w;
+    }
+
     frame.render_widget(
-        Paragraph::new(line).style(Style::default().bg(theme.bg_header)),
-        Rect::new(area.x, area.y, area.width.saturating_sub(stats_w), 1),
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.bg_header)),
+        Rect::new(area.x, area.y, left_limit.saturating_sub(area.x), 1),
     );
+
     if area.width > stats_w + 10 {
+        let rx = area.x + area.width - stats_w;
         frame.render_widget(
             Paragraph::new(Span::styled(stats_right, theme.subtle_style()))
                 .style(Style::default().bg(theme.bg_header)),
-            Rect::new(area.x + area.width - stats_w, area.y, stats_w, 1),
+            Rect::new(rx, area.y, stats_w, 1),
         );
+        hitmap.add_line(rx, area.y, stats_w, HitTarget::Button(ButtonId::ReindexNow));
     }
 }
 
@@ -281,7 +362,7 @@ pub fn truncate_width(s: &str, max_width: usize) -> String {
         let w = ch.width().unwrap_or(0);
         if cur + w > max_width {
             if max_width >= 1 && !out.is_empty() {
-                while unicode_width::UnicodeWidthStr::width(out.as_str()) + 1 > max_width {
+                while out.width() + 1 > max_width {
                     if out.pop().is_none() {
                         break;
                     }

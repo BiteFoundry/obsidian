@@ -20,7 +20,8 @@ use crate::{
     models::{InlineSpan, NoteBlock, NoteDetail},
     ui::{
         app::{AppState, Focus, UiState},
-        hitmap::{HitMap, HitTarget},
+        hitmap::{ButtonId, HitMap, HitTarget},
+        overlays::html_preview::{block_is_html, is_html_code_language, note_has_html},
         theme::Theme,
         truncate_width,
     },
@@ -32,6 +33,8 @@ struct RenderedLine {
     task_line_no: Option<usize>,
     has_wikilink: bool,
     image_idx: Option<usize>,
+    html_pill: Option<(u16, u16, usize)>,
+    action_pills: Vec<(u16, u16, ButtonId)>,
     bg_override: Option<ratatui::style::Color>,
 }
 
@@ -126,6 +129,23 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
                 hitmap.add(row_rect, HitTarget::ImageChip(img_i));
             }
         }
+        if let Some((x_off, w, b_idx)) = rl.html_pill {
+            if x_off < content_area.width {
+                let clamped_w = w.min(content_area.width.saturating_sub(x_off));
+                hitmap.add_line(
+                    content_area.x + x_off,
+                    y,
+                    clamped_w,
+                    HitTarget::HtmlChip(b_idx),
+                );
+            }
+        }
+        for &(x_off, w, btn) in &rl.action_pills {
+            if x_off < content_area.width {
+                let clamped_w = w.min(content_area.width.saturating_sub(x_off));
+                hitmap.add_line(content_area.x + x_off, y, clamped_w, HitTarget::Button(btn));
+            }
+        }
     }
 }
 
@@ -146,6 +166,8 @@ fn build_canvas_lines(
             task_line_no: None,
             has_wikilink: false,
             image_idx: None,
+            html_pill: None,
+            action_pills: Vec::new(),
             bg_override: bg,
         });
     };
@@ -165,6 +187,74 @@ fn build_canvas_lines(
         ]),
         None,
     );
+
+    // 1b. Interactive Note Action Pill Bar (Bookmark, Width, Append, New, Edit, Links, Hrefs, Img)
+    {
+        let bm_label = if detail.summary.is_bookmarked {
+            "[★ Mark]"
+        } else {
+            "[☆ Mark]"
+        };
+        let width_label = match ui.page_width {
+            PageWidthMode::Centered => "[w Wide]",
+            PageWidthMode::Full => "[w Center]",
+        };
+        let img_label = if detail.images.is_empty() {
+            "[v Img]".to_string()
+        } else {
+            format!("[v Img({})]", detail.images.len())
+        };
+        let has_html = note_has_html(detail) || !app.html_files.is_empty();
+        let pills: Vec<(String, bool, ButtonId)> = vec![
+            (bm_label.to_string(), detail.summary.is_bookmarked, ButtonId::ToggleBookmark),
+            (width_label.to_string(), ui.page_width == PageWidthMode::Full, ButtonId::ToggleWidth),
+            ("[a Append]".to_string(), false, ButtonId::QuickAppend),
+            ("[n New]".to_string(), false, ButtonId::NewNote),
+            ("[e Edit]".to_string(), false, ButtonId::EditExternal),
+            ("[u Links]".to_string(), false, ButtonId::LinkExtractor),
+            ("[h Hrefs]".to_string(), ui.show_inline_hrefs, ButtonId::ToggleHrefs),
+            (img_label, !detail.images.is_empty(), ButtonId::ImagePreview),
+            ("[H: HTML]".to_string(), has_html, ButtonId::HtmlPreview),
+        ];
+
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut hit_pills: Vec<(u16, u16, ButtonId)> = Vec::new();
+        let mut x_off = 0usize;
+        for (label, active, btn) in pills {
+            let lw = unicode_width::UnicodeWidthStr::width(label.as_str());
+            let gap = if x_off > 0 { 1 } else { 0 };
+            if x_off + gap + lw > width {
+                break;
+            }
+            if gap > 0 {
+                spans.push(Span::raw(" "));
+                x_off += 1;
+            }
+            let style = if active {
+                Style::default()
+                    .fg(theme.accent)
+                    .bg(theme.bg_card)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                theme.muted_style()
+            };
+            hit_pills.push((x_off as u16, lw as u16, btn));
+            spans.push(Span::styled(label, style));
+            x_off += lw;
+        }
+        if !spans.is_empty() {
+            out.push(RenderedLine {
+                line: Line::from(spans),
+                block_idx: None,
+                task_line_no: None,
+                has_wikilink: false,
+                image_idx: None,
+                html_pill: None,
+                action_pills: hit_pills,
+                bg_override: None,
+            });
+        }
+    }
 
     // 2. YAML Frontmatter Properties Strip (clean pills + #tags + aliases)
     let mut prop_spans: Vec<Span<'static>> = Vec::new();
@@ -271,11 +361,36 @@ fn build_canvas_lines(
                     task_line_no: None,
                     has_wikilink: has_wl,
                     image_idx: None,
+                    html_pill: None,
+                    action_pills: Vec::new(),
                     bg_override: sel_bg,
                 });
             }
 
             NoteBlock::Paragraph { spans, .. } => {
+                if block_is_html(detail, b_idx) {
+                    let pill = "[H: HTML]";
+                    let pill_w = unicode_width::UnicodeWidthStr::width(pill) as u16;
+                    out.push(RenderedLine {
+                        line: Line::from(vec![
+                            Span::styled(" ◈ Embedded HTML · ", theme.muted_style()),
+                            Span::styled(
+                                pill,
+                                Style::default()
+                                    .fg(theme.accent)
+                                    .bg(theme.bg_card)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                        ]),
+                        block_idx: Some(b_idx),
+                        task_line_no: None,
+                        has_wikilink: false,
+                        image_idx: None,
+                        html_pill: Some((19, pill_w, b_idx)),
+                        action_pills: Vec::new(),
+                        bg_override: Some(if is_sel { theme.bg_selected } else { theme.bg_card }),
+                    });
+                }
                 let mut rendered = render_inline_spans(
                     spans,
                     theme,
@@ -295,6 +410,8 @@ fn build_canvas_lines(
                         task_line_no: None,
                         has_wikilink: has_wl,
                         image_idx: None,
+                        html_pill: None,
+                        action_pills: Vec::new(),
                         bg_override: sel_bg,
                     });
                 }
@@ -334,6 +451,8 @@ fn build_canvas_lines(
                     task_line_no: None,
                     has_wikilink: has_wl,
                     image_idx: None,
+                    html_pill: None,
+                    action_pills: Vec::new(),
                     bg_override: Some(card_bg),
                 });
 
@@ -358,6 +477,8 @@ fn build_canvas_lines(
                             task_line_no: None,
                             has_wikilink: has_wl,
                             image_idx: None,
+                            html_pill: None,
+                            action_pills: Vec::new(),
                             bg_override: Some(card_bg),
                         });
                     }
@@ -404,6 +525,8 @@ fn build_canvas_lines(
                     task_line_no: Some(*line_no),
                     has_wikilink: has_wl,
                     image_idx: None,
+                    html_pill: None,
+                    action_pills: Vec::new(),
                     bg_override: sel_bg,
                 });
             }
@@ -427,6 +550,8 @@ fn build_canvas_lines(
                         task_line_no: None,
                         has_wikilink: has_wl,
                         image_idx: None,
+                        html_pill: None,
+                        action_pills: Vec::new(),
                         bg_override: sel_bg,
                     });
                 }
@@ -456,6 +581,8 @@ fn build_canvas_lines(
                         task_line_no: None,
                         has_wikilink: has_wl,
                         image_idx: None,
+                        html_pill: None,
+                        action_pills: Vec::new(),
                         bg_override: sel_bg,
                     });
                 }
@@ -464,21 +591,45 @@ fn build_canvas_lines(
             NoteBlock::CodeBlock { language, code, .. } => {
                 let code_bg = if is_sel { theme.bg_selected } else { theme.bg_code };
                 let lang_label = if language.is_empty() { "code" } else { language.as_str() };
-                let bar_w = width.saturating_sub(lang_label.len() + 14);
+                let is_html = is_html_code_language(language) && !code.trim().is_empty();
+                let html_suffix = if is_html { " [H: HTML]" } else { "" };
+                let bar_w = width
+                    .saturating_sub(lang_label.len() + 14 + html_suffix.len())
+                    .min(50);
+                let mut hdr_spans = vec![
+                    Span::styled("╭─ ", Style::default().fg(theme.border)),
+                    Span::styled(
+                        format!("{lang_label} "),
+                        Style::default().fg(theme.accent_soft).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("─".repeat(bar_w), Style::default().fg(theme.border)),
+                    Span::styled(" [y copy]", theme.muted_style()),
+                ];
+                let html_pill = if is_html {
+                    let prefix_w: usize = hdr_spans
+                        .iter()
+                        .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
+                        .sum();
+                    hdr_spans.push(Span::raw(" "));
+                    hdr_spans.push(Span::styled(
+                        "[H: HTML]",
+                        Style::default()
+                            .fg(theme.accent)
+                            .bg(theme.bg_card)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                    Some(((prefix_w + 1) as u16, 9u16, b_idx))
+                } else {
+                    None
+                };
                 out.push(RenderedLine {
-                    line: Line::from(vec![
-                        Span::styled("╭─ ", Style::default().fg(theme.border)),
-                        Span::styled(
-                            format!("{lang_label} "),
-                            Style::default().fg(theme.accent_soft).add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled("─".repeat(bar_w.min(50)), Style::default().fg(theme.border)),
-                        Span::styled(" [y copy]", theme.muted_style()),
-                    ]),
+                    line: Line::from(hdr_spans),
                     block_idx: Some(b_idx),
                     task_line_no: None,
                     has_wikilink: false,
                     image_idx: None,
+                    html_pill,
+                    action_pills: Vec::new(),
                     bg_override: Some(code_bg),
                 });
                 for code_line in code.lines() {
@@ -494,6 +645,8 @@ fn build_canvas_lines(
                         task_line_no: None,
                         has_wikilink: false,
                         image_idx: None,
+                        html_pill: None,
+                        action_pills: Vec::new(),
                         bg_override: Some(code_bg),
                     });
                 }
@@ -506,6 +659,8 @@ fn build_canvas_lines(
                     task_line_no: None,
                     has_wikilink: false,
                     image_idx: None,
+                    html_pill: None,
+                    action_pills: Vec::new(),
                     bg_override: Some(code_bg),
                 });
                 push_plain(&mut out, Line::from(""), None);
@@ -526,6 +681,8 @@ fn build_canvas_lines(
                         task_line_no: None,
                         has_wikilink: has_wl,
                         image_idx: None,
+                        html_pill: None,
+                        action_pills: Vec::new(),
                         bg_override: sel_bg,
                     });
                 }
@@ -550,6 +707,8 @@ fn build_canvas_lines(
                     task_line_no: None,
                     has_wikilink: false,
                     image_idx: None,
+                    html_pill: None,
+                    action_pills: Vec::new(),
                     bg_override: Some(theme.bg_card),
                 });
                 let sep_cells: Vec<String> = (0..cols).map(|_| "─".repeat(col_w)).collect();
@@ -562,6 +721,8 @@ fn build_canvas_lines(
                     task_line_no: None,
                     has_wikilink: false,
                     image_idx: None,
+                    html_pill: None,
+                    action_pills: Vec::new(),
                     bg_override: None,
                 });
                 for r in rows {
@@ -580,6 +741,8 @@ fn build_canvas_lines(
                         task_line_no: None,
                         has_wikilink: false,
                         image_idx: None,
+                        html_pill: None,
+                        action_pills: Vec::new(),
                         bg_override: sel_bg,
                     });
                 }
@@ -612,6 +775,8 @@ fn build_canvas_lines(
                     task_line_no: None,
                     has_wikilink: false,
                     image_idx: Some(img_idx),
+                    html_pill: None,
+                    action_pills: Vec::new(),
                     bg_override: sel_bg,
                 });
 
@@ -627,6 +792,8 @@ fn build_canvas_lines(
                                     task_line_no: None,
                                     has_wikilink: false,
                                     image_idx: Some(img_idx),
+                                    html_pill: None,
+                                    action_pills: Vec::new(),
                                     bg_override: None,
                                 });
                             }
@@ -655,6 +822,8 @@ fn build_canvas_lines(
                     task_line_no: None,
                     has_wikilink: true,
                     image_idx: None,
+                    html_pill: None,
+                    action_pills: Vec::new(),
                     bg_override: Some(theme.bg_card),
                 });
                 push_plain(&mut out, Line::from(""), None);
@@ -670,6 +839,8 @@ fn build_canvas_lines(
                     task_line_no: None,
                     has_wikilink: false,
                     image_idx: None,
+                    html_pill: None,
+                    action_pills: Vec::new(),
                     bg_override: sel_bg,
                 });
             }

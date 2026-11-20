@@ -19,14 +19,23 @@ use crate::models::{
     WikilinkRef,
 };
 
-const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"];
+const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp"];
 
 pub fn is_image_target(target: &str) -> bool {
-    let base = target.split('#').next().unwrap_or(target).trim();
+    let base = target
+        .split(['#', '?'])
+        .next()
+        .unwrap_or(target)
+        .trim()
+        .trim_matches(['<', '>']);
     let Some((_, ext)) = base.rsplit_once('.') else {
         return false;
     };
-    IMAGE_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str())
+    let lower = ext.to_ascii_lowercase();
+    if matches!(lower.as_str(), "svg" | "html" | "htm" | "xhtml") {
+        return false;
+    }
+    IMAGE_EXTENSIONS.contains(&lower.as_str())
 }
 
 pub fn mime_type_for_path(path: &str) -> &'static str {
@@ -793,7 +802,7 @@ fn parse_standalone_embed(
         if let Some((alt, url_part)) = rest.split_once("](") {
             if let Some(url) = url_part.strip_suffix(')') {
                 let target = url.trim().trim_matches(['<', '>']);
-                if !target.is_empty() && !alt.contains(']') {
+                if !target.is_empty() && !alt.contains(']') && is_image_target(target) {
                     md_links.push(MarkdownLinkRef {
                         label: alt.to_string(),
                         url: target.to_string(),
@@ -1137,5 +1146,38 @@ Inline code `#ignore-tag` and `[[ignore-link]]` stay literal.
         assert!(updated.contains("tags: [core, rfc]"));
         assert!(updated.contains("# Hello"));
         assert!(updated.contains("Body text."));
+    }
+
+    #[test]
+    fn test_is_image_target_rejects_html_and_svg() {
+        assert!(is_image_target("diagram.png"));
+        assert!(is_image_target("assets/photo.JPEG?v=2#top"));
+        assert!(is_image_target("anim.gif"));
+        assert!(is_image_target("pic.webp"));
+        assert!(is_image_target("scan.bmp"));
+
+        // Must never classify SVG or HTML/HTM as raster images
+        assert!(!is_image_target("vector.svg"));
+        assert!(!is_image_target("icons/logo.SVG?raw=1"));
+        assert!(!is_image_target("page.html"));
+        assert!(!is_image_target("report.HTM"));
+        assert!(!is_image_target("doc.xhtml"));
+        assert!(!is_image_target("Note.md"));
+
+        // Standalone embeds of .svg / .html must not produce ImageEmbed blocks
+        let parsed = parse_markdown(
+            "Test.md",
+            "Test",
+            "![[diagram.svg]]\n\n![icon](logo.svg)\n\n![page](index.html)\n\n![[photo.png]]\n",
+        );
+        let img_embeds: Vec<&str> = parsed
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                NoteBlock::ImageEmbed { raw_target, .. } => Some(raw_target.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(img_embeds, vec!["photo.png"]);
     }
 }

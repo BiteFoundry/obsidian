@@ -1,12 +1,12 @@
 //! Core TUI application state (`AppState`), presentation state (`UiState`), and action dispatcher.
 
 use std::{
-    cell::Cell,
     collections::{HashMap, HashSet},
     fs,
     path::PathBuf,
 };
 
+use bitefoundry_html::{sniff_content_kind, ContentKind, NativeHtmlServer};
 use chrono::Local;
 
 use crate::{
@@ -28,11 +28,17 @@ use crate::{
         hitmap::{ButtonId, HitMap, HitTarget},
         keymap::KeyMap,
         overlays::{
-            confirm::ConfirmOverlay, context_menu::ContextMenuOverlay,
-            file_picker::FilePickerOverlay, image_preview::ImagePreviewOverlay,
-            links::LinkExtractorOverlay, note_form::NoteFormOverlay,
-            quick_switcher::QuickSwitcherOverlay, settings::SettingsOverlay,
-            vault_switcher::VaultSwitcherOverlay, Overlay, OverlayKind, OverlayOutcome,
+            confirm::ConfirmOverlay,
+            context_menu::ContextMenuOverlay,
+            file_picker::FilePickerOverlay,
+            html_preview::{extract_note_html_candidates, HtmlPreviewOverlay},
+            image_preview::ImagePreviewOverlay,
+            links::LinkExtractorOverlay,
+            note_form::NoteFormOverlay,
+            quick_switcher::QuickSwitcherOverlay,
+            settings::SettingsOverlay,
+            vault_switcher::VaultSwitcherOverlay,
+            Overlay, OverlayKind, OverlayOutcome,
         },
         sidebar::{build_sidebar_entries, SidebarEntry},
         theme::Theme,
@@ -40,8 +46,9 @@ use crate::{
     },
     vault::{
         fs::{
-            append_to_note, create_note, ensure_daily_note, move_note_to_trash, safe_vault_path,
-            save_vault_attachment, toggle_task_at_line,
+            append_to_note, create_note, ensure_daily_note, is_html_file_path, move_note_to_trash,
+            resolve_attachment_path, safe_vault_path, save_vault_attachment, scan_vault_html_files,
+            toggle_task_at_line, VaultHtmlFile,
         },
         merged_vaults,
     },
@@ -61,12 +68,11 @@ pub enum CanvasMode {
     Graph,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingPixelGraphic {
-    pub col: u16,
-    pub row: u16,
+    pub cache_key: String,
+    pub rect: ratatui::layout::Rect,
     pub protocol: TerminalImageProtocol,
-    pub payload: String,
 }
 
 pub struct AppState {
@@ -76,6 +82,7 @@ pub struct AppState {
     pub storage: Storage,
     pub sync_ctrl: SyncController,
     pub notes: Vec<NoteSummary>,
+    pub html_files: Vec<VaultHtmlFile>,
     pub tags: Vec<TagCount>,
     pub tasks: Vec<TaskEntry>,
     pub active_note: Option<NoteDetail>,
@@ -83,6 +90,9 @@ pub struct AppState {
     pub history: Vec<String>,
     pub preview_cache: HashMap<String, RenderedTerminalImage>,
     pub graphics_caps: TerminalGraphicsCaps,
+    pub html_server: NativeHtmlServer,
+    pub pending_html_serve: Option<(String, String)>,
+    pub last_served_html_url: Option<String>,
     pub last_index_stats: Option<IndexStats>,
     pub pending_external_editor: Option<PathBuf>,
 }
@@ -111,7 +121,9 @@ pub struct UiState {
     pub overlay: Option<Overlay>,
     pub toasts: ToastQueue,
     pub keymap: KeyMap,
-    pub pending_pixel: Cell<Option<PendingPixelGraphic>>,
+    pub pending_pixel: Option<PendingPixelGraphic>,
+    pub term_width: u16,
+    pub term_height: u16,
     pub should_quit: bool,
     pub last_hitmap: HitMap,
 }
@@ -142,7 +154,9 @@ impl UiState {
             overlay: None,
             toasts: ToastQueue::new(),
             keymap: KeyMap,
-            pending_pixel: Cell::new(None),
+            pending_pixel: None,
+            term_width: 120,
+            term_height: 34,
             should_quit: false,
             last_hitmap: HitMap::new(),
         }
@@ -192,6 +206,7 @@ impl AppState {
             storage,
             sync_ctrl,
             notes: Vec::new(),
+            html_files: Vec::new(),
             tags: Vec::new(),
             tasks: Vec::new(),
             active_note: None,
@@ -199,6 +214,9 @@ impl AppState {
             history: Vec::new(),
             preview_cache: HashMap::new(),
             graphics_caps,
+            html_server: NativeHtmlServer::new(),
+            pending_html_serve: None,
+            last_served_html_url: None,
             last_index_stats: None,
             pending_external_editor: None,
         }
@@ -208,6 +226,7 @@ impl AppState {
     pub fn reload_from_storage(&mut self, ui: &mut UiState) {
         let vid = self.active_vault.id.clone();
         self.notes = self.storage.list_notes(&vid, None).unwrap_or_default();
+        self.html_files = scan_vault_html_files(&self.active_vault.path).unwrap_or_default();
         self.tags = self.storage.list_tags(&vid).unwrap_or_default();
         self.tasks = self
             .storage
@@ -264,6 +283,14 @@ impl AppState {
                 continue;
             }
             if let Ok(bytes) = fs::read(&img.abs_path) {
+                if sniff_content_kind(
+                    Some(&img.mime_type),
+                    Some(&img.display_name),
+                    Some(&bytes),
+                ) != ContentKind::RasterImage
+                {
+                    continue;
+                }
                 if let Ok(rendered) =
                     decode_and_render_halfblocks(&bytes, 48, 10, (19, 19, 24))
                 {
@@ -273,22 +300,38 @@ impl AppState {
         }
     }
 
+    /// Ensures the active `ImagePreview` modal target is decoded and cached.
+    ///
+    /// If the attachment bytes sniff as `ContentKind::Html`, returns an `HtmlPreviewOverlay`
+    /// so the caller automatically routes to `Overlay::HtmlPreview` instead of failing image decode.
     pub fn ensure_modal_image_cached(
         &mut self,
         ov: &mut ImagePreviewOverlay,
         term_w: u16,
         term_h: u16,
-    ) {
-        let Some(target) = ov.current().cloned() else {
-            return;
-        };
-        let key = format!("{}@{}", target.abs_path.to_string_lossy(), ov.zoom_pct);
-        if self.preview_cache.contains_key(&key) {
-            return;
-        }
+    ) -> Option<HtmlPreviewOverlay> {
+        let target = ov.current()?.clone();
         let (cols, rows) = ov.target_dimensions(term_w, term_h);
+        let key = ImagePreviewOverlay::cache_key(&target, cols, rows, self.graphics_caps.protocol);
+        if self.preview_cache.contains_key(&key) {
+            return None;
+        }
         match fs::read(&target.abs_path) {
             Ok(bytes) => {
+                if sniff_content_kind(
+                    Some(&target.mime_type),
+                    Some(&target.display_name),
+                    Some(&bytes),
+                ) == ContentKind::Html
+                {
+                    let html = String::from_utf8_lossy(&bytes).into_owned();
+                    let src = target.abs_path.display().to_string();
+                    return Some(HtmlPreviewOverlay::new(
+                        target.display_name.clone(),
+                        src,
+                        html,
+                    ));
+                }
                 match decode_and_render_for_protocol(
                     &bytes,
                     cols,
@@ -305,9 +348,138 @@ impl AppState {
             }
             Err(e) => ov.error = Some(format!("Failed to read image file: {e}")),
         }
+        None
+    }
+
+    /// Prepares the active overlay prior to drawing (including HTML-vs-Image auto-routing).
+    pub fn prepare_active_overlay(&mut self, ui: &mut UiState, term_w: u16, term_h: u16) {
+        let reroute = if let Some(Overlay::ImagePreview(ref mut ov)) = ui.overlay {
+            self.ensure_modal_image_cached(ov, term_w, term_h)
+        } else {
+            None
+        };
+        if let Some(html_ov) = reroute {
+            let name = html_ov.title.clone();
+            ui.open_overlay(Overlay::HtmlPreview(html_ov));
+            ui.toasts.info(format!(
+                "Detected HTML in '{name}' — routed to interactive HTML preview"
+            ));
+        }
+    }
+
+    /// Lazily serves an HTML document via `NativeHtmlServer` and optionally opens it in the default browser.
+    pub async fn serve_html_and_open(
+        &mut self,
+        title: &str,
+        html: &str,
+        ui: &mut UiState,
+        open_browser: bool,
+    ) -> anyhow::Result<String> {
+        let url = self.html_server.serve_html(title, html).await?;
+        self.last_served_html_url = Some(url.clone());
+        if let Some(Overlay::HtmlPreview(ref mut ov)) = ui.overlay {
+            ov.session.last_status = Some(format!("Served at {url}"));
+        }
+        if open_browser {
+            match open::that(&url) {
+                Ok(()) => ui.toasts.success(format!("Opened in browser: {url}")),
+                Err(e) => ui.toasts.warning(format!("Served at {url} (browser failed: {e})")),
+            }
+        } else {
+            ui.toasts.success(format!("Served HTML at {url}"));
+        }
+        Ok(url)
+    }
+
+    /// Opens a vault `.html`/`.htm`/`.xhtml` file in `Overlay::HtmlPreview`.
+    pub fn open_html_file(&mut self, ui: &mut UiState, rel_or_target: &str) -> bool {
+        let resolved = safe_vault_path(&self.active_vault.path, rel_or_target)
+            .ok()
+            .filter(|p| p.is_file())
+            .or_else(|| {
+                let note_rel = self
+                    .active_note
+                    .as_ref()
+                    .map(|d| d.summary.rel_path.as_str())
+                    .unwrap_or("");
+                resolve_attachment_path(&self.active_vault.path, note_rel, rel_or_target)
+            });
+
+        let Some(abs_path) = resolved else {
+            ui.toasts
+                .warning(format!("HTML file not found: {rel_or_target}"));
+            return false;
+        };
+
+        match fs::read(&abs_path) {
+            Ok(bytes) => {
+                let html = String::from_utf8_lossy(&bytes).into_owned();
+                let title = abs_path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(rel_or_target)
+                    .to_string();
+                let source = abs_path.display().to_string();
+                ui.open_overlay(Overlay::HtmlPreview(HtmlPreviewOverlay::new(
+                    title, source, html,
+                )));
+                true
+            }
+            Err(e) => {
+                ui.toasts.error(format!("Failed to read HTML file: {e}"));
+                false
+            }
+        }
+    }
+
+    /// Opens `Overlay::HtmlPreview` for the selected HTML block, active note HTML, or vault `.html` file.
+    pub fn open_html_preview(&mut self, ui: &mut UiState, preferred_block: Option<usize>) {
+        // 1. If sidebar is focused on a vault HTML file and no specific block was requested, open it.
+        if preferred_block.is_none() && ui.focus == Focus::Sidebar {
+            let entries = build_sidebar_entries(self, ui);
+            if let Some(SidebarEntry::HtmlFile { rel_path, .. }) = entries.get(ui.sidebar_selected)
+            {
+                let rp = rel_path.clone();
+                self.open_html_file(ui, &rp);
+                return;
+            }
+        }
+
+        // 2. Check active note for HTML code blocks, embedded raw HTML, or linked `.html` files.
+        if let Some(detail) = self.active_note.as_ref() {
+            let candidates =
+                extract_note_html_candidates(detail, Some(self.active_vault.path.as_path()));
+            if !candidates.is_empty() {
+                let target_idx = preferred_block.unwrap_or(ui.canvas_selected_block);
+                let chosen = candidates
+                    .iter()
+                    .find(|c| c.block_idx == Some(target_idx))
+                    .unwrap_or(&candidates[0]);
+                ui.open_overlay(Overlay::HtmlPreview(HtmlPreviewOverlay::new(
+                    chosen.title.clone(),
+                    chosen.source_label.clone(),
+                    chosen.html.clone(),
+                )));
+                return;
+            }
+        }
+
+        // 3. Fall back to the first `.html`/`.htm`/`.xhtml` file in the vault.
+        if let Some(first_html) = self.html_files.first().cloned() {
+            self.open_html_file(ui, &first_html.rel_path);
+            return;
+        }
+
+        ui.toasts
+            .info("No HTML blocks or .html files found in active note or vault");
     }
 
     pub fn open_note(&mut self, ui: &mut UiState, note_ref: &str, push_history: bool) {
+        // Route `.html`/`.htm`/`.xhtml` targets directly into `Overlay::HtmlPreview`.
+        if is_html_file_path(note_ref) {
+            self.open_html_file(ui, note_ref);
+            return;
+        }
         if push_history {
             if let Some(cur) = self.active_note.as_ref().map(|d| d.summary.rel_path.clone()) {
                 if !cur.eq_ignore_ascii_case(note_ref) {
@@ -905,11 +1077,60 @@ impl AppState {
             Action::OpenImagePreviewAt(idx) => {
                 if let Some(d) = &self.active_note {
                     if let Some(ov) = ImagePreviewOverlay::from_note(d, Some(idx)) {
+                        if let Some(target) = ov.current() {
+                            if let Ok(bytes) = fs::read(&target.abs_path) {
+                                if sniff_content_kind(
+                                    Some(&target.mime_type),
+                                    Some(&target.display_name),
+                                    Some(&bytes),
+                                ) == ContentKind::Html
+                                {
+                                    let html = String::from_utf8_lossy(&bytes).into_owned();
+                                    let src = target.abs_path.display().to_string();
+                                    let name = target.display_name.clone();
+                                    ui.open_overlay(Overlay::HtmlPreview(HtmlPreviewOverlay::new(
+                                        name.clone(),
+                                        src,
+                                        html,
+                                    )));
+                                    ui.toasts.info(format!(
+                                        "Detected HTML in '{name}' — routed to interactive HTML preview"
+                                    ));
+                                    return;
+                                }
+                            }
+                        }
                         ui.open_overlay(Overlay::ImagePreview(ov));
                     } else {
                         ui.toasts.info("No embedded images in this note");
                     }
                 }
+            }
+            Action::OpenHtmlPreview => {
+                self.open_html_preview(ui, None);
+            }
+            Action::OpenHtmlBlock(block_idx) => {
+                self.open_html_preview(ui, Some(block_idx));
+            }
+            Action::OpenHtmlFile(rel_path) => {
+                self.open_html_file(ui, &rel_path);
+            }
+            Action::OpenHtmlContent {
+                title,
+                source_label,
+                html,
+            } => {
+                ui.open_overlay(Overlay::HtmlPreview(HtmlPreviewOverlay::new(
+                    title,
+                    source_label,
+                    html,
+                )));
+            }
+            Action::ServeHtmlInBrowser { title, html } => {
+                self.pending_html_serve = Some((title, html));
+            }
+            Action::ShowInfoToast(msg) => {
+                ui.toasts.info(msg);
             }
             Action::OpenUrl(url) => {
                 if let Err(e) = open::that(&url) {
@@ -1085,6 +1306,9 @@ impl AppState {
                 self.open_note(ui, &rel_path, true);
                 ui.focus = Focus::Canvas;
             }
+            SidebarEntry::HtmlFile { rel_path, .. } => {
+                self.open_html_file(ui, &rel_path);
+            }
             SidebarEntry::Tag { tag, .. } => {
                 if ui.active_tag_filter.as_deref() == Some(tag.as_str()) {
                     ui.active_tag_filter = None;
@@ -1127,6 +1351,58 @@ impl AppState {
     }
 
     fn handle_mouse_click(&mut self, col: u16, row: u16, ui: &mut UiState) {
+        if matches!(ui.overlay, Some(Overlay::HtmlPreview(_))) {
+            match ui.last_hitmap.hit(row, col) {
+                Some(HitTarget::Button(ButtonId::ConfirmCancel)) => {
+                    ui.close_overlay();
+                    return;
+                }
+                Some(HitTarget::Button(ButtonId::HtmlToggleRaw)) => {
+                    self.dispatch(Action::HtmlToggleRawMode, ui);
+                    return;
+                }
+                Some(HitTarget::Button(ButtonId::HtmlServeBrowser)) => {
+                    self.dispatch(
+                        Action::ServeHtmlInBrowser {
+                            title: String::new(),
+                            html: String::new(),
+                        },
+                        ui,
+                    );
+                    return;
+                }
+                _ => {
+                    let outcome = if let Some(Overlay::HtmlPreview(mut ov)) = ui.overlay.take() {
+                        let res = ov.handle(&Action::MouseClick { col, row });
+                        match res {
+                            OverlayOutcome::Close => {
+                                ui.close_overlay();
+                                None
+                            }
+                            OverlayOutcome::CloseAndDispatch(next) => {
+                                ui.close_overlay();
+                                Some(next)
+                            }
+                            OverlayOutcome::Dispatch(next) => {
+                                ui.overlay = Some(Overlay::HtmlPreview(ov));
+                                Some(next)
+                            }
+                            OverlayOutcome::Handled | OverlayOutcome::NotHandled => {
+                                ui.overlay = Some(Overlay::HtmlPreview(ov));
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(next_act) = outcome {
+                        self.dispatch_core(next_act, ui);
+                    }
+                    return;
+                }
+            }
+        }
+
         let Some(target) = ui.last_hitmap.hit(row, col) else {
             if ui.overlay.is_some() {
                 ui.close_overlay();
@@ -1157,6 +1433,9 @@ impl AppState {
             }
             HitTarget::ImageChip(img_idx) => {
                 self.dispatch_core(Action::OpenImagePreviewAt(img_idx), ui);
+            }
+            HitTarget::HtmlChip(block_idx) => {
+                self.dispatch_core(Action::OpenHtmlBlock(block_idx), ui);
             }
             HitTarget::GraphCanvas => {
                 ui.focus = Focus::Canvas;
@@ -1213,6 +1492,15 @@ impl AppState {
                 ButtonId::LinkExtractor => self.dispatch_core(Action::OpenLinkExtractor, ui),
                 ButtonId::ToggleHrefs => self.dispatch_core(Action::ToggleShowLinkUrls, ui),
                 ButtonId::ImagePreview => self.dispatch_core(Action::OpenImagePreview, ui),
+                ButtonId::HtmlPreview => self.dispatch_core(Action::OpenHtmlPreview, ui),
+                ButtonId::HtmlToggleRaw => self.dispatch(Action::HtmlToggleRawMode, ui),
+                ButtonId::HtmlServeBrowser => self.dispatch(
+                    Action::ServeHtmlInBrowser {
+                        title: String::new(),
+                        html: String::new(),
+                    },
+                    ui,
+                ),
                 ButtonId::ReindexNow => self.dispatch_core(Action::RefreshAll, ui),
                 ButtonId::GraphToggleScope => self.dispatch_core(Action::ToggleGraphScope, ui),
                 ButtonId::ConfirmOk => self.dispatch(Action::Input('y'), ui),

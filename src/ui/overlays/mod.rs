@@ -3,6 +3,7 @@
 pub mod confirm;
 pub mod context_menu;
 pub mod file_picker;
+pub mod html_preview;
 pub mod image_preview;
 pub mod links;
 pub mod note_form;
@@ -21,7 +22,7 @@ use ratatui::{
 use crate::ui::{
     action::Action,
     app::{AppState, UiState},
-    hitmap::{HitMap, HitTarget},
+    hitmap::{ButtonId, HitMap, HitTarget},
     keymap::HELP_SECTIONS,
 };
 
@@ -42,7 +43,7 @@ pub enum OverlayOutcome {
     CloseAndDispatch(Action),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum Overlay {
     QuickSwitcher(quick_switcher::QuickSwitcherOverlay),
     VaultSwitcher(vault_switcher::VaultSwitcherOverlay),
@@ -50,6 +51,7 @@ pub enum Overlay {
     LinkExtractor(links::LinkExtractorOverlay),
     FilePicker(file_picker::FilePickerOverlay),
     ImagePreview(image_preview::ImagePreviewOverlay),
+    HtmlPreview(html_preview::HtmlPreviewOverlay),
     NoteForm(note_form::NoteFormOverlay),
     Confirm(confirm::ConfirmOverlay),
     ContextMenu(context_menu::ContextMenuOverlay),
@@ -58,10 +60,11 @@ pub enum Overlay {
 
 impl Overlay {
     pub fn is_text_input(&self) -> bool {
-        matches!(
-            self,
-            Self::QuickSwitcher(_) | Self::NoteForm(_) | Self::FilePicker(_)
-        )
+        match self {
+            Self::QuickSwitcher(_) | Self::NoteForm(_) | Self::FilePicker(_) => true,
+            Self::HtmlPreview(ov) => ov.is_editing_input(),
+            _ => false,
+        }
     }
 
     pub fn handle(&mut self, action: &Action, app: &AppState) -> OverlayOutcome {
@@ -72,6 +75,7 @@ impl Overlay {
             Self::LinkExtractor(ov) => ov.handle(action),
             Self::FilePicker(ov) => ov.handle(action),
             Self::ImagePreview(ov) => ov.handle(action),
+            Self::HtmlPreview(ov) => ov.handle(action),
             Self::NoteForm(ov) => ov.handle(action),
             Self::Confirm(ov) => ov.handle(action),
             Self::ContextMenu(ov) => ov.handle(action),
@@ -79,11 +83,11 @@ impl Overlay {
                 Action::CloseOverlay | Action::Input('q') | Action::Input('?') => {
                     OverlayOutcome::Close
                 }
-                Action::MoveDown | Action::Input('j') => {
+                Action::MoveDown | Action::Input('j') | Action::MouseScrollDown { .. } => {
                     *scroll = scroll.saturating_add(1);
                     OverlayOutcome::Handled
                 }
-                Action::MoveUp | Action::Input('k') => {
+                Action::MoveUp | Action::Input('k') | Action::MouseScrollUp { .. } => {
                     *scroll = scroll.saturating_sub(1);
                     OverlayOutcome::Handled
                 }
@@ -93,7 +97,14 @@ impl Overlay {
         }
     }
 
-    pub fn draw(&self, frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap: &mut HitMap) {
+    pub fn draw(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        app: &AppState,
+        ui: &mut UiState,
+        hitmap: &mut HitMap,
+    ) {
         match self {
             Self::QuickSwitcher(ov) => ov.draw(frame, area, app, ui, hitmap),
             Self::VaultSwitcher(ov) => ov.draw(frame, area, app, ui, hitmap),
@@ -101,6 +112,7 @@ impl Overlay {
             Self::LinkExtractor(ov) => ov.draw(frame, area, ui, hitmap),
             Self::FilePicker(ov) => ov.draw(frame, area, ui, hitmap),
             Self::ImagePreview(ov) => ov.draw(frame, area, app, ui, hitmap),
+            Self::HtmlPreview(ov) => ov.draw(frame, area, ui, hitmap),
             Self::NoteForm(ov) => ov.draw(frame, area, ui, hitmap),
             Self::Confirm(ov) => ov.draw(frame, area, ui, hitmap),
             Self::ContextMenu(ov) => ov.draw(frame, area, ui, hitmap),
@@ -144,6 +156,25 @@ fn draw_help_overlay(
         )));
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
+
+    let close_label = "[✕ Esc]";
+    let close_w = unicode_width::UnicodeWidthStr::width(close_label) as u16;
+    if rect.width > close_w + 4 {
+        let close_x = rect.right().saturating_sub(close_w + 1);
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                close_label,
+                Style::default().fg(theme.fg).bg(theme.bg_elevated),
+            )),
+            Rect::new(close_x, rect.y, close_w, 1),
+        );
+        hitmap.add_line(
+            close_x,
+            rect.y,
+            close_w,
+            HitTarget::Button(ButtonId::ConfirmCancel),
+        );
+    }
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     for (section, items) in HELP_SECTIONS {

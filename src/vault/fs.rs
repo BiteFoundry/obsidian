@@ -34,6 +34,83 @@ pub struct DiskNoteEntry {
     pub size_bytes: i64,
 }
 
+/// Metadata of a discovered `.html`/`.htm`/`.xhtml` file inside a vault.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VaultHtmlFile {
+    pub rel_path: String,
+    pub abs_path: PathBuf,
+    pub title: String,
+    pub folder: String,
+    pub size_bytes: i64,
+}
+
+/// Returns `true` when `path` has an `.html`, `.htm`, or `.xhtml` extension (ignoring `#` / `?` suffixes).
+pub fn is_html_file_path(path: &str) -> bool {
+    let base = path
+        .split(['#', '?'])
+        .next()
+        .unwrap_or(path)
+        .trim()
+        .trim_matches(['<', '>']);
+    let Some((_, ext)) = base.rsplit_once('.') else {
+        return false;
+    };
+    matches!(ext.to_ascii_lowercase().as_str(), "html" | "htm" | "xhtml")
+}
+
+/// Walks a vault directory recursively for `.html`/`.htm`/`.xhtml` files, skipping hidden/system directories.
+pub fn scan_vault_html_files(vault_root: &Path) -> Result<Vec<VaultHtmlFile>> {
+    if !vault_root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    walk_html_dir_recursive(vault_root, vault_root, &mut out)?;
+    out.sort_by(|a, b| a.rel_path.to_ascii_lowercase().cmp(&b.rel_path.to_ascii_lowercase()));
+    Ok(out)
+}
+
+fn walk_html_dir_recursive(root: &Path, dir: &Path, out: &mut Vec<VaultHtmlFile>) -> Result<()> {
+    let entries = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(_) => return Ok(()),
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if ft.is_symlink() {
+            continue;
+        }
+        if ft.is_dir() {
+            if IGNORED_DIRS.iter().any(|&ig| name.eq_ignore_ascii_case(ig))
+                || name.starts_with('.')
+            {
+                continue;
+            }
+            walk_html_dir_recursive(root, &path, out)?;
+        } else if ft.is_file() && is_html_file_path(&name) {
+            let Ok(rel) = path.strip_prefix(root) else {
+                continue;
+            };
+            let rel_path = normalize_rel_path(rel);
+            let title = name.to_string();
+            let folder = folder_from_rel_path(&rel_path);
+            let size_bytes = entry.metadata().ok().map(|m| m.len() as i64).unwrap_or(0);
+            out.push(VaultHtmlFile {
+                rel_path,
+                abs_path: path,
+                title,
+                folder,
+                size_bytes,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Walks a vault directory recursively for `.md` files, skipping hidden/system directories.
 pub fn scan_vault_markdown_files(vault_root: &Path) -> Result<Vec<DiskNoteEntry>> {
     if !vault_root.is_dir() {
@@ -315,15 +392,18 @@ pub fn hydrate_parsed_note_links(
                 line_no,
                 ..
             } => {
-                if let Some(abs) = resolve_attachment_path(vault_root, note_rel_path, raw_target) {
-                    *resolved_path = Some(abs.clone());
-                    images.push(NoteImageRef {
-                        raw_target: raw_target.clone(),
-                        display_name: alt.clone(),
-                        mime_type: mime_type_for_path(raw_target).to_string(),
-                        abs_path: abs,
-                        line_no: *line_no,
-                    });
+                if is_image_target(raw_target) {
+                    if let Some(abs) = resolve_attachment_path(vault_root, note_rel_path, raw_target)
+                    {
+                        *resolved_path = Some(abs.clone());
+                        images.push(NoteImageRef {
+                            raw_target: raw_target.clone(),
+                            display_name: alt.clone(),
+                            mime_type: mime_type_for_path(raw_target).to_string(),
+                            abs_path: abs,
+                            line_no: *line_no,
+                        });
+                    }
                 }
             }
             _ => {}

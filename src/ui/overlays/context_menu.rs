@@ -69,6 +69,11 @@ impl ContextMenuOverlay {
                 action: Action::OpenLinkExtractor,
             },
             ContextMenuItem {
+                label: "Interactive HTML Preview".into(),
+                shortcut: "H".into(),
+                action: Action::OpenHtmlPreview,
+            },
+            ContextMenuItem {
                 label: "Attach Local File".into(),
                 shortcut: "Ctrl+F".into(),
                 action: Action::OpenFilePicker,

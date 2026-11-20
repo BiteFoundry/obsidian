@@ -36,6 +36,11 @@ pub enum SidebarEntry {
         is_bookmarked: bool,
         backlinks: usize,
     },
+    HtmlFile {
+        rel_path: String,
+        title: String,
+        depth: usize,
+    },
     Tag {
         tag: String,
         count: usize,
@@ -70,7 +75,7 @@ pub fn selection_offset(selected: usize, visible: usize, total: usize) -> usize 
 
 pub fn build_sidebar_entries(app: &AppState, ui: &UiState) -> Vec<SidebarEntry> {
     match ui.sidebar_tab {
-        SidebarTab::Files => build_file_tree(&app.notes, &ui.collapsed_folders),
+        SidebarTab::Files => build_file_tree(&app.notes, &app.html_files, &ui.collapsed_folders),
         SidebarTab::Tags => {
             let mut out = Vec::new();
             if let Some(ref active_tag) = ui.active_tag_filter {
@@ -152,18 +157,29 @@ pub fn build_sidebar_entries(app: &AppState, ui: &UiState) -> Vec<SidebarEntry> 
     }
 }
 
-fn build_file_tree(notes: &[NoteSummary], collapsed: &HashSet<String>) -> Vec<SidebarEntry> {
+fn build_file_tree(
+    notes: &[NoteSummary],
+    html_files: &[crate::vault::fs::VaultHtmlFile],
+    collapsed: &HashSet<String>,
+) -> Vec<SidebarEntry> {
     let mut by_folder: BTreeMap<String, Vec<&NoteSummary>> = BTreeMap::new();
     for n in notes {
         by_folder.entry(n.folder.clone()).or_default().push(n);
     }
+    let mut html_by_folder: BTreeMap<String, Vec<&crate::vault::fs::VaultHtmlFile>> =
+        BTreeMap::new();
+    for h in html_files {
+        html_by_folder.entry(h.folder.clone()).or_default().push(h);
+        by_folder.entry(h.folder.clone()).or_default();
+    }
 
     let mut out = Vec::new();
-    // Folders first, then root notes
+    // Folders first, then root notes & root HTML files
     for (folder, items) in &by_folder {
         if folder.is_empty() {
             continue;
         }
+        let html_items = html_by_folder.get(folder).map(Vec::as_slice).unwrap_or(&[]);
         let expanded = !collapsed.contains(folder);
         let depth = folder.matches('/').count();
         let display = folder.rsplit('/').next().unwrap_or(folder).to_string();
@@ -172,7 +188,7 @@ fn build_file_tree(notes: &[NoteSummary], collapsed: &HashSet<String>) -> Vec<Si
             name: display,
             depth,
             expanded,
-            count: items.len(),
+            count: items.len() + html_items.len(),
         });
         if expanded {
             for n in items {
@@ -182,6 +198,13 @@ fn build_file_tree(notes: &[NoteSummary], collapsed: &HashSet<String>) -> Vec<Si
                     depth: depth + 1,
                     is_bookmarked: n.is_bookmarked,
                     backlinks: n.backlink_count,
+                });
+            }
+            for h in html_items {
+                out.push(SidebarEntry::HtmlFile {
+                    rel_path: h.rel_path.clone(),
+                    title: h.title.clone(),
+                    depth: depth + 1,
                 });
             }
         }
@@ -195,6 +218,15 @@ fn build_file_tree(notes: &[NoteSummary], collapsed: &HashSet<String>) -> Vec<Si
                 depth: 0,
                 is_bookmarked: n.is_bookmarked,
                 backlinks: n.backlink_count,
+            });
+        }
+    }
+    if let Some(root_html) = html_by_folder.get("") {
+        for h in root_html {
+            out.push(SidebarEntry::HtmlFile {
+                rel_path: h.rel_path.clone(),
+                title: h.title.clone(),
+                depth: 0,
             });
         }
     }
@@ -403,6 +435,30 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
                                 Modifier::empty()
                             }),
                     ),
+                ])
+            }
+            SidebarEntry::HtmlFile { title, depth, .. } => {
+                let indent = "  ".repeat(*depth);
+                let marker = if is_sel && focused { "▸" } else { " " };
+                let avail = w.saturating_sub(indent.len() + 9);
+                Line::from(vec![
+                    Span::styled(
+                        marker.to_string(),
+                        Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(indent),
+                    Span::styled("◈ ", Style::default().fg(theme.info)),
+                    Span::styled(
+                        truncate_width(title, avail),
+                        Style::default()
+                            .fg(theme.fg_primary)
+                            .add_modifier(if is_sel && focused {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
+                    ),
+                    Span::styled(" HTML", Style::default().fg(theme.info)),
                 ])
             }
             SidebarEntry::TagHeader { tag, count } => Line::from(vec![

@@ -498,3 +498,367 @@ fn test_ratatui_test_backend_3pane_and_braille_graph_view() {
         .collect();
     assert!(tags_text.contains("Tags ("));
 }
+
+#[test]
+fn test_all_button_ids_registered_and_dispatched_on_mouse_click() {
+    use obsidian_cli::{
+        config::PageWidthMode,
+        ui::{
+            hitmap::{ButtonId, HitTarget},
+            overlays::Overlay,
+        },
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("ClickVault");
+    fs::create_dir_all(&root).unwrap();
+    seed_vault(&root);
+
+    let vault = vault_from_dir(&root, Some("ClickVault"));
+    let mut cfg = AppConfig::default();
+    cfg.upsert_vault(vault.clone(), true);
+
+    let storage = Storage::open_in_memory().unwrap();
+    storage.sync_vault(&vault).unwrap();
+
+    let (focus_tx, _focus_rx) = watch::channel(FocusTarget::default());
+    let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel::<SyncCommand>();
+    let sync_ctrl = SyncController::from_channels(focus_tx, cmd_tx);
+
+    let mut app = AppState::new(cfg.clone(), vault, storage, sync_ctrl);
+    let mut ui = UiState::from_config(&cfg);
+    app.reload_from_storage(&mut ui);
+    app.open_note(&mut ui, "Projects/Q4 Architecture RFC.md", false);
+
+    let mut terminal = Terminal::new(TestBackend::new(140, 36)).unwrap();
+
+    let click_button = |terminal: &mut Terminal<TestBackend>,
+                        app: &mut AppState,
+                        ui: &mut UiState,
+                        btn: ButtonId| {
+        ui.toasts.clear();
+        terminal
+            .draw(|f| {
+                let _ = ui::draw(f, app, ui);
+            })
+            .unwrap();
+        let rect = ui
+            .last_hitmap
+            .region_of(HitTarget::Button(btn))
+            .unwrap_or_else(|| panic!("ButtonId::{btn:?} was not registered in HitMap"));
+        app.dispatch(
+            Action::MouseClick {
+                col: rect.x,
+                row: rect.y,
+            },
+            ui,
+        );
+    };
+
+    // 1. ToggleSidebar
+    let prev_sidebar = ui.show_sidebar;
+    click_button(&mut terminal, &mut app, &mut ui, ButtonId::ToggleSidebar);
+    assert_eq!(ui.show_sidebar, !prev_sidebar);
+    click_button(&mut terminal, &mut app, &mut ui, ButtonId::ToggleSidebar);
+    assert_eq!(ui.show_sidebar, prev_sidebar);
+
+    // 2. VaultSwitcher
+    click_button(&mut terminal, &mut app, &mut ui, ButtonId::VaultSwitcher);
+    assert!(matches!(ui.overlay, Some(Overlay::VaultSwitcher(_))));
+    ui.close_overlay();
+
+    // 3. Settings
+    click_button(&mut terminal, &mut app, &mut ui, ButtonId::Settings);
+    assert!(matches!(ui.overlay, Some(Overlay::Settings(_))));
+    ui.close_overlay();
+
+    // 4. Help (+ ConfirmCancel close pill)
+    click_button(&mut terminal, &mut app, &mut ui, ButtonId::Help);
+    assert!(matches!(ui.overlay, Some(Overlay::Help { .. })));
+    click_button(&mut terminal, &mut app, &mut ui, ButtonId::ConfirmCancel);
+    assert!(ui.overlay.is_none());
+
+    // 5. QuickSwitcher
+    click_button(&mut terminal, &mut app, &mut ui, ButtonId::QuickSwitcher);
+    assert!(matches!(ui.overlay, Some(Overlay::QuickSwitcher(_))));
+    ui.close_overlay();
+
+    // 6. ToggleInspector
+    let prev_insp = ui.show_inspector;
+    click_button(&mut terminal, &mut app, &mut ui, ButtonId::ToggleInspector);
+    assert_eq!(ui.show_inspector, !prev_insp);
+    click_button(&mut terminal, &mut app, &mut ui, ButtonId::ToggleInspector);
+    assert_eq!(ui.show_inspector, prev_insp);
+
+    // 7. ToggleBookmark
+    let prev_bm = app.active_note.as_ref().unwrap().summary.is_bookmarked;
+    click_button(&mut terminal, &mut app, &mut ui, ButtonId::ToggleBookmark);
+    assert_eq!(
+        app.active_note.as_ref().unwrap().summary.is_bookmarked,
+        !prev_bm
+    );
+
+    // 8. ToggleWidth
+    let prev_w = ui.page_width;
+    click_button(&mut terminal, &mut app, &mut ui, ButtonId::ToggleWidth);
+    assert_ne!(ui.page_width, prev_w);
+    assert!(matches!(
+        ui.page_width,
+        PageWidthMode::Full | PageWidthMode::Centered
+    ));
+
+    // 9. QuickAppend
+    click_button(&mut terminal, &mut app, &mut ui, ButtonId::QuickAppend);
+    assert!(matches!(ui.overlay, Some(Overlay::NoteForm(_))));
+    ui.close_overlay();
+
+    // 10. NewNote
+    click_button(&mut terminal, &mut app, &mut ui, ButtonId::NewNote);
+    assert!(matches!(ui.overlay, Some(Overlay::NoteForm(_))));
+    ui.close_overlay();
+
+    // 11. EditExternal
+    assert!(app.pending_external_editor.is_none());
+    click_button(&mut terminal, &mut app, &mut ui, ButtonId::EditExternal);
+    assert!(app.pending_external_editor.take().is_some());
+
+    // 12. LinkExtractor
+    click_button(&mut terminal, &mut app, &mut ui, ButtonId::LinkExtractor);
+    assert!(matches!(ui.overlay, Some(Overlay::LinkExtractor(_))));
+    ui.close_overlay();
+
+    // 13. ToggleHrefs
+    let prev_hrefs = ui.show_inline_hrefs;
+    click_button(&mut terminal, &mut app, &mut ui, ButtonId::ToggleHrefs);
+    assert_eq!(ui.show_inline_hrefs, !prev_hrefs);
+
+    // 14. ImagePreview (note has Attachments/diagram.png!) + ConfirmCancel close pill
+    click_button(&mut terminal, &mut app, &mut ui, ButtonId::ImagePreview);
+    assert!(matches!(ui.overlay, Some(Overlay::ImagePreview(_))));
+    click_button(&mut terminal, &mut app, &mut ui, ButtonId::ConfirmCancel);
+    assert!(ui.overlay.is_none());
+
+    // 15. ReindexNow
+    app.last_index_stats = None;
+    click_button(&mut terminal, &mut app, &mut ui, ButtonId::ReindexNow);
+    assert!(app.last_index_stats.is_some());
+
+    // 16. ToggleGraph + 17. GraphToggleScope
+    assert_eq!(ui.canvas_mode, CanvasMode::Note);
+    click_button(&mut terminal, &mut app, &mut ui, ButtonId::ToggleGraph);
+    assert_eq!(ui.canvas_mode, CanvasMode::Graph);
+    let prev_global = ui.graph_global;
+    click_button(&mut terminal, &mut app, &mut ui, ButtonId::GraphToggleScope);
+    assert_eq!(ui.graph_global, !prev_global);
+    click_button(&mut terminal, &mut app, &mut ui, ButtonId::ToggleGraph);
+    assert_eq!(ui.canvas_mode, CanvasMode::Note);
+
+    // 18. OpenDaily
+    click_button(&mut terminal, &mut app, &mut ui, ButtonId::OpenDaily);
+    assert!(app
+        .active_note
+        .as_ref()
+        .unwrap()
+        .summary
+        .rel_path
+        .starts_with("Daily Notes/"));
+
+    // 19. ConfirmOk & ConfirmCancel via ConfirmDeleteNote
+    app.dispatch(Action::ConfirmDeleteNote, &mut ui);
+    assert!(matches!(ui.overlay, Some(Overlay::Confirm(_))));
+    click_button(&mut terminal, &mut app, &mut ui, ButtonId::ConfirmOk);
+    assert!(ui.overlay.is_none());
+}
+
+#[tokio::test]
+async fn test_html_preview_interactive_quickjs_native_serving_vault_files_and_auto_routing() {
+    use obsidian_cli::ui::{
+        hitmap::{ButtonId, HitTarget},
+        overlays::Overlay,
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("HtmlVault");
+    fs::create_dir_all(root.join("Attachments")).unwrap();
+    fs::create_dir_all(root.join("Pages")).unwrap();
+
+    // 1. Standalone .html file in vault
+    fs::write(
+        root.join("Pages/dashboard.html"),
+        r#"<!DOCTYPE html><html><head><title>Vault Dashboard</title></head><body><h1>Dashboard</h1><p id="msg">Ready</p><button onclick="document.getElementById('msg').textContent='Launched'">Launch</button></body></html>"#,
+    )
+    .unwrap();
+
+    // 2. Fake .png attachment whose actual bytes are HTML (must auto-route to HtmlPreview!)
+    fs::write(
+        root.join("Attachments/fake_chart.png"),
+        b"<!DOCTYPE html><html><body><h1>Login Redirect</h1><button onclick=\"this.textContent='Retried'\">Retry</button></body></html>",
+    )
+    .unwrap();
+
+    // 3. Markdown note with fenced ```html code block + fake_chart.png embed
+    fs::write(
+        root.join("Interactive.md"),
+        r#"# Interactive Note
+
+```html
+<div>
+  <p id="cnt">Clicks: 0</p>
+  <button id="btn" onclick="window.__n=(window.__n||0)+1; document.getElementById('cnt').textContent='Clicks: '+window.__n;">Click Me</button>
+</div>
+```
+
+![[fake_chart.png]]
+"#,
+    )
+    .unwrap();
+
+    let vault = vault_from_dir(&root, Some("HtmlVault"));
+    let mut cfg = AppConfig::default();
+    cfg.upsert_vault(vault.clone(), true);
+
+    let storage = Storage::open_in_memory().unwrap();
+    storage.sync_vault(&vault).unwrap();
+
+    let (focus_tx, _focus_rx) = watch::channel(FocusTarget::default());
+    let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel::<SyncCommand>();
+    let sync_ctrl = SyncController::from_channels(focus_tx, cmd_tx);
+
+    let mut app = AppState::new(cfg.clone(), vault, storage, sync_ctrl);
+    let mut ui = UiState::from_config(&cfg);
+    app.reload_from_storage(&mut ui);
+    app.open_note(&mut ui, "Interactive.md", false);
+
+    // Vault .html file discovery
+    assert_eq!(app.html_files.len(), 1);
+    assert_eq!(app.html_files[0].rel_path, "Pages/dashboard.html");
+
+    let mut terminal = Terminal::new(TestBackend::new(120, 34)).unwrap();
+
+    // Render note canvas -> `[H: HTML]` pill registered as ButtonId::HtmlPreview & HitTarget::HtmlChip
+    terminal
+        .draw(|f| {
+            let _ = ui::draw(f, &app, &mut ui);
+        })
+        .unwrap();
+    let html_pill = ui
+        .last_hitmap
+        .region_of(HitTarget::Button(ButtonId::HtmlPreview))
+        .expect("[H: HTML] pill should be registered in HitMap");
+
+    // Clicking `[H: HTML]` opens Overlay::HtmlPreview with the fenced ```html block
+    app.dispatch(
+        Action::MouseClick {
+            col: html_pill.x,
+            row: html_pill.y,
+        },
+        &mut ui,
+    );
+    assert!(matches!(ui.overlay, Some(Overlay::HtmlPreview(_))));
+
+    terminal
+        .draw(|f| {
+            let _ = ui::draw(f, &app, &mut ui);
+        })
+        .unwrap();
+
+    // Verify mouse `click_at` invokes QuickJS `<button onclick>` and mutates DOM
+    let (btn_col, btn_row) = {
+        let Some(Overlay::HtmlPreview(ref mut ov)) = ui.overlay else {
+            panic!("expected HtmlPreview");
+        };
+        assert!(ov.session.js_active);
+        let theme = obsidian_cli::ui::overlays::html_preview::html_theme_from_ui(&ui.theme);
+        let rendered = ov
+            .session
+            .render(ov.last_content_rect.width, &theme, false);
+        let ctrl = &rendered.controls[0];
+        (
+            ov.last_content_rect.x + ctrl.col_start + 1,
+            ov.last_content_rect.y + ctrl.line as u16,
+        )
+    };
+    app.dispatch(
+        Action::MouseClick {
+            col: btn_col,
+            row: btn_row,
+        },
+        &mut ui,
+    );
+    terminal
+        .draw(|f| {
+            let _ = ui::draw(f, &app, &mut ui);
+        })
+        .unwrap();
+    let after_click: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(
+        after_click.contains("Clicks: 1"),
+        "mouse click_at should execute onclick handler and render Clicks: 1"
+    );
+
+    // Toggle Raw HTML (`m`) and back
+    app.dispatch(Action::Input('m'), &mut ui);
+    {
+        let Some(Overlay::HtmlPreview(ref ov)) = ui.overlay else {
+            panic!("expected HtmlPreview");
+        };
+        assert!(ov.session.raw_mode);
+    }
+    app.dispatch(Action::Input('m'), &mut ui);
+
+    // Native Serving (`o`) -> queues pending_html_serve -> serves over localhost Axum!
+    app.dispatch(Action::Input('o'), &mut ui);
+    let (serve_title, serve_html) = app
+        .pending_html_serve
+        .take()
+        .expect("pressing 'o' should queue native HTML serving");
+    let served_url = app
+        .serve_html_and_open(&serve_title, &serve_html, &mut ui, false)
+        .await
+        .expect("NativeHtmlServer::serve_html should succeed");
+    assert!(served_url.starts_with("http://127.0.0.1:"));
+
+    let resp = reqwest::get(&served_url).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    assert!(content_type.contains("text/html"));
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("Click Me"));
+
+    // Click outside modal (0, 0) closes HtmlPreview and drops QuickJS session
+    app.dispatch(Action::MouseClick { col: 0, row: 0 }, &mut ui);
+    assert!(ui.overlay.is_none());
+
+    // Open vault `.html` file via `Action::OpenHtmlFile`
+    app.dispatch(
+        Action::OpenHtmlFile("Pages/dashboard.html".into()),
+        &mut ui,
+    );
+    assert!(matches!(ui.overlay, Some(Overlay::HtmlPreview(_))));
+    app.dispatch(Action::Input('q'), &mut ui);
+    assert!(ui.overlay.is_none());
+
+    // HTML-vs-Image Auto-Routing: opening image preview on `fake_chart.png` (which contains HTML)
+    // automatically routes to Overlay::HtmlPreview instead of failing image decode!
+    app.dispatch(Action::OpenImagePreview, &mut ui);
+    match ui.overlay {
+        Some(Overlay::HtmlPreview(ref ov)) => {
+            assert!(ov.session.raw_html().contains("Login Redirect"));
+            assert!(ov.session.js_active);
+        }
+        ref other => panic!("expected auto-routed HtmlPreview, got {other:?}"),
+    }
+
+    app.html_server.shutdown();
+}

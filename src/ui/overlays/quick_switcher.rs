@@ -28,6 +28,11 @@ pub enum SwitcherItem {
         tags: Vec<String>,
         backlinks: usize,
     },
+    HtmlFile {
+        rel_path: String,
+        title: String,
+        folder: String,
+    },
     Command {
         label: String,
         shortcut: String,
@@ -78,11 +83,25 @@ impl QuickSwitcherOverlay {
                 .collect();
             scored.sort_by(|a, b| b.0.cmp(&a.0));
             out.extend(scored.into_iter().take(40).map(|(_, item)| item));
+
+            for h in &app.html_files {
+                if needle.is_empty()
+                    || h.title.to_ascii_lowercase().contains(&needle)
+                    || h.rel_path.to_ascii_lowercase().contains(&needle)
+                {
+                    out.push(SwitcherItem::HtmlFile {
+                        rel_path: h.rel_path.clone(),
+                        title: h.title.clone(),
+                        folder: h.folder.clone(),
+                    });
+                }
+            }
         }
 
         let commands = vec![
             ("Open Knowledge Graph View", "G", Action::ToggleGraphView),
             ("Open Today's Daily Note", "D", Action::OpenDailyNote),
+            ("Interactive HTML Preview", "H", Action::OpenHtmlPreview),
             ("Create New Note", "n", Action::OpenNewNoteModal),
             ("Quick Append to Active Note", "a", Action::OpenQuickAppend),
             ("Toggle Right Inspector (Backlinks)", "B", Action::ToggleInspector),
@@ -147,6 +166,9 @@ impl QuickSwitcherOverlay {
                 match &list[idx] {
                     SwitcherItem::Note { rel_path, .. } => {
                         OverlayOutcome::CloseAndDispatch(Action::OpenNote(rel_path.clone()))
+                    }
+                    SwitcherItem::HtmlFile { rel_path, .. } => {
+                        OverlayOutcome::CloseAndDispatch(Action::OpenHtmlFile(rel_path.clone()))
                     }
                     SwitcherItem::Command { action, .. } => {
                         OverlayOutcome::CloseAndDispatch(action.clone())
@@ -274,6 +296,29 @@ impl QuickSwitcherOverlay {
                     }
                     if *backlinks > 0 {
                         spans.push(Span::styled(format!("  ←{backlinks}"), theme.muted_style()));
+                    }
+                    Line::from(spans)
+                }
+                SwitcherItem::HtmlFile { title, folder, .. } => {
+                    let mut spans = vec![
+                        Span::styled(
+                            if is_sel { " ▸ " } else { "   " },
+                            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled("◈ ", Style::default().fg(theme.info)),
+                        Span::styled(
+                            truncate_width(title, 34),
+                            Style::default()
+                                .fg(theme.fg_primary)
+                                .add_modifier(if is_sel { Modifier::BOLD } else { Modifier::empty() }),
+                        ),
+                        Span::styled("  [HTML]", Style::default().fg(theme.info)),
+                    ];
+                    if !folder.is_empty() {
+                        spans.push(Span::styled(
+                            format!("  {}", truncate_width(folder, 18)),
+                            theme.muted_style(),
+                        ));
                     }
                     Line::from(spans)
                 }

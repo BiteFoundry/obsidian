@@ -25,6 +25,16 @@ pub fn key_to_action(
         return None;
     }
 
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+
+    // When an overlay is focused (and not editing text), `q` closes the overlay
+    // while `Ctrl+C` still quits the app globally.
+    if focus == Focus::Overlay && !text_input && !ctrl && !alt && key.code == KeyCode::Char('q') {
+        return Some(Action::Input('q'));
+    }
+
     if let Some(cmd) = keymap.resolve_global(&key, text_input) {
         return Some(match cmd {
             KeyCommand::Quit => Action::QuitConfirm,
@@ -48,6 +58,7 @@ pub fn key_to_action(
             KeyCommand::OpenLinkExtractor => Action::OpenLinkExtractor,
             KeyCommand::ToggleShowLinkUrls => Action::ToggleShowLinkUrls,
             KeyCommand::OpenImagePreview => Action::OpenImagePreview,
+            KeyCommand::OpenHtmlPreview => Action::OpenHtmlPreview,
             KeyCommand::CopySelection => Action::CopySelectionOrMarkdown,
             KeyCommand::PasteClipboard => Action::PasteClipboard,
             KeyCommand::NavigateBack => Action::NavigateBack,
@@ -55,10 +66,6 @@ pub fn key_to_action(
             KeyCommand::SmoothScrollUp => Action::PageUp,
         });
     }
-
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    let alt = key.modifiers.contains(KeyModifiers::ALT);
-    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
     if focus == Focus::Overlay {
         if ctrl && key.code == KeyCode::Enter

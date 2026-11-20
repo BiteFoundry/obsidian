@@ -25,6 +25,7 @@ pub enum KeyCommand {
     OpenLinkExtractor,
     ToggleShowLinkUrls,
     OpenImagePreview,
+    OpenHtmlPreview,
     CopySelection,
     PasteClipboard,
     NavigateBack,
@@ -103,6 +104,7 @@ impl KeyMap {
             KeyCode::Char('X') if shift => Some(KeyCommand::DeleteNote),
             KeyCode::Char('u') => Some(KeyCommand::OpenLinkExtractor),
             KeyCode::Char('h') => Some(KeyCommand::ToggleShowLinkUrls),
+            KeyCode::Char('H') => Some(KeyCommand::OpenHtmlPreview),
             KeyCode::Char('v') => Some(KeyCommand::OpenImagePreview),
             KeyCode::Char('y') => Some(KeyCommand::CopySelection),
             KeyCode::Char('.') => Some(KeyCommand::OpenContextMenu),
@@ -142,6 +144,7 @@ pub const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
         &[
             ("u", "Link Extractor overlay (wikilinks & external URLs)"),
             ("v / Alt+V", "HD Image Preview modal (Kitty/iTerm2/Sixel/Halfblock)"),
+            ("H", "Interactive HTML Preview modal (QuickJS, m Raw, o Browser)"),
             ("Ctrl+V / Ctrl+F", "Paste clipboard PNG / File Picker (z zoxide jump)"),
             ("y / X", "Copy code or note Markdown / Move note to .trash/"),
             ("Ctrl+, / . / ?", "Settings (5 palettes) / Context Menu / Keybinding Help"),

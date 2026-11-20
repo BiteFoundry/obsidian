@@ -30,7 +30,7 @@ use crate::{
     models::{GraphData, GraphNode},
     ui::{
         app::{AppState, UiState},
-        hitmap::{HitMap, HitTarget},
+        hitmap::{ButtonId, HitMap, HitTarget},
         truncate_width,
     },
 };
@@ -462,6 +462,12 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
             theme.muted_style(),
         ),
     ]);
+    let scope_pill = if ui.graph_global {
+        "[l Global ▾]"
+    } else {
+        "[l Local ▾]"
+    };
+    let scope_pill_w = unicode_width::UnicodeWidthStr::width(scope_pill) as u16;
     let legend_line = Line::from(vec![
         Span::styled("   ◉ Focal  ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
         Span::styled("● 1-hop  ", Style::default().fg(theme.accent_soft)),
@@ -473,6 +479,31 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
         Paragraph::new(vec![header_line, legend_line]).style(Style::default().bg(theme.bg_canvas)),
         chunks[0],
     );
+    if chunks[0].width > scope_pill_w + 6 {
+        let px = chunks[0].x + chunks[0].width.saturating_sub(scope_pill_w + 1);
+        let py = chunks[0].y;
+        let pill_style = if ui.graph_global {
+            Style::default()
+                .fg(theme.bg_canvas)
+                .bg(theme.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(theme.accent_soft)
+                .bg(theme.bg_card)
+                .add_modifier(Modifier::BOLD)
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(scope_pill, pill_style)),
+            Rect::new(px, py, scope_pill_w, 1),
+        );
+        hitmap.add_line(
+            px,
+            py,
+            scope_pill_w,
+            HitTarget::Button(ButtonId::GraphToggleScope),
+        );
+    }
 
     // 2. Braille Force-Directed Canvas (live physics positions + pan/zoom camera)
     let canvas_area = chunks[1];
