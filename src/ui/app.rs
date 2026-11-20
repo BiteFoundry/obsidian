@@ -1108,6 +1108,13 @@ impl AppState {
                 ui.graph_depth = ui.graph_depth.saturating_sub(1).max(1);
                 self.refresh_graph(ui);
             }
+            Action::GraphZoomIn => {
+                ui.graph_sim.zoom_by(crate::ui::graph_view::GRAPH_WHEEL_FACTOR);
+            }
+            Action::GraphZoomOut => {
+                ui.graph_sim
+                    .zoom_by(1.0 / crate::ui::graph_view::GRAPH_WHEEL_FACTOR);
+            }
             Action::GraphResetView => {
                 ui.graph_sim.reset_view(&self.graph);
                 ui.toasts.info("Reset graph view");
@@ -1555,7 +1562,10 @@ impl AppState {
             Action::MouseDrag { col, row } => {
                 if ui.overlay.is_none() && ui.canvas_mode == CanvasMode::Graph {
                     if ui.graph_sim.dragging_node.is_some() {
-                        ui.graph_sim.move_dragged_node(&self.graph, col, row);
+                        if ui.graph_sim.last_mouse != Some((col, row)) {
+                            ui.graph_sim.last_mouse = Some((col, row));
+                            ui.graph_sim.move_dragged_node(&self.graph, col, row);
+                        }
                     } else if ui.graph_sim.panning {
                         if let Some((lc, lr)) = ui.graph_sim.last_mouse {
                             ui.graph_sim
@@ -1573,8 +1583,9 @@ impl AppState {
                                 self.open_note(ui, &node.id, true);
                             }
                         } else if ui.graph_sim.drag_moved {
-                            // Let connected neighbors smoothly settle after release
-                            ui.graph_sim.energy = ui.graph_sim.energy.max(0.03);
+                            // Let direct 1-hop neighbors gently settle after drag release
+                            ui.graph_sim.energy = ui.graph_sim.energy.max(0.015);
+                            ui.graph_sim.settle_frames = 0;
                         }
                     }
                     ui.graph_sim.panning = false;
@@ -1591,15 +1602,9 @@ impl AppState {
                 }
             }
             Action::MouseScrollUp { col, row } => {
-                if ui.overlay.is_none()
-                    && ui.canvas_mode == CanvasMode::Graph
-                    && ui
-                        .graph_sim
-                        .canvas_area
-                        .get()
-                        .contains(ratatui::layout::Position::new(col, row))
-                {
-                    ui.graph_sim.zoom_by(1.14);
+                if self.is_over_graph_view(col, row, ui) {
+                    ui.graph_sim
+                        .zoom_at(col, row, crate::ui::graph_view::GRAPH_WHEEL_FACTOR);
                 } else {
                     match self.scroll_pane_at(col, row, ui) {
                         Focus::Sidebar => {
@@ -1616,15 +1621,9 @@ impl AppState {
                 }
             }
             Action::MouseScrollDown { col, row } => {
-                if ui.overlay.is_none()
-                    && ui.canvas_mode == CanvasMode::Graph
-                    && ui
-                        .graph_sim
-                        .canvas_area
-                        .get()
-                        .contains(ratatui::layout::Position::new(col, row))
-                {
-                    ui.graph_sim.zoom_by(1.0 / 1.14);
+                if self.is_over_graph_view(col, row, ui) {
+                    ui.graph_sim
+                        .zoom_at(col, row, 1.0 / crate::ui::graph_view::GRAPH_WHEEL_FACTOR);
                 } else {
                     match self.scroll_pane_at(col, row, ui) {
                         Focus::Sidebar => {
@@ -1711,6 +1710,32 @@ impl AppState {
                 .unwrap_or_else(|| ol.target_raw.clone());
             self.open_note(ui, &dest, true);
         }
+    }
+
+    fn is_over_graph_view(&self, col: u16, row: u16, ui: &UiState) -> bool {
+        if ui.overlay.is_some() || ui.canvas_mode != CanvasMode::Graph {
+            return false;
+        }
+        let pos = ratatui::layout::Position::new(col, row);
+        if ui.graph_sim.pane_area.get().contains(pos)
+            || ui.graph_sim.canvas_area.get().contains(pos)
+        {
+            return true;
+        }
+        matches!(
+            ui.last_hitmap.hit(row, col),
+            Some(
+                HitTarget::GraphCanvas
+                    | HitTarget::GraphNode(_)
+                    | HitTarget::Pane(Focus::Canvas)
+                    | HitTarget::Button(
+                        ButtonId::GraphToggleScope
+                            | ButtonId::GraphZoomOut
+                            | ButtonId::GraphZoomIn
+                            | ButtonId::GraphResetView
+                    )
+            )
+        )
     }
 
     fn scroll_pane_at(&self, col: u16, row: u16, ui: &UiState) -> Focus {
@@ -1857,7 +1882,6 @@ impl AppState {
                 ui.graph_sim.drag_moved = false;
                 ui.graph_sim.panning = false;
                 ui.graph_sim.last_mouse = Some((col, row));
-                ui.graph_sim.energy = 0.05;
             }
             HitTarget::InspectorBacklink(idx) => {
                 ui.focus = Focus::Inspector;
@@ -1913,6 +1937,9 @@ impl AppState {
                 ),
                 ButtonId::ReindexNow => self.dispatch_core(Action::RefreshAll, ui),
                 ButtonId::GraphToggleScope => self.dispatch_core(Action::ToggleGraphScope, ui),
+                ButtonId::GraphZoomOut => self.dispatch_core(Action::GraphZoomOut, ui),
+                ButtonId::GraphZoomIn => self.dispatch_core(Action::GraphZoomIn, ui),
+                ButtonId::GraphResetView => self.dispatch_core(Action::GraphResetView, ui),
                 ButtonId::ConfirmOk => self.dispatch(Action::Input('y'), ui),
                 ButtonId::ConfirmCancel => self.dispatch(Action::CloseOverlay, ui),
             },

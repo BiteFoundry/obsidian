@@ -135,7 +135,7 @@ pub const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
         "Obsidian Note Canvas & Knowledge Graph",
         &[
             ("G", "Toggle Interactive Knowledge Graph View (Braille Canvas)"),
-            ("l / + / -", "In Graph View: toggle Local/Global scope & hop depth"),
+            ("l / +/- / 0,r / [/]", "In Graph View: Scope, Zoom, Reset, Hop Depth"),
             ("D", "Open or create Today's Daily Note"),
             ("Space / x", "Toggle live Markdown checkbox right in the .md file"),
             ("Enter", "Follow [[wikilink]], open note, or jump to heading"),

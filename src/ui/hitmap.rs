@@ -30,6 +30,9 @@ pub enum ButtonId {
     HtmlServeBrowser,
     ReindexNow,
     GraphToggleScope,
+    GraphZoomOut,
+    GraphZoomIn,
+    GraphResetView,
     ConfirmOk,
     ConfirmCancel,
 }

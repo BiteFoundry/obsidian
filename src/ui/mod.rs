@@ -328,7 +328,9 @@ fn draw_status_bar(
         CanvasMode::Graph => &[
             ("G Note", Some(ButtonId::ToggleGraph)),
             ("l Local/Global", Some(ButtonId::GraphToggleScope)),
-            ("+/- Depth", None),
+            ("+/- Zoom", None),
+            ("0/r Reset", Some(ButtonId::GraphResetView)),
+            ("[/] Depth", None),
             ("Ctrl+O Switch", Some(ButtonId::QuickSwitcher)),
             ("Ctrl+, Theme", Some(ButtonId::Settings)),
         ],

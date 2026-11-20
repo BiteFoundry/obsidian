@@ -35,6 +35,28 @@ pub fn key_to_action(
         return Some(Action::Input('q'));
     }
 
+    // Graph View specific shortcuts when viewing Knowledge Graph in Canvas.
+    // Handled before global keymap so `r` resets the graph view (instead of RefreshAll)
+    // and `[` / `]` adjust hop depth cleanly without clashing with zoom (`+`/`-`).
+    if canvas_mode == CanvasMode::Graph && focus == Focus::Canvas && !text_input && !ctrl && !alt {
+        match key.code {
+            KeyCode::Char('l') | KeyCode::Char('L') => return Some(Action::ToggleGraphScope),
+            KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Char('z') => {
+                return Some(Action::GraphZoomIn);
+            }
+            KeyCode::Char('-') | KeyCode::Char('_') | KeyCode::Char('Z') => {
+                return Some(Action::GraphZoomOut);
+            }
+            KeyCode::Char(']') => return Some(Action::GraphDepthInc),
+            KeyCode::Char('[') => return Some(Action::GraphDepthDec),
+            KeyCode::Char('r') | KeyCode::Char('R') | KeyCode::Char('0') => {
+                return Some(Action::GraphResetView);
+            }
+            KeyCode::Esc => return Some(Action::ToggleGraphView),
+            _ => {}
+        }
+    }
+
     if let Some(cmd) = keymap.resolve_global(&key, text_input) {
         return Some(match cmd {
             KeyCommand::Quit => Action::QuitConfirm,
@@ -142,20 +164,6 @@ pub fn key_to_action(
             KeyCode::Char(ch) if !ctrl && !alt => Some(Action::Input(ch)),
             _ => None,
         };
-    }
-
-    // Graph View specific shortcuts when viewing Knowledge Graph in Canvas
-    if canvas_mode == CanvasMode::Graph && focus == Focus::Canvas {
-        match key.code {
-            KeyCode::Char('l') | KeyCode::Char('L') => return Some(Action::ToggleGraphScope),
-            KeyCode::Char('+') | KeyCode::Char('=') => return Some(Action::GraphDepthInc),
-            KeyCode::Char('-') | KeyCode::Char('_') => return Some(Action::GraphDepthDec),
-            KeyCode::Char('r') | KeyCode::Char('R') | KeyCode::Char('0') => {
-                return Some(Action::GraphResetView);
-            }
-            KeyCode::Esc => return Some(Action::ToggleGraphView),
-            _ => {}
-        }
     }
 
     // Sidebar tab number keys `1`..`5`

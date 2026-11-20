@@ -43,6 +43,8 @@ pub enum Action {
     ToggleGraphScope,
     GraphDepthInc,
     GraphDepthDec,
+    GraphZoomIn,
+    GraphZoomOut,
     GraphResetView,
     GraphTick,
     ToggleBookmark,

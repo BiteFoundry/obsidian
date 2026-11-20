@@ -660,13 +660,20 @@ fn test_all_button_ids_registered_and_dispatched_on_mouse_click() {
     click_button(&mut terminal, &mut app, &mut ui, ButtonId::ReindexNow);
     assert!(app.last_index_stats.is_some());
 
-    // 16. ToggleGraph + 17. GraphToggleScope
+    // 16. ToggleGraph + 17. GraphToggleScope + GraphZoomIn/Out/ResetView
     assert_eq!(ui.canvas_mode, CanvasMode::Note);
     click_button(&mut terminal, &mut app, &mut ui, ButtonId::ToggleGraph);
     assert_eq!(ui.canvas_mode, CanvasMode::Graph);
     let prev_global = ui.graph_global;
     click_button(&mut terminal, &mut app, &mut ui, ButtonId::GraphToggleScope);
     assert_eq!(ui.graph_global, !prev_global);
+    click_button(&mut terminal, &mut app, &mut ui, ButtonId::GraphZoomIn);
+    assert!(ui.graph_sim.zoom > 1.0);
+    click_button(&mut terminal, &mut app, &mut ui, ButtonId::GraphZoomOut);
+    assert!((ui.graph_sim.zoom - 1.0).abs() < 1e-6);
+    click_button(&mut terminal, &mut app, &mut ui, ButtonId::GraphZoomIn);
+    click_button(&mut terminal, &mut app, &mut ui, ButtonId::GraphResetView);
+    assert!((ui.graph_sim.zoom - 1.0).abs() < 1e-6);
     click_button(&mut terminal, &mut app, &mut ui, ButtonId::ToggleGraph);
     assert_eq!(ui.canvas_mode, CanvasMode::Note);
 
@@ -1290,4 +1297,278 @@ fn test_in_place_inline_editor_0ms_live_reflection_autosave_upsert_scroll_and_mo
     assert!(fs::read_to_string(root.join("Storage Engine.md"))
         .unwrap()
         .contains("FlushedBeforeVaultSwitch"));
+}
+
+#[test]
+fn test_graph_stability_click_hover_cursor_centered_wheel_zoom_pan_and_keys() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use obsidian_cli::ui::{
+        app::Focus,
+        event::key_to_action,
+        hitmap::{ButtonId, HitTarget},
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("GraphVault");
+    fs::create_dir_all(&root).unwrap();
+    seed_vault(&root);
+
+    let vault = vault_from_dir(&root, Some("GraphVault"));
+    let mut cfg = AppConfig::default();
+    cfg.upsert_vault(vault.clone(), true);
+
+    let storage = Storage::open_in_memory().unwrap();
+    storage.sync_vault(&vault).unwrap();
+
+    let (focus_tx, _focus_rx) = watch::channel(FocusTarget::default());
+    let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel::<SyncCommand>();
+    let sync_ctrl = SyncController::from_channels(focus_tx, cmd_tx);
+
+    let mut app = AppState::new(cfg.clone(), vault, storage, sync_ctrl);
+    let mut ui = UiState::from_config(&cfg);
+    app.reload_from_storage(&mut ui);
+    app.open_note(&mut ui, "Projects/Q4 Architecture RFC.md", false);
+
+    // Enter Graph View
+    app.dispatch(Action::ToggleGraphView, &mut ui);
+    assert_eq!(ui.canvas_mode, CanvasMode::Graph);
+    assert_eq!(ui.focus, Focus::Canvas);
+    assert!(app.graph.nodes.len() >= 3);
+
+    let mut terminal = Terminal::new(TestBackend::new(140, 36)).unwrap();
+    terminal
+        .draw(|f| {
+            let _ = ui::draw(f, &app, &mut ui);
+        })
+        .unwrap();
+
+    // 1. Clicking a GraphNode without dragging must NOT wake physics or move any node
+    let node_idx = (0..app.graph.nodes.len())
+        .find(|&i| i != ui.graph_selected)
+        .unwrap_or(0);
+    let node_rect = ui
+        .last_hitmap
+        .region_of(HitTarget::GraphNode(node_idx))
+        .expect("GraphNode should be registered in HitMap");
+    let positions_before_click = ui.graph_sim.positions.clone();
+
+    app.dispatch(
+        Action::MouseClick {
+            col: node_rect.x + 1,
+            row: node_rect.y,
+        },
+        &mut ui,
+    );
+    assert_eq!(ui.graph_selected, node_idx);
+    assert_eq!(ui.graph_sim.energy, 0.0, "click must NOT wake physics");
+    assert!(!ui.graph_sim.is_active(), "click without drag must NOT activate physics loop");
+    // Even if GraphTick fires before MouseUp, no node moves
+    app.dispatch(Action::GraphTick, &mut ui);
+    app.dispatch(
+        Action::MouseUp {
+            col: node_rect.x + 1,
+            row: node_rect.y,
+        },
+        &mut ui,
+    );
+    assert_eq!(ui.graph_sim.energy, 0.0);
+    assert_eq!(
+        ui.graph_sim.positions, positions_before_click,
+        "clicking a node without dragging must not move any node"
+    );
+
+    // 2. Hovering a GraphNode must NOT change its pill width (zero label-jitter domino effect!)
+    terminal
+        .draw(|f| {
+            let _ = ui::draw(f, &app, &mut ui);
+        })
+        .unwrap();
+    let rects_unhovered: Vec<(usize, ratatui::layout::Rect)> = (0..app.graph.nodes.len())
+        .filter_map(|i| {
+            ui.last_hitmap
+                .region_of(HitTarget::GraphNode(i))
+                .map(|r| (i, r))
+        })
+        .collect();
+    let hover_target = rects_unhovered[0];
+    app.dispatch(
+        Action::MouseMove {
+            col: hover_target.1.x + 1,
+            row: hover_target.1.y,
+        },
+        &mut ui,
+    );
+    assert_eq!(ui.graph_sim.hovered_node, Some(hover_target.0));
+    terminal
+        .draw(|f| {
+            let _ = ui::draw(f, &app, &mut ui);
+        })
+        .unwrap();
+    let hovered_rect = ui
+        .last_hitmap
+        .region_of(HitTarget::GraphNode(hover_target.0))
+        .unwrap();
+    assert_eq!(
+        hovered_rect.width, hover_target.1.width,
+        "hovering a node must never change its pill width"
+    );
+
+    // 3. MouseScrollUp / MouseScrollDown over GraphCanvas AND over a GraphNode zooms smoothly & cursor-centered
+    let canvas_rect = ui.graph_sim.canvas_area.get();
+    let scroll_col = canvas_rect.x + canvas_rect.width / 3;
+    let scroll_row = canvas_rect.y + canvas_rect.height / 3;
+    let (wx0, wy0) = ui
+        .graph_sim
+        .screen_to_world_raw(scroll_col, scroll_row)
+        .unwrap();
+
+    app.dispatch(
+        Action::MouseScrollUp {
+            col: scroll_col,
+            row: scroll_row,
+        },
+        &mut ui,
+    );
+    assert!(ui.graph_sim.zoom > 1.1, "MouseScrollUp over graph canvas must zoom in");
+    let (wx1, wy1) = ui
+        .graph_sim
+        .screen_to_world_raw(scroll_col, scroll_row)
+        .unwrap();
+    assert!((wx1 - wx0).abs() < 1e-9 && (wy1 - wy0).abs() < 1e-9);
+
+    // Wheel directly over a GraphNode pill zooms out cleanly
+    let zoom_before_node_scroll = ui.graph_sim.zoom;
+    app.dispatch(
+        Action::MouseScrollDown {
+            col: hovered_rect.x + 1,
+            row: hovered_rect.y,
+        },
+        &mut ui,
+    );
+    assert!(
+        ui.graph_sim.zoom < zoom_before_node_scroll,
+        "MouseScrollDown over a GraphNode pill must zoom out"
+    );
+
+    // Wheel over Sidebar still scrolls sidebar, NOT graph zoom!
+    let sidebar_rect = ui
+        .last_hitmap
+        .region_of(HitTarget::Pane(Focus::Sidebar))
+        .expect("Sidebar pane registered");
+    let zoom_before_sidebar_scroll = ui.graph_sim.zoom;
+    ui.sidebar_selected = 0;
+    app.dispatch(
+        Action::MouseScrollDown {
+            col: sidebar_rect.x + 2,
+            row: sidebar_rect.y + 4,
+        },
+        &mut ui,
+    );
+    assert_eq!(ui.graph_sim.zoom, zoom_before_sidebar_scroll);
+    assert_eq!(ui.sidebar_selected, 1);
+
+    // 4. Dragging empty GraphCanvas pans smoothly
+    let pan_before = (ui.graph_sim.pan_x, ui.graph_sim.pan_y);
+    app.dispatch(
+        Action::MouseClick {
+            col: canvas_rect.x + 1,
+            row: canvas_rect.y + 1,
+        },
+        &mut ui,
+    );
+    app.dispatch(
+        Action::MouseDrag {
+            col: canvas_rect.x + 11,
+            row: canvas_rect.y + 5,
+        },
+        &mut ui,
+    );
+    app.dispatch(
+        Action::MouseUp {
+            col: canvas_rect.x + 11,
+            row: canvas_rect.y + 5,
+        },
+        &mut ui,
+    );
+    assert!(ui.graph_sim.pan_x > pan_before.0);
+    assert!(ui.graph_sim.pan_y > pan_before.1);
+
+    // 5. Keyboard shortcuts in Graph View: `+`/`-` zoom, `r`/`0` reset, `[`/`]` depth
+    let act_plus = key_to_action(
+        KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE),
+        Focus::Canvas,
+        CanvasMode::Graph,
+        &ui.keymap,
+        false,
+    );
+    assert_eq!(act_plus, Some(Action::GraphZoomIn));
+
+    let act_minus = key_to_action(
+        KeyEvent::new(KeyCode::Char('-'), KeyModifiers::NONE),
+        Focus::Canvas,
+        CanvasMode::Graph,
+        &ui.keymap,
+        false,
+    );
+    assert_eq!(act_minus, Some(Action::GraphZoomOut));
+
+    let act_r = key_to_action(
+        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+        Focus::Canvas,
+        CanvasMode::Graph,
+        &ui.keymap,
+        false,
+    );
+    assert_eq!(
+        act_r,
+        Some(Action::GraphResetView),
+        "'r' in Graph View must map to GraphResetView, not RefreshAll"
+    );
+
+    let act_depth_inc = key_to_action(
+        KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE),
+        Focus::Canvas,
+        CanvasMode::Graph,
+        &ui.keymap,
+        false,
+    );
+    let act_depth_dec = key_to_action(
+        KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE),
+        Focus::Canvas,
+        CanvasMode::Graph,
+        &ui.keymap,
+        false,
+    );
+    assert_eq!(act_depth_inc, Some(Action::GraphDepthInc));
+    assert_eq!(act_depth_dec, Some(Action::GraphDepthDec));
+
+    app.dispatch(Action::GraphResetView, &mut ui);
+    assert!((ui.graph_sim.zoom - 1.0).abs() < 1e-9);
+    assert!((ui.graph_sim.pan_x - 0.0).abs() < 1e-9);
+    assert!((ui.graph_sim.pan_y - 0.0).abs() < 1e-9);
+
+    // Verify rendering at extreme zoom levels (0.25x low-zoom compact dots and 4.0x high-zoom edge clipping)
+    // completes cleanly with zero panics and registers header zoom buttons!
+    for target_zoom in [0.25, 0.55, 1.0, 2.5, 6.0] {
+        ui.graph_sim.zoom = target_zoom;
+        ui.graph_sim.pan_x = 0.25;
+        ui.graph_sim.pan_y = -0.15;
+        terminal
+            .draw(|f| {
+                let _ = ui::draw(f, &app, &mut ui);
+            })
+            .unwrap();
+        assert!(ui
+            .last_hitmap
+            .region_of(HitTarget::Button(ButtonId::GraphZoomIn))
+            .is_some());
+        assert!(ui
+            .last_hitmap
+            .region_of(HitTarget::Button(ButtonId::GraphZoomOut))
+            .is_some());
+        assert!(ui
+            .last_hitmap
+            .region_of(HitTarget::Button(ButtonId::GraphResetView))
+            .is_some());
+    }
 }
