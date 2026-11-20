@@ -24,6 +24,7 @@ use crate::{
     ui::{
         action::Action,
         composer::read_clipboard_image_png,
+        graph_view::GraphSim,
         hitmap::{ButtonId, HitMap, HitTarget},
         keymap::KeyMap,
         overlays::{
@@ -105,6 +106,7 @@ pub struct UiState {
     pub graph_global: bool,
     pub graph_depth: usize,
     pub graph_selected: usize,
+    pub graph_sim: GraphSim,
     pub inspector_selected: usize,
     pub overlay: Option<Overlay>,
     pub toasts: ToastQueue,
@@ -135,6 +137,7 @@ impl UiState {
             graph_global: false,
             graph_depth: 2,
             graph_selected: 0,
+            graph_sim: GraphSim::default(),
             inspector_selected: 0,
             overlay: None,
             toasts: ToastQueue::new(),
@@ -236,7 +239,7 @@ impl AppState {
         self.refresh_graph(ui);
     }
 
-    pub fn refresh_graph(&mut self, ui: &UiState) {
+    pub fn refresh_graph(&mut self, ui: &mut UiState) {
         let center = if ui.graph_global {
             None
         } else {
@@ -248,6 +251,7 @@ impl AppState {
             .storage
             .get_graph(&self.active_vault.id, center.as_deref(), ui.graph_depth)
             .unwrap_or_default();
+        ui.graph_sim.sync_from_graph(&self.graph);
     }
 
     fn cache_inline_images(&mut self, detail: &NoteDetail) {
@@ -629,6 +633,15 @@ impl AppState {
                 ui.graph_depth = ui.graph_depth.saturating_sub(1).max(1);
                 self.refresh_graph(ui);
             }
+            Action::GraphResetView => {
+                ui.graph_sim.reset_view(&self.graph);
+                ui.toasts.info("Reset graph view");
+            }
+            Action::GraphTick => {
+                if ui.canvas_mode == CanvasMode::Graph {
+                    ui.graph_sim.step_physics(&self.graph);
+                }
+            }
 
             Action::ToggleBookmark => {
                 if let Some(d) = &self.active_note {
@@ -994,8 +1007,64 @@ impl AppState {
             }
 
             Action::MouseClick { col, row } => self.handle_mouse_click(col, row, ui),
-            Action::MouseScrollUp { .. } => self.dispatch_core(Action::MoveUp, ui),
-            Action::MouseScrollDown { .. } => self.dispatch_core(Action::MoveDown, ui),
+            Action::MouseDrag { col, row } => {
+                if ui.overlay.is_none() && ui.canvas_mode == CanvasMode::Graph {
+                    if ui.graph_sim.dragging_node.is_some() {
+                        ui.graph_sim.move_dragged_node(&self.graph, col, row);
+                    } else if ui.graph_sim.panning {
+                        if let Some((lc, lr)) = ui.graph_sim.last_mouse {
+                            ui.graph_sim
+                                .pan_by_screen_delta(col as i32 - lc as i32, row as i32 - lr as i32);
+                        }
+                        ui.graph_sim.last_mouse = Some((col, row));
+                    }
+                }
+            }
+            Action::MouseUp { .. } => {
+                if ui.overlay.is_none() && ui.canvas_mode == CanvasMode::Graph {
+                    if let Some(idx) = ui.graph_sim.dragging_node.take() {
+                        if !ui.graph_sim.drag_moved && ui.graph_sim.drag_started_selected {
+                            if let Some(node) = self.graph.nodes.get(idx).cloned() {
+                                self.open_note(ui, &node.id, true);
+                            }
+                        } else if ui.graph_sim.drag_moved {
+                            // Let connected neighbors smoothly settle after release
+                            ui.graph_sim.energy = ui.graph_sim.energy.max(0.03);
+                        }
+                    }
+                    ui.graph_sim.panning = false;
+                    ui.graph_sim.drag_moved = false;
+                    ui.graph_sim.last_mouse = None;
+                }
+            }
+            Action::MouseMove { col, row } => {
+                if ui.overlay.is_none() && ui.canvas_mode == CanvasMode::Graph {
+                    ui.graph_sim.hovered_node = match ui.last_hitmap.hit(row, col) {
+                        Some(HitTarget::GraphNode(idx)) => Some(idx),
+                        _ => None,
+                    };
+                }
+            }
+            Action::MouseScrollUp { col, row } => {
+                if ui.overlay.is_none()
+                    && ui.canvas_mode == CanvasMode::Graph
+                    && ui.graph_sim.canvas_area.get().contains(ratatui::layout::Position::new(col, row))
+                {
+                    ui.graph_sim.zoom_by(1.14);
+                } else {
+                    self.dispatch_core(Action::MoveUp, ui);
+                }
+            }
+            Action::MouseScrollDown { col, row } => {
+                if ui.overlay.is_none()
+                    && ui.canvas_mode == CanvasMode::Graph
+                    && ui.graph_sim.canvas_area.get().contains(ratatui::layout::Position::new(col, row))
+                {
+                    ui.graph_sim.zoom_by(1.0 / 1.14);
+                } else {
+                    self.dispatch_core(Action::MoveDown, ui);
+                }
+            }
 
             _ => {}
         }
@@ -1089,15 +1158,22 @@ impl AppState {
             HitTarget::ImageChip(img_idx) => {
                 self.dispatch_core(Action::OpenImagePreviewAt(img_idx), ui);
             }
+            HitTarget::GraphCanvas => {
+                ui.focus = Focus::Canvas;
+                ui.graph_sim.panning = true;
+                ui.graph_sim.dragging_node = None;
+                ui.graph_sim.last_mouse = Some((col, row));
+            }
             HitTarget::GraphNode(idx) => {
                 ui.focus = Focus::Canvas;
-                if ui.graph_selected == idx {
-                    if let Some(node) = self.graph.nodes.get(idx).cloned() {
-                        self.open_note(ui, &node.id, true);
-                    }
-                } else {
-                    ui.graph_selected = idx;
-                }
+                let was_selected = ui.graph_selected == idx;
+                ui.graph_selected = idx;
+                ui.graph_sim.dragging_node = Some(idx);
+                ui.graph_sim.drag_started_selected = was_selected;
+                ui.graph_sim.drag_moved = false;
+                ui.graph_sim.panning = false;
+                ui.graph_sim.last_mouse = Some((col, row));
+                ui.graph_sim.energy = 0.05;
             }
             HitTarget::InspectorBacklink(idx) => {
                 ui.focus = Focus::Inspector;

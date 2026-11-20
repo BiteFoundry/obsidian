@@ -36,6 +36,7 @@ pub enum HitTarget {
     TaskCheckbox { line_no: usize },
     WikilinkBlock(usize),
     ImageChip(usize),
+    GraphCanvas,
     GraphNode(usize),
     InspectorBacklink(usize),
     InspectorOutgoing(usize),

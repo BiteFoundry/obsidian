@@ -94,6 +94,9 @@ pub fn key_to_action(
             KeyCode::Char('l') | KeyCode::Char('L') => return Some(Action::ToggleGraphScope),
             KeyCode::Char('+') | KeyCode::Char('=') => return Some(Action::GraphDepthInc),
             KeyCode::Char('-') | KeyCode::Char('_') => return Some(Action::GraphDepthDec),
+            KeyCode::Char('r') | KeyCode::Char('R') | KeyCode::Char('0') => {
+                return Some(Action::GraphResetView);
+            }
             KeyCode::Esc => return Some(Action::ToggleGraphView),
             _ => {}
         }
@@ -133,6 +136,18 @@ pub fn key_to_action(
 pub fn mouse_to_action(mouse: MouseEvent) -> Option<Action> {
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => Some(Action::MouseClick {
+            col: mouse.column,
+            row: mouse.row,
+        }),
+        MouseEventKind::Drag(MouseButton::Left) => Some(Action::MouseDrag {
+            col: mouse.column,
+            row: mouse.row,
+        }),
+        MouseEventKind::Up(MouseButton::Left) => Some(Action::MouseUp {
+            col: mouse.column,
+            row: mouse.row,
+        }),
+        MouseEventKind::Moved => Some(Action::MouseMove {
             col: mouse.column,
             row: mouse.row,
         }),

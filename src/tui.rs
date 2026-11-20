@@ -129,6 +129,8 @@ pub async fn run_tui(
 
     let mut reader = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(250));
+    let mut physics_tick = tokio::time::interval(Duration::from_millis(25));
+    physics_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         // Ensure HD modal image is rendered before draw
@@ -184,7 +186,13 @@ pub async fn run_tui(
             continue;
         }
 
+        let graph_animating =
+            ui.canvas_mode == ui::app::CanvasMode::Graph && ui.graph_sim.is_active();
+
         tokio::select! {
+            _ = physics_tick.tick(), if graph_animating => {
+                app.dispatch(ui::action::Action::GraphTick, &mut ui);
+            }
             _ = tick.tick() => {
                 ui.toasts.prune();
             }
