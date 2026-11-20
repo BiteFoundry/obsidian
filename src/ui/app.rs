@@ -16,8 +16,8 @@ use crate::{
         RenderedTerminalImage, TerminalGraphicsCaps, TerminalImageProtocol,
     },
     models::{
-        CoreEvent, GraphData, IndexStats, NoteBlock, NoteDetail, NoteSummary, SidebarTab,
-        TagCount, TaskEntry, TaskFilter,
+        CoreEvent, GraphData, IndexStats, NoteBlock, NoteDetail, NoteSummary, OutgoingLinkEntry,
+        SidebarTab, TagCount, TaskEntry, TaskFilter,
     },
     storage::Storage,
     sync::SyncController,
@@ -26,6 +26,7 @@ use crate::{
         composer::read_clipboard_image_png,
         graph_view::GraphSim,
         hitmap::{ButtonId, HitMap, HitTarget},
+        inline_editor::{InlineEditEvent, InlineNoteEditor},
         keymap::KeyMap,
         overlays::{
             confirm::ConfirmOverlay,
@@ -34,7 +35,6 @@ use crate::{
             html_preview::{extract_note_html_candidates, HtmlPreviewOverlay},
             image_preview::ImagePreviewOverlay,
             links::LinkExtractorOverlay,
-            note_editor::NoteEditorOverlay,
             note_form::NoteFormOverlay,
             quick_switcher::QuickSwitcherOverlay,
             settings::SettingsOverlay,
@@ -47,11 +47,13 @@ use crate::{
     },
     vault::{
         fs::{
-            append_to_note, create_note, ensure_daily_note, is_html_file_path, move_note_to_trash,
-            resolve_attachment_path, safe_vault_path, save_vault_attachment, scan_vault_html_files,
-            toggle_task_at_line, VaultHtmlFile,
+            append_to_note, create_note, ensure_daily_note, file_mtime_and_size,
+            hydrate_parsed_note_links, is_html_file_path, move_note_to_trash,
+            resolve_attachment_path, resolve_wikilink_target, safe_vault_path,
+            save_vault_attachment, scan_vault_html_files, toggle_task_at_line, VaultHtmlFile,
         },
         merged_vaults,
+        parser::parse_markdown,
     },
 };
 
@@ -120,6 +122,7 @@ pub struct UiState {
     pub graph_selected: usize,
     pub graph_sim: GraphSim,
     pub inspector_selected: usize,
+    pub inline_editor: Option<InlineNoteEditor>,
     pub overlay: Option<Overlay>,
     pub toasts: ToastQueue,
     pub keymap: KeyMap,
@@ -155,6 +158,7 @@ impl UiState {
             graph_selected: 0,
             graph_sim: GraphSim::default(),
             inspector_selected: 0,
+            inline_editor: None,
             overlay: None,
             toasts: ToastQueue::new(),
             keymap: KeyMap,
@@ -188,7 +192,7 @@ impl UiState {
         self.overlay
             .as_ref()
             .map(|o| o.is_text_input())
-            .unwrap_or(false)
+            .unwrap_or_else(|| self.inline_editor.is_some())
     }
 }
 
@@ -485,6 +489,10 @@ impl AppState {
             self.open_html_file(ui, note_ref);
             return;
         }
+        // Flush any pending inline auto-save cleanly before switching notes
+        if ui.inline_editor.is_some() {
+            self.finish_inline_edit(ui);
+        }
         if push_history {
             if let Some(cur) = self.active_note.as_ref().map(|d| d.summary.rel_path.clone()) {
                 if !cur.eq_ignore_ascii_case(note_ref) {
@@ -525,17 +533,229 @@ impl AppState {
         }
     }
 
+    /// Toggles in-place inline Markdown editing directly inside `note_view` (zero popup window).
+    pub fn toggle_inline_edit(&mut self, ui: &mut UiState) {
+        if ui.inline_editor.is_some() {
+            self.finish_inline_edit(ui);
+            return;
+        }
+        let Some(d) = self.active_note.as_ref() else {
+            ui.toasts.info("Open a note to edit");
+            return;
+        };
+        let rel_path = d.summary.rel_path.clone();
+        let title = d.summary.title.clone();
+        let raw = safe_vault_path(&self.active_vault.path, &rel_path)
+            .ok()
+            .and_then(|abs| fs::read_to_string(&abs).ok())
+            .unwrap_or_else(|| d.raw_markdown.clone());
+        let initial_scroll = ui.canvas_scroll.min(u16::MAX as usize) as u16;
+        ui.canvas_mode = CanvasMode::Note;
+        ui.focus = Focus::Canvas;
+        ui.inline_editor = Some(InlineNoteEditor::new(rel_path, title, &raw, initial_scroll));
+    }
+
+    /// Re-parses the active note's Markdown in memory (< 0.2ms) on every keystroke so
+    /// the right-side Inspector (Outline, Tags, Word Count, Links) and Sidebar Outline update live at 0ms.
+    pub fn apply_live_inline_parse(&mut self, ui: &UiState) {
+        let Some(ed) = ui.inline_editor.as_ref() else {
+            return;
+        };
+        let Some(detail) = self.active_note.as_mut() else {
+            return;
+        };
+        if detail.summary.rel_path != ed.note_path {
+            return;
+        }
+        let markdown = ed.composer.text().to_string();
+        let rel_path = detail.summary.rel_path.clone();
+        let title = detail.summary.title.clone();
+        let mut parsed = parse_markdown(&rel_path, &title, &markdown);
+
+        let mut all_paths: Vec<String> = Vec::with_capacity(self.notes.len());
+        let mut aliases_map: HashMap<String, Vec<String>> = HashMap::new();
+        let mut title_by_path: HashMap<String, String> = HashMap::with_capacity(self.notes.len());
+        for n in &self.notes {
+            all_paths.push(n.rel_path.clone());
+            title_by_path.insert(n.rel_path.clone(), n.title.clone());
+            if n.rel_path == rel_path {
+                if !parsed.aliases.is_empty() {
+                    aliases_map.insert(n.rel_path.clone(), parsed.aliases.clone());
+                }
+            } else if !n.aliases.is_empty() {
+                aliases_map.insert(n.rel_path.clone(), n.aliases.clone());
+            }
+        }
+
+        let images = hydrate_parsed_note_links(
+            &self.active_vault.path,
+            &rel_path,
+            &mut parsed,
+            &all_paths,
+            &aliases_map,
+        );
+
+        let outgoing_links: Vec<OutgoingLinkEntry> = parsed
+            .wikilinks
+            .iter()
+            .map(|wl| {
+                let resolved_path =
+                    resolve_wikilink_target(&wl.target_raw, &all_paths, &aliases_map);
+                let resolved = resolved_path.is_some();
+                let target_title = resolved_path
+                    .as_ref()
+                    .and_then(|rp| title_by_path.get(rp).cloned())
+                    .unwrap_or_else(|| wl.target_raw.clone());
+                OutgoingLinkEntry {
+                    target_raw: wl.target_raw.clone(),
+                    target_resolved_path: resolved_path,
+                    target_title,
+                    alias: wl.alias.clone(),
+                    heading: wl.heading.clone(),
+                    is_embed: wl.is_embed,
+                    resolved,
+                }
+            })
+            .collect();
+
+        detail.raw_markdown = markdown;
+        detail.summary.frontmatter = parsed.frontmatter.clone();
+        detail.summary.aliases = parsed.aliases.clone();
+        detail.summary.tags = parsed.tags.clone();
+        detail.summary.word_count = parsed.word_count;
+        detail.summary.outgoing_count = outgoing_links.len();
+        detail.parsed = parsed;
+        detail.outgoing_links = outgoing_links;
+        detail.images = images;
+
+        let updated_summary = detail.summary.clone();
+        if let Some(slot) = self
+            .notes
+            .iter_mut()
+            .find(|n| n.rel_path == updated_summary.rel_path)
+        {
+            *slot = updated_summary;
+        }
+    }
+
+    /// Atomically writes the inline editor buffer to disk (preserving CRLF) and updates ONLY that
+    /// single note in SQLite via `Storage::upsert_single_note` (< 5ms, zero full vault scan).
+    pub fn flush_inline_save(&mut self, ui: &mut UiState) -> bool {
+        let Some((note_path, disk_md)) = ui
+            .inline_editor
+            .as_ref()
+            .map(|ed| (ed.note_path.clone(), ed.disk_markdown()))
+        else {
+            return false;
+        };
+
+        let abs = match safe_vault_path(&self.active_vault.path, &note_path) {
+            Ok(p) => p,
+            Err(e) => {
+                if let Some(ref mut ed) = ui.inline_editor {
+                    ed.mark_error(e.to_string());
+                }
+                ui.toasts.error(format!("Invalid note path: {e}"));
+                return false;
+            }
+        };
+
+        if let Err(e) = write_atomic(&abs, disk_md.as_bytes()) {
+            if let Some(ref mut ed) = ui.inline_editor {
+                ed.mark_error(e.to_string());
+            }
+            ui.toasts.error(format!("Save failed: {e}"));
+            return false;
+        }
+
+        let (mtime_ms, size_bytes) = file_mtime_and_size(&abs);
+        if let Err(e) = self.storage.upsert_single_note(
+            &self.active_vault,
+            &note_path,
+            &disk_md,
+            mtime_ms,
+            size_bytes,
+        ) {
+            if let Some(ref mut ed) = ui.inline_editor {
+                ed.mark_error(e.to_string());
+            }
+            ui.toasts.error(format!("Index update failed: {e}"));
+            return false;
+        }
+
+        if let Some(ref mut ed) = ui.inline_editor {
+            ed.mark_saved();
+        }
+
+        // Sync live parsed AST + lightweight SQLite aggregates (NO disk scan!)
+        self.apply_live_inline_parse(ui);
+        let vid = self.active_vault.id.clone();
+        self.tags = self.storage.list_tags(&vid).unwrap_or_default();
+        self.tasks = self
+            .storage
+            .list_tasks(&vid, TaskFilter::All, None)
+            .unwrap_or_default();
+        if let Some(detail) = self.active_note.as_mut() {
+            if detail.summary.rel_path == note_path {
+                detail.summary.mtime_ms = mtime_ms;
+                detail.summary.size_bytes = size_bytes;
+                if let Ok(bl) = self.storage.get_backlinks(&vid, &note_path) {
+                    detail.summary.backlink_count = bl.len();
+                    detail.backlinks = bl;
+                }
+                if let Ok(ol) = self.storage.get_outgoing_links(&vid, &note_path) {
+                    detail.summary.outgoing_count = ol.len();
+                    detail.outgoing_links = ol;
+                }
+                let updated_summary = detail.summary.clone();
+                if let Some(slot) = self.notes.iter_mut().find(|n| n.rel_path == note_path) {
+                    *slot = updated_summary;
+                }
+            }
+        }
+        true
+    }
+
+    /// Flushes debounced auto-save when `dirty` and idle for >= 250ms.
+    pub fn tick_inline_autosave(&mut self, ui: &mut UiState) -> bool {
+        if ui
+            .inline_editor
+            .as_ref()
+            .is_some_and(InlineNoteEditor::is_autosave_due)
+        {
+            self.flush_inline_save(ui)
+        } else {
+            false
+        }
+    }
+
+    /// Flushes any pending inline auto-save and exits cleanly back to the rendered reader view
+    /// at the exact same scroll offset on frame 0.
+    pub fn finish_inline_edit(&mut self, ui: &mut UiState) {
+        if ui.inline_editor.as_ref().is_some_and(|e| e.dirty) {
+            self.flush_inline_save(ui);
+        }
+        if let Some(ed) = ui.inline_editor.take() {
+            ui.canvas_scroll = ed.scroll_y as usize;
+            ui.canvas_follow_selected = false;
+            ui.focus = Focus::Canvas;
+        }
+    }
+
     pub fn handle_core_event(&mut self, ev: CoreEvent, ui: &mut UiState) {
+        let inline_dirty = ui.inline_editor.as_ref().is_some_and(|e| e.dirty);
         match ev {
             CoreEvent::VaultIndexed { stats } => {
                 let changed = stats.updated > 0 || stats.removed > 0 || self.notes.is_empty();
                 self.last_index_stats = Some(stats);
-                if changed {
+                if changed && !inline_dirty {
                     self.reload_from_storage(ui);
                 }
             }
             CoreEvent::NoteChanged { .. } => {
-                self.reload_from_storage(ui);
+                if !inline_dirty {
+                    self.reload_from_storage(ui);
+                }
             }
             CoreEvent::SyncStatus { summary, .. } => {
                 ui.toasts.info(summary);
@@ -550,6 +770,11 @@ impl AppState {
     }
 
     pub fn dispatch(&mut self, action: Action, ui: &mut UiState) {
+        if matches!(action, Action::InlineEditTick) {
+            self.tick_inline_autosave(ui);
+            return;
+        }
+
         // Route overlay input first when an overlay is open
         if ui.overlay.is_some() && !matches!(action, Action::MouseClick { .. }) {
             let outcome = if let Some(mut ov) = ui.overlay.take() {
@@ -586,13 +811,79 @@ impl AppState {
             return;
         }
 
+        // Route inline editor keys directly when in-place editing is active inside `note_view`
+        if ui.overlay.is_none() && ui.inline_editor.is_some() {
+            match &action {
+                Action::SaveInlineEdit | Action::OverlaySubmit => {
+                    self.flush_inline_save(ui);
+                    return;
+                }
+                Action::FinishInlineEdit | Action::CloseOverlay => {
+                    self.finish_inline_edit(ui);
+                    return;
+                }
+                Action::RequestExternalEditor => {
+                    self.finish_inline_edit(ui);
+                    self.dispatch_core(Action::RequestExternalEditor, ui);
+                    return;
+                }
+                Action::PasteClipboard => {
+                    match arboard::Clipboard::new().and_then(|mut cb| cb.get_text()) {
+                        Ok(text) if !text.is_empty() => {
+                            let changed = ui.inline_editor.as_mut().is_some_and(|ed| {
+                                ed.handle_edit_action(&Action::Paste(text))
+                                    == InlineEditEvent::TextChanged
+                            });
+                            if changed {
+                                self.apply_live_inline_parse(ui);
+                            }
+                        }
+                        Ok(_) => ui.toasts.info("Clipboard is empty"),
+                        Err(e) => ui.toasts.warning(format!("Clipboard error: {e}")),
+                    }
+                    return;
+                }
+                Action::MouseScrollUp { col, row } | Action::MouseScrollDown { col, row } => {
+                    if self.scroll_pane_at(*col, *row, ui) == Focus::Canvas {
+                        if let Some(ref mut ed) = ui.inline_editor {
+                            ed.handle_edit_action(&action);
+                        }
+                        return;
+                    }
+                }
+                _ => {
+                    let ev = ui
+                        .inline_editor
+                        .as_mut()
+                        .map(|ed| ed.handle_edit_action(&action))
+                        .unwrap_or(InlineEditEvent::Ignored);
+                    match ev {
+                        InlineEditEvent::TextChanged => {
+                            self.apply_live_inline_parse(ui);
+                            return;
+                        }
+                        InlineEditEvent::CursorOrScrollChanged => return,
+                        InlineEditEvent::Ignored => {}
+                    }
+                }
+            }
+        }
+
         self.dispatch_core(action, ui);
     }
 
     fn dispatch_core(&mut self, action: Action, ui: &mut UiState) {
         match action {
-            Action::Quit => ui.should_quit = true,
+            Action::Quit => {
+                if ui.inline_editor.as_ref().is_some_and(|e| e.dirty) {
+                    self.flush_inline_save(ui);
+                }
+                ui.should_quit = true;
+            }
             Action::QuitConfirm => {
+                if ui.inline_editor.as_ref().is_some_and(|e| e.dirty) {
+                    self.flush_inline_save(ui);
+                }
                 ui.should_quit = true;
             }
             Action::RefreshAll => {
@@ -793,6 +1084,9 @@ impl AppState {
             Action::ToggleGraphView => {
                 ui.canvas_mode = match ui.canvas_mode {
                     CanvasMode::Note => {
+                        if ui.inline_editor.is_some() {
+                            self.finish_inline_edit(ui);
+                        }
                         self.refresh_graph(ui);
                         ui.graph_selected = 0;
                         ui.focus = Focus::Canvas;
@@ -944,47 +1238,17 @@ impl AppState {
                 ui.open_overlay(Overlay::NoteForm(NoteFormOverlay::new_note(default_folder)));
             }
             Action::OpenNoteEditor => {
-                if let Some(d) = &self.active_note {
-                    let rel_path = d.summary.rel_path.clone();
-                    let title = d.summary.title.clone();
-                    let raw = safe_vault_path(&self.active_vault.path, &rel_path)
-                        .ok()
-                        .and_then(|abs| fs::read_to_string(&abs).ok())
-                        .unwrap_or_else(|| d.raw_markdown.clone());
-                    ui.open_overlay(Overlay::NoteEditor(NoteEditorOverlay::new(
-                        rel_path, title, raw,
-                    )));
-                } else {
-                    ui.toasts.info("Open a note to edit");
-                }
+                self.toggle_inline_edit(ui);
             }
-            Action::SubmitNoteEdit {
-                note_path,
-                markdown,
-            } => match safe_vault_path(&self.active_vault.path, &note_path) {
-                Ok(abs) => {
-                    let existing_crlf = fs::read_to_string(&abs)
-                        .map(|s| s.contains("\r\n"))
-                        .unwrap_or(false);
-                    let out = if existing_crlf {
-                        markdown.replace("\r\n", "\n").replace('\n', "\r\n")
-                    } else {
-                        markdown
-                    };
-                    match write_atomic(&abs, out.as_bytes()) {
-                        Ok(()) => {
-                            let _ = self
-                                .storage
-                                .invalidate_note_mtime(&self.active_vault.id, &note_path);
-                            let _ = self.storage.sync_vault(&self.active_vault);
-                            self.reload_from_storage(ui);
-                            ui.toasts.success(format!("Saved {note_path}"));
-                        }
-                        Err(e) => ui.toasts.error(format!("Save failed: {e}")),
-                    }
-                }
-                Err(e) => ui.toasts.error(format!("Invalid note path: {e}")),
-            },
+            Action::SaveInlineEdit => {
+                self.flush_inline_save(ui);
+            }
+            Action::FinishInlineEdit => {
+                self.finish_inline_edit(ui);
+            }
+            Action::InlineEditTick => {
+                self.tick_inline_autosave(ui);
+            }
             Action::CreateNoteSubmit {
                 title,
                 folder,
@@ -1046,6 +1310,7 @@ impl AppState {
             }
             Action::DeleteActiveNoteConfirmed => {
                 if let Some(d) = &self.active_note {
+                    ui.inline_editor = None;
                     let rp = d.summary.rel_path.clone();
                     match move_note_to_trash(&self.active_vault.path, &rp) {
                         Ok(_) => {
@@ -1088,43 +1353,33 @@ impl AppState {
                 }
             }
             Action::PasteClipboard => {
-                if let Some(Overlay::NoteEditor(ref mut ed)) = ui.overlay {
-                    match arboard::Clipboard::new().and_then(|mut cb| cb.get_text()) {
-                        Ok(text) if !text.is_empty() => {
-                            ed.handle(&Action::Paste(text));
-                        }
-                        Ok(_) => ui.toasts.info("Clipboard is empty"),
-                        Err(e) => ui.toasts.warning(format!("Clipboard error: {e}")),
-                    }
-                } else {
-                    match read_clipboard_image_png() {
-                        Ok(Some((filename, bytes))) => {
-                            let name = if filename.trim().is_empty() {
-                                format!("pasted-{}.png", Local::now().format("%Y%m%d-%H%M%S"))
-                            } else {
-                                filename
-                            };
-                            match save_vault_attachment(&self.active_vault, &name, &bytes) {
-                                Ok((saved_name, _)) => {
-                                    if let Some(d) = &self.active_note {
-                                        if let Ok(abs) = safe_vault_path(
-                                            &self.active_vault.path,
-                                            &d.summary.rel_path,
-                                        ) {
-                                            let _ =
-                                                append_to_note(&abs, &format!("\n![[{saved_name}]]"));
-                                            let _ = self.storage.sync_vault(&self.active_vault);
-                                            self.reload_from_storage(ui);
-                                            ui.toasts.success(format!("Pasted ![[{saved_name}]]"));
-                                        }
+                match read_clipboard_image_png() {
+                    Ok(Some((filename, bytes))) => {
+                        let name = if filename.trim().is_empty() {
+                            format!("pasted-{}.png", Local::now().format("%Y%m%d-%H%M%S"))
+                        } else {
+                            filename
+                        };
+                        match save_vault_attachment(&self.active_vault, &name, &bytes) {
+                            Ok((saved_name, _)) => {
+                                if let Some(d) = &self.active_note {
+                                    if let Ok(abs) = safe_vault_path(
+                                        &self.active_vault.path,
+                                        &d.summary.rel_path,
+                                    ) {
+                                        let _ =
+                                            append_to_note(&abs, &format!("\n![[{saved_name}]]"));
+                                        let _ = self.storage.sync_vault(&self.active_vault);
+                                        self.reload_from_storage(ui);
+                                        ui.toasts.success(format!("Pasted ![[{saved_name}]]"));
                                     }
                                 }
-                                Err(e) => ui.toasts.error(format!("Clipboard save failed: {e}")),
                             }
+                            Err(e) => ui.toasts.error(format!("Clipboard save failed: {e}")),
                         }
-                        Ok(None) => ui.toasts.info("No image found in clipboard"),
-                        Err(e) => ui.toasts.warning(format!("Clipboard error: {e}")),
                     }
+                    Ok(None) => ui.toasts.info("No image found in clipboard"),
+                    Err(e) => ui.toasts.warning(format!("Clipboard error: {e}")),
                 }
             }
 
@@ -1249,6 +1504,9 @@ impl AppState {
 
             Action::SwitchVault(vault_id) => {
                 if let Some(next) = self.vaults.iter().find(|v| v.id == vault_id).cloned() {
+                    if ui.inline_editor.is_some() {
+                        self.finish_inline_edit(ui);
+                    }
                     self.active_vault = next.clone();
                     self.cfg.active_vault = next.name.clone();
                     let _ = self.cfg.save();
@@ -1469,6 +1727,7 @@ impl AppState {
             ) => Focus::Inspector,
             Some(
                 HitTarget::CanvasBlock(_)
+                | HitTarget::InlineEditorBody
                 | HitTarget::TaskCheckbox { .. }
                 | HitTarget::WikilinkBlock(_)
                 | HitTarget::ImageChip(_)
@@ -1486,25 +1745,6 @@ impl AppState {
     }
 
     fn handle_mouse_click(&mut self, col: u16, row: u16, ui: &mut UiState) {
-        if matches!(ui.overlay, Some(Overlay::NoteEditor(_))) {
-            match ui.last_hitmap.hit(row, col) {
-                Some(HitTarget::Button(ButtonId::ConfirmOk)) => {
-                    self.dispatch(Action::OverlaySubmit, ui);
-                }
-                Some(HitTarget::Button(ButtonId::EditExternal)) => {
-                    self.dispatch(Action::RequestExternalEditor, ui);
-                }
-                Some(HitTarget::Button(ButtonId::ConfirmCancel)) => {
-                    self.dispatch(Action::CloseOverlay, ui);
-                }
-                Some(HitTarget::OverlayBody) => {}
-                _ => {
-                    self.dispatch(Action::CloseOverlay, ui);
-                }
-            }
-            return;
-        }
-
         if matches!(ui.overlay, Some(Overlay::HtmlPreview(_))) {
             match ui.last_hitmap.hit(row, col) {
                 Some(HitTarget::Button(ButtonId::ConfirmCancel)) => {
@@ -1579,6 +1819,12 @@ impl AppState {
                 ui.focus = Focus::Canvas;
                 ui.canvas_selected_block = idx;
             }
+            HitTarget::InlineEditorBody => {
+                ui.focus = Focus::Canvas;
+                if let Some(ref mut ed) = ui.inline_editor {
+                    ed.place_cursor_at_screen_pos(col, row);
+                }
+            }
             HitTarget::TaskCheckbox { line_no } => {
                 if let Some(d) = &self.active_note {
                     let note_path = d.summary.rel_path.clone();
@@ -1648,6 +1894,10 @@ impl AppState {
                 ButtonId::QuickAppend => self.dispatch_core(Action::OpenQuickAppend, ui),
                 ButtonId::NewNote => self.dispatch_core(Action::OpenNewNoteModal, ui),
                 ButtonId::EditNote => self.dispatch_core(Action::OpenNoteEditor, ui),
+                ButtonId::FinishInlineEdit => self.finish_inline_edit(ui),
+                ButtonId::SaveInlineEdit => {
+                    self.flush_inline_save(ui);
+                }
                 ButtonId::EditExternal => self.dispatch(Action::RequestExternalEditor, ui),
                 ButtonId::LinkExtractor => self.dispatch_core(Action::OpenLinkExtractor, ui),
                 ButtonId::ToggleHrefs => self.dispatch_core(Action::ToggleShowLinkUrls, ui),

@@ -624,7 +624,7 @@ pub async fn run_tui(
     app.reload_from_storage(&mut ui);
 
     let mut reader = EventStream::new();
-    let mut tick = tokio::time::interval(Duration::from_millis(250));
+    let mut tick = tokio::time::interval(Duration::from_millis(100));
     let mut physics_tick = tokio::time::interval(Duration::from_millis(33));
     physics_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -668,6 +668,7 @@ pub async fn run_tui(
             }
             _ = tick.tick() => {
                 ui.toasts.prune();
+                app.dispatch(ui::action::Action::InlineEditTick, &mut ui);
             }
             Some(core_ev) = events_rx.recv() => {
                 app.handle_core_event(core_ev, &mut ui);

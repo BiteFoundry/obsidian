@@ -14,6 +14,7 @@ pub mod composer;
 pub mod event;
 pub mod graph_view;
 pub mod hitmap;
+pub mod inline_editor;
 pub mod inspector;
 pub mod keymap;
 pub mod note_view;
@@ -69,6 +70,7 @@ pub fn draw(frame: &mut Frame, app: &AppState, ui: &mut UiState) -> HitMap {
     draw_status_bar(frame, vertical[2], app, ui, &mut hitmap);
 
     if let Some(mut overlay) = ui.overlay.take() {
+        ui.cursor_pos = None;
         overlay.draw(frame, area, app, ui, &mut hitmap);
         ui.overlay = Some(overlay);
     }
@@ -278,6 +280,35 @@ fn draw_status_bar(
             Paragraph::new(line).style(Style::default().bg(theme.bg_header)),
             area,
         );
+        return;
+    }
+
+    if let Some(ed) = ui.inline_editor.as_ref() {
+        let (ln, col) = ed.cursor_line_col();
+        let right = format!(" Ln {ln}, Col {col} ");
+        let right_w = right.width() as u16;
+        let left_limit = if area.width > right_w + 10 {
+            area.x + area.width.saturating_sub(right_w)
+        } else {
+            area.x + area.width
+        };
+        let hint = " Esc Done · Ctrl+S Save · Ctrl+Z/Y Undo/Redo · Ctrl+V Paste · Ctrl+E External $EDITOR";
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                truncate_width(hint, left_limit.saturating_sub(area.x) as usize),
+                theme.muted_style(),
+            ))
+            .style(Style::default().bg(theme.bg_header)),
+            Rect::new(area.x, area.y, left_limit.saturating_sub(area.x), 1),
+        );
+        if area.width > right_w + 10 {
+            let rx = area.x + area.width - right_w;
+            frame.render_widget(
+                Paragraph::new(Span::styled(right, theme.subtle_style()))
+                    .style(Style::default().bg(theme.bg_header)),
+                Rect::new(rx, area.y, right_w, 1),
+            );
+        }
         return;
     }
 

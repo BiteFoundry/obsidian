@@ -28,7 +28,7 @@ struct Snapshot {
     cursor: usize,
 }
 
-/// Alias used by full-screen in-terminal Markdown editors (e.g. `NoteEditorOverlay`).
+/// Alias used by in-terminal Markdown editors (e.g. `InlineNoteEditor`).
 pub type MultiLineComposer = ComposerState;
 
 #[derive(Debug, Clone)]
@@ -377,6 +377,28 @@ impl ComposerState {
 
     pub fn move_doc_end(&mut self, extend: bool) {
         self.move_to(self.text.len(), extend);
+    }
+
+    /// Places the cursor at a UTF-8 byte offset (clamped and snapped to a valid char boundary),
+    /// clearing any active selection.
+    pub fn set_cursor(&mut self, pos: usize) {
+        let mut p = pos.min(self.text.len());
+        while p > 0 && !self.text.is_char_boundary(p) {
+            p -= 1;
+        }
+        self.cursor = p;
+        self.anchor = None;
+    }
+
+    /// Places the cursor at the start of a 0-based logical line (clamped to the last line).
+    pub fn set_cursor_line(&mut self, zero_based_line: usize) {
+        let ranges = line_ranges(&self.text);
+        if ranges.is_empty() {
+            self.set_cursor(0);
+            return;
+        }
+        let idx = zero_based_line.min(ranges.len() - 1);
+        self.set_cursor(ranges[idx].0);
     }
 
     fn move_to(&mut self, pos: usize, extend: bool) {

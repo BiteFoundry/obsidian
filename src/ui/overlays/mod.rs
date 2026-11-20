@@ -6,7 +6,6 @@ pub mod file_picker;
 pub mod html_preview;
 pub mod image_preview;
 pub mod links;
-pub mod note_editor;
 pub mod note_form;
 pub mod quick_switcher;
 pub mod settings;
@@ -53,7 +52,6 @@ pub enum Overlay {
     FilePicker(file_picker::FilePickerOverlay),
     ImagePreview(image_preview::ImagePreviewOverlay),
     HtmlPreview(html_preview::HtmlPreviewOverlay),
-    NoteEditor(note_editor::NoteEditorOverlay),
     NoteForm(note_form::NoteFormOverlay),
     Confirm(confirm::ConfirmOverlay),
     ContextMenu(context_menu::ContextMenuOverlay),
@@ -64,7 +62,6 @@ impl Overlay {
     pub fn is_text_input(&self) -> bool {
         match self {
             Self::QuickSwitcher(_) | Self::NoteForm(_) | Self::FilePicker(_) => true,
-            Self::NoteEditor(ov) => ov.accepts_text(),
             Self::HtmlPreview(ov) => ov.is_editing_input(),
             _ => false,
         }
@@ -79,7 +76,6 @@ impl Overlay {
             Self::FilePicker(ov) => ov.handle(action),
             Self::ImagePreview(ov) => ov.handle(action),
             Self::HtmlPreview(ov) => ov.handle(action),
-            Self::NoteEditor(ov) => ov.handle(action),
             Self::NoteForm(ov) => ov.handle(action),
             Self::Confirm(ov) => ov.handle(action),
             Self::ContextMenu(ov) => ov.handle(action),
@@ -117,9 +113,6 @@ impl Overlay {
             Self::FilePicker(ov) => ov.draw(frame, area, ui, hitmap),
             Self::ImagePreview(ov) => ov.draw(frame, area, app, ui, hitmap),
             Self::HtmlPreview(ov) => ov.draw(frame, area, ui, hitmap),
-            Self::NoteEditor(ov) => {
-                ui.cursor_pos = ov.draw(frame, area, ui, hitmap);
-            }
             Self::NoteForm(ov) => ov.draw(frame, area, ui, hitmap),
             Self::Confirm(ov) => ov.draw(frame, area, ui, hitmap),
             Self::ContextMenu(ov) => ov.draw(frame, area, ui, hitmap),

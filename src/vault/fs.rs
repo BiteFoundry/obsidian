@@ -154,14 +154,7 @@ fn walk_dir_recursive(root: &Path, dir: &Path, out: &mut Vec<DiskNoteEntry>) -> 
             let rel_path = normalize_rel_path(rel);
             let title = title_from_rel_path(&rel_path);
             let folder = folder_from_rel_path(&rel_path);
-            let meta = entry.metadata().ok();
-            let size_bytes = meta.as_ref().map(|m| m.len() as i64).unwrap_or(0);
-            let mtime_ms = meta
-                .as_ref()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0);
+            let (mtime_ms, size_bytes) = file_mtime_and_size(&path);
             out.push(DiskNoteEntry {
                 rel_path,
                 abs_path: path,
@@ -173,6 +166,20 @@ fn walk_dir_recursive(root: &Path, dir: &Path, out: &mut Vec<DiskNoteEntry>) -> 
         }
     }
     Ok(())
+}
+
+/// Reads `(mtime_ms, size_bytes)` from a file's filesystem metadata using the exact
+/// same clock conversion as `scan_vault_markdown_files`.
+pub fn file_mtime_and_size(path: &Path) -> (i64, i64) {
+    let meta = fs::metadata(path).ok();
+    let size_bytes = meta.as_ref().map(|m| m.len() as i64).unwrap_or(0);
+    let mtime_ms = meta
+        .as_ref()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    (mtime_ms, size_bytes)
 }
 
 pub fn normalize_rel_path(rel: &Path) -> String {

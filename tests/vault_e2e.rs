@@ -617,16 +617,25 @@ fn test_all_button_ids_registered_and_dispatched_on_mouse_click() {
     assert!(matches!(ui.overlay, Some(Overlay::NoteForm(_))));
     ui.close_overlay();
 
-    // 11. EditNote ([✎ Edit] opens in-terminal NoteEditor, NEVER external editor)
-    //     + EditExternal ([Ext $EDITOR] inside NoteEditor requests external $EDITOR)
+    // 11. EditNote ([✎ Edit] enters IN-PLACE inline editor inside note_view, ZERO popup overlay!)
+    //     + SaveInlineEdit ([Ctrl+S Save]) + FinishInlineEdit ([✓ Done])
+    //     + EditExternal ([Ext $EDITOR] flushes inline edit and requests external $EDITOR)
     assert!(app.pending_external_editor.is_none());
     click_button(&mut terminal, &mut app, &mut ui, ButtonId::EditNote);
     assert!(
         app.pending_external_editor.is_none(),
-        "[✎ Edit] must open in-terminal editor, not external $EDITOR"
+        "[✎ Edit] must open in-place inline editor, not external $EDITOR"
     );
-    assert!(matches!(ui.overlay, Some(Overlay::NoteEditor(_))));
+    assert!(ui.inline_editor.is_some(), "expected in-place inline_editor");
+    assert!(ui.overlay.is_none(), "must NOT pop up a separate overlay window");
+    click_button(&mut terminal, &mut app, &mut ui, ButtonId::SaveInlineEdit);
+    assert!(ui.inline_editor.is_some(), "[Ctrl+S Save] stays in inline edit mode");
+    click_button(&mut terminal, &mut app, &mut ui, ButtonId::FinishInlineEdit);
+    assert!(ui.inline_editor.is_none(), "[✓ Done] returns cleanly to rendered reader view");
+    click_button(&mut terminal, &mut app, &mut ui, ButtonId::EditNote);
+    assert!(ui.inline_editor.is_some());
     click_button(&mut terminal, &mut app, &mut ui, ButtonId::EditExternal);
+    assert!(ui.inline_editor.is_none());
     assert!(ui.overlay.is_none());
     assert!(app.pending_external_editor.take().is_some());
 
@@ -872,13 +881,15 @@ async fn test_html_preview_interactive_quickjs_native_serving_vault_files_and_au
 }
 
 #[test]
-fn test_in_terminal_note_editor_keybindings_save_roundtrip_and_mouse_wheel() {
+fn test_in_place_inline_editor_0ms_live_reflection_autosave_upsert_scroll_and_mouse() {
+    use std::time::{Duration, Instant};
+
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use obsidian_cli::ui::{
         app::Focus,
         event::key_to_action,
         hitmap::{ButtonId, HitTarget},
-        overlays::Overlay,
+        inline_editor::InlineSaveStatus,
     };
 
     let tmp = tempfile::tempdir().unwrap();
@@ -886,7 +897,7 @@ fn test_in_terminal_note_editor_keybindings_save_roundtrip_and_mouse_wheel() {
     fs::create_dir_all(&root).unwrap();
     seed_vault(&root);
 
-    // Add a tall note to verify mouse-wheel scrolling on the note reader & editor
+    // Add a tall note to verify scroll position preservation & mouse-wheel scrolling
     let long_body = (1..=60)
         .map(|i| format!("Paragraph {i}: Obsidian Markdown content line"))
         .collect::<Vec<_>>()
@@ -904,14 +915,18 @@ fn test_in_terminal_note_editor_keybindings_save_roundtrip_and_mouse_wheel() {
     let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel::<SyncCommand>();
     let sync_ctrl = SyncController::from_channels(focus_tx, cmd_tx);
 
-    let mut app = AppState::new(cfg.clone(), vault, storage, sync_ctrl);
+    let mut app = AppState::new(cfg.clone(), vault.clone(), storage, sync_ctrl);
     let mut ui = UiState::from_config(&cfg);
     app.reload_from_storage(&mut ui);
     app.open_note(&mut ui, "Projects/Q4 Architecture RFC.md", false);
 
-    let mut terminal = Terminal::new(TestBackend::new(120, 34)).unwrap();
+    // Bookmark the note to verify `upsert_single_note` preserves `is_bookmarked`
+    app.dispatch(Action::ToggleBookmark, &mut ui);
+    assert!(app.active_note.as_ref().unwrap().summary.is_bookmarked);
 
-    // 1. Pressing `e` opens in-terminal NoteEditorOverlay (NOT external editor)
+    let mut terminal = Terminal::new(TestBackend::new(140, 36)).unwrap();
+
+    // 1. Pressing `e` enters IN-PLACE inline edit mode inside `note_view` (ZERO popup overlay!)
     let act_e = key_to_action(
         KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
         ui.focus,
@@ -926,21 +941,149 @@ fn test_in_terminal_note_editor_keybindings_save_roundtrip_and_mouse_wheel() {
         app.pending_external_editor.is_none(),
         "'e' must never launch external editor"
     );
-    assert!(matches!(ui.overlay, Some(Overlay::NoteEditor(_))));
+    assert!(ui.inline_editor.is_some(), "must activate in-place inline_editor");
+    assert!(ui.overlay.is_none(), "must NOT open any popup overlay window");
     assert!(ui.is_text_input_active());
 
-    // 2. Navigate past YAML frontmatter into Markdown body, then edit with UTF-8 / Korean,
-    //    Enter newline, Tab (2 spaces), Paste, Ctrl+Z undo, Ctrl+Y redo
+    // Render and confirm 3-pane layout (Sidebar + inline note_view + Inspector) stays 100% intact
+    terminal
+        .draw(|f| {
+            let _ = ui::draw(f, &app, &mut ui);
+        })
+        .unwrap();
+    let initial_screen: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(initial_screen.contains("✎ EDITING"));
+    assert!(initial_screen.contains("✓ Live Saved"));
+    assert!(initial_screen.contains("Linked Mentions"));
+    assert!(initial_screen.contains("Files ("));
+    assert!(ui.cursor_pos.is_some());
+    assert!(ui
+        .last_hitmap
+        .region_of(HitTarget::Button(ButtonId::FinishInlineEdit))
+        .is_some());
+    assert!(ui
+        .last_hitmap
+        .region_of(HitTarget::Button(ButtonId::SaveInlineEdit))
+        .is_some());
+    assert!(ui
+        .last_hitmap
+        .region_of(HitTarget::Button(ButtonId::EditExternal))
+        .is_some());
+    assert!(ui
+        .last_hitmap
+        .region_of(HitTarget::InlineEditorBody)
+        .is_some());
+
+    // 2. Typing `# New Heading` + `#livetag` + Korean UTF-8 + `q`/`j`/`k`/`e` types normally AND
+    //    updates `app.active_note.parsed` + right-side Inspector in 0ms (BEFORE any disk save!)
     for _ in 0..7 {
-        app.dispatch(Action::MoveDown, &mut ui);
+        app.dispatch(Action::CursorDown, &mut ui);
     }
     app.dispatch(Action::CursorEnd, &mut ui);
-    app.dispatch(Action::Activate, &mut ui);
+    app.dispatch(Action::Newline, &mut ui);
+    for ch in "## Live Heading #livetag".chars() {
+        let act = key_to_action(
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            ui.focus,
+            ui.canvas_mode,
+            &ui.keymap,
+            ui.is_text_input_active(),
+        )
+        .expect("printable char must map to Action::Input during inline edit");
+        assert_eq!(act, Action::Input(ch));
+        app.dispatch(act, &mut ui);
+    }
+
+    // Verify 0ms live reflection in memory BEFORE disk save!
+    let disk_before_save =
+        fs::read_to_string(root.join("Projects/Q4 Architecture RFC.md")).unwrap();
+    assert!(
+        !disk_before_save.contains("Live Heading"),
+        "disk should not be written yet before 250ms debounce or Ctrl+S"
+    );
+    let live_note = app.active_note.as_ref().unwrap();
+    assert!(
+        live_note
+            .parsed
+            .headings
+            .iter()
+            .any(|h| h.text.contains("Live Heading")),
+        "live heading must appear in active_note.parsed immediately (0ms)"
+    );
+    assert!(
+        live_note.summary.tags.iter().any(|t| t == "livetag"),
+        "#livetag must appear in active_note.summary.tags immediately (0ms)"
+    );
+    assert_eq!(
+        ui.inline_editor.as_ref().unwrap().save_status,
+        InlineSaveStatus::Editing
+    );
+
+    // Render frame right now -> right-side Inspector shows `Live Heading` and `#livetag` live!
+    terminal
+        .draw(|f| {
+            let _ = ui::draw(f, &app, &mut ui);
+        })
+        .unwrap();
+    let live_screen: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(live_screen.contains("● Editing"));
+    assert!(live_screen.contains("#livetag"));
+
+    // 3. Debounced Auto-Save (simulate >= 250ms idle, then tick) writes atomically + calls upsert_single_note!
+    ui.inline_editor.as_mut().unwrap().dirty_since =
+        Some(Instant::now() - Duration::from_millis(300));
+    app.dispatch(Action::InlineEditTick, &mut ui);
+    assert!(!ui.inline_editor.as_ref().unwrap().dirty);
+    assert_eq!(
+        ui.inline_editor.as_ref().unwrap().save_status,
+        InlineSaveStatus::Saved
+    );
+
+    let disk_after_autosave =
+        fs::read_to_string(root.join("Projects/Q4 Architecture RFC.md")).unwrap();
+    assert!(disk_after_autosave.contains("## Live Heading #livetag"));
+
+    // Verify SQLite FTS5, headings, tags, and bookmark updated WITHOUT calling sync_vault
+    let fts_hits = app
+        .storage
+        .search_notes(&vault.id, "Live Heading", 10)
+        .unwrap();
+    assert_eq!(fts_hits.len(), 1);
+    assert_eq!(fts_hits[0].rel_path, "Projects/Q4 Architecture RFC.md");
+    assert!(app.tags.iter().any(|t| t.tag == "livetag"));
+    assert!(
+        app.storage
+            .get_note_summary(&vault.id, "Projects/Q4 Architecture RFC.md")
+            .unwrap()
+            .unwrap()
+            .is_bookmarked,
+        "bookmark must survive single-note upsert"
+    );
+    // Subsequent background watcher sync_vault sees 0 changed files!
+    let watcher_stats = app.storage.sync_vault(&vault).unwrap();
+    assert_eq!(
+        watcher_stats.updated, 0,
+        "mtime_ms + size_bytes written by upsert_single_note must suppress redundant sync_vault rescans"
+    );
+
+    // 4. Test Tab (2 spaces), Korean UTF-8, Undo/Redo, Paste, and Ctrl+S (saves & STAYS in edit mode!)
+    app.dispatch(Action::Newline, &mut ui);
     app.dispatch(Action::Tab, &mut ui);
     for ch in "한글 노트 편집X".chars() {
         app.dispatch(Action::Input(ch), &mut ui);
     }
-
     let act_undo = key_to_action(
         KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL),
         ui.focus,
@@ -948,7 +1091,7 @@ fn test_in_terminal_note_editor_keybindings_save_roundtrip_and_mouse_wheel() {
         &ui.keymap,
         ui.is_text_input_active(),
     )
-    .expect("Ctrl+Z should map to Undo in NoteEditor");
+    .expect("Ctrl+Z should map to Undo in inline editor");
     assert_eq!(act_undo, Action::Undo);
     app.dispatch(act_undo, &mut ui);
 
@@ -959,34 +1102,13 @@ fn test_in_terminal_note_editor_keybindings_save_roundtrip_and_mouse_wheel() {
         &ui.keymap,
         ui.is_text_input_active(),
     )
-    .expect("Ctrl+Y should map to Redo in NoteEditor");
+    .expect("Ctrl+Y should map to Redo in inline editor");
     assert_eq!(act_redo, Action::Redo);
     app.dispatch(act_redo, &mut ui);
     app.dispatch(Action::Undo, &mut ui); // remove trailing 'X'
 
-    app.dispatch(Action::Paste("\n#edited_in_tui\n- [ ] 새 작업".into()), &mut ui);
+    app.dispatch(Action::Paste("\n- [ ] 새 작업".into()), &mut ui);
 
-    // Render editor and verify cursor_pos, pills, and mouse-wheel scrolling
-    terminal
-        .draw(|f| {
-            let _ = ui::draw(f, &app, &mut ui);
-        })
-        .unwrap();
-    assert!(ui.cursor_pos.is_some());
-    assert!(ui
-        .last_hitmap
-        .region_of(HitTarget::Button(ButtonId::ConfirmOk))
-        .is_some());
-    assert!(ui
-        .last_hitmap
-        .region_of(HitTarget::Button(ButtonId::EditExternal))
-        .is_some());
-    assert!(ui
-        .last_hitmap
-        .region_of(HitTarget::Button(ButtonId::ConfirmCancel))
-        .is_some());
-
-    // 3. Ctrl+S saves directly to disk, re-indexes vault, updates reader pane, closes overlay, shows toast
     let act_save = key_to_action(
         KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
         ui.focus,
@@ -994,28 +1116,50 @@ fn test_in_terminal_note_editor_keybindings_save_roundtrip_and_mouse_wheel() {
         &ui.keymap,
         ui.is_text_input_active(),
     )
-    .expect("Ctrl+S should map to OverlaySubmit in NoteEditor");
-    assert_eq!(act_save, Action::OverlaySubmit);
+    .expect("Ctrl+S should map to SaveInlineEdit in inline editor");
+    assert_eq!(act_save, Action::SaveInlineEdit);
     app.dispatch(act_save, &mut ui);
 
-    assert!(ui.overlay.is_none(), "Ctrl+S must close NoteEditorOverlay");
-    assert!(app.pending_external_editor.is_none());
+    assert!(
+        ui.inline_editor.is_some(),
+        "Ctrl+S must save immediately while STAYING in inline edit mode"
+    );
+    assert!(!ui.inline_editor.as_ref().unwrap().dirty);
+    let disk_after_ctrl_s =
+        fs::read_to_string(root.join("Projects/Q4 Architecture RFC.md")).unwrap();
+    assert!(disk_after_ctrl_s.contains("  한글 노트 편집"));
+    assert!(disk_after_ctrl_s.contains("- [ ] 새 작업"));
 
-    let disk_content = fs::read_to_string(root.join("Projects/Q4 Architecture RFC.md")).unwrap();
-    assert!(disk_content.contains("  한글 노트 편집"));
-    assert!(disk_content.contains("#edited_in_tui"));
-    assert!(disk_content.contains("- [ ] 새 작업"));
+    // 5. Esc flushes any pending edit and returns smoothly to rendered note_view
+    app.dispatch(Action::Paste("\n#flushed_on_esc".into()), &mut ui);
+    assert!(ui.inline_editor.as_ref().unwrap().dirty);
+    let act_esc = key_to_action(
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        ui.focus,
+        ui.canvas_mode,
+        &ui.keymap,
+        ui.is_text_input_active(),
+    )
+    .expect("Esc should map to FinishInlineEdit");
+    assert_eq!(act_esc, Action::FinishInlineEdit);
+    app.dispatch(act_esc, &mut ui);
+    assert!(ui.inline_editor.is_none());
+    assert!(ui.overlay.is_none());
+    assert!(fs::read_to_string(root.join("Projects/Q4 Architecture RFC.md"))
+        .unwrap()
+        .contains("#flushed_on_esc"));
+    assert!(app
+        .active_note
+        .as_ref()
+        .unwrap()
+        .summary
+        .tags
+        .iter()
+        .any(|t| t == "flushed_on_esc"));
 
-    let active = app.active_note.as_ref().unwrap();
-    assert!(active.raw_markdown.contains("한글 노트 편집"));
-    assert!(active.summary.tags.iter().any(|t| t == "edited_in_tui"));
-    assert!(app.tags.iter().any(|t| t.tag == "edited_in_tui"));
-    assert!(ui
-        .toasts
-        .current()
-        .is_some_and(|t| t.message.contains("Saved Projects/Q4 Architecture RFC.md")));
-
-    // 4. Ctrl+E requests external $EDITOR
+    // 6. Ctrl+E still requests external $EDITOR (both outside and inside inline edit)
+    app.dispatch(Action::OpenNoteEditor, &mut ui);
+    assert!(ui.inline_editor.is_some());
     let act_ctrl_e = key_to_action(
         KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
         ui.focus,
@@ -1026,13 +1170,14 @@ fn test_in_terminal_note_editor_keybindings_save_roundtrip_and_mouse_wheel() {
     .expect("Ctrl+E should map to RequestExternalEditor");
     assert_eq!(act_ctrl_e, Action::RequestExternalEditor);
     app.dispatch(act_ctrl_e, &mut ui);
+    assert!(ui.inline_editor.is_none());
     let ext_path = app
         .pending_external_editor
         .take()
         .expect("Ctrl+E must queue pending_external_editor");
     assert!(ext_path.ends_with("Q4 Architecture RFC.md"));
 
-    // 5. Mouse wheel works on Note Reader, Sidebar, and NoteEditorOverlay
+    // 7. Scroll position preserved 100% across reader <-> inline edit + mouse wheel + click-to-cursor
     app.open_note(&mut ui, "Long Note.md", false);
     ui.focus = Focus::Canvas;
     terminal
@@ -1049,26 +1194,46 @@ fn test_in_terminal_note_editor_keybindings_save_roundtrip_and_mouse_wheel() {
         .region_of(HitTarget::Pane(Focus::Sidebar))
         .expect("Sidebar pane registered");
 
-    // Wheel over Note Reader scrolls canvas_scroll
-    assert_eq!(ui.canvas_scroll, 0);
+    // Scroll reader down to offset 9
+    for _ in 0..3 {
+        app.dispatch(
+            Action::MouseScrollDown {
+                col: canvas_rect.x + 2,
+                row: canvas_rect.y + 4,
+            },
+            &mut ui,
+        );
+    }
+    assert_eq!(ui.canvas_scroll, 9);
+
+    // Enter inline edit -> inherits scroll_y == 9!
+    app.dispatch(Action::OpenNoteEditor, &mut ui);
+    assert_eq!(ui.inline_editor.as_ref().unwrap().scroll_y, 9);
+    terminal
+        .draw(|f| {
+            let _ = ui::draw(f, &app, &mut ui);
+        })
+        .unwrap();
+
+    // Mouse wheel over inline editor scrolls editor viewport to 12, then back to 9
     app.dispatch(
         Action::MouseScrollDown {
-            col: canvas_rect.x + 2,
-            row: canvas_rect.y + 4,
+            col: canvas_rect.x + 4,
+            row: canvas_rect.y + 5,
         },
         &mut ui,
     );
-    assert_eq!(ui.canvas_scroll, 3);
+    assert_eq!(ui.inline_editor.as_ref().unwrap().scroll_y, 12);
     app.dispatch(
         Action::MouseScrollUp {
-            col: canvas_rect.x + 2,
-            row: canvas_rect.y + 4,
+            col: canvas_rect.x + 4,
+            row: canvas_rect.y + 5,
         },
         &mut ui,
     );
-    assert_eq!(ui.canvas_scroll, 0);
+    assert_eq!(ui.inline_editor.as_ref().unwrap().scroll_y, 9);
 
-    // Wheel over Sidebar scrolls sidebar_selected even while Focus::Canvas is active
+    // Wheel over Sidebar still scrolls sidebar even while inline editor is open
     ui.sidebar_selected = 0;
     app.dispatch(
         Action::MouseScrollDown {
@@ -1078,40 +1243,51 @@ fn test_in_terminal_note_editor_keybindings_save_roundtrip_and_mouse_wheel() {
         &mut ui,
     );
     assert_eq!(ui.sidebar_selected, 1);
+
+    // Click inside InlineEditorBody places cursor on that line/col
+    let body_rect = ui
+        .last_hitmap
+        .region_of(HitTarget::InlineEditorBody)
+        .expect("InlineEditorBody hit target registered");
     app.dispatch(
-        Action::MouseScrollUp {
-            col: sidebar_rect.x + 2,
-            row: sidebar_rect.y + 4,
+        Action::MouseClick {
+            col: body_rect.x + 3,
+            row: body_rect.y + 2,
         },
         &mut ui,
     );
-    assert_eq!(ui.sidebar_selected, 0);
+    assert_eq!(ui.focus, Focus::Canvas);
 
-    // Wheel inside NoteEditorOverlay scrolls editor viewport
+    // Esc exits inline edit and returns reader view at the EXACT same scroll position (9)!
+    app.dispatch(Action::FinishInlineEdit, &mut ui);
+    assert!(ui.inline_editor.is_none());
+    assert_eq!(ui.canvas_scroll, 9);
+    assert!(!ui.canvas_follow_selected);
+
+    // 8. Opening another note while inline editing flushes pending save cleanly first!
     app.dispatch(Action::OpenNoteEditor, &mut ui);
-    terminal
-        .draw(|f| {
-            let _ = ui::draw(f, &app, &mut ui);
-        })
-        .unwrap();
-    app.dispatch(Action::MouseScrollDown { col: 50, row: 15 }, &mut ui);
-    terminal
-        .draw(|f| {
-            let _ = ui::draw(f, &app, &mut ui);
-        })
-        .unwrap();
-    match ui.overlay {
-        Some(Overlay::NoteEditor(ref ed)) => assert_eq!(ed.scroll_y, 3),
-        ref other => panic!("expected NoteEditor, got {other:?}"),
-    }
-    app.dispatch(Action::MouseScrollUp { col: 50, row: 15 }, &mut ui);
-    terminal
-        .draw(|f| {
-            let _ = ui::draw(f, &app, &mut ui);
-        })
-        .unwrap();
-    match ui.overlay {
-        Some(Overlay::NoteEditor(ref ed)) => assert_eq!(ed.scroll_y, 0),
-        ref other => panic!("expected NoteEditor, got {other:?}"),
-    }
+    app.dispatch(Action::Paste("\nFlushedBeforeSwitch".into()), &mut ui);
+    assert!(ui.inline_editor.as_ref().unwrap().dirty);
+    app.open_note(&mut ui, "Storage Engine.md", true);
+    assert!(ui.inline_editor.is_none());
+    assert!(fs::read_to_string(root.join("Long Note.md"))
+        .unwrap()
+        .contains("FlushedBeforeSwitch"));
+
+    // 9. Switching vault while inline editing also flushes pending save cleanly and closes inline edit!
+    let root_b = tmp.path().join("SecondVault");
+    fs::create_dir_all(&root_b).unwrap();
+    fs::write(root_b.join("Welcome.md"), "# Welcome Vault B\n").unwrap();
+    let vault_b = vault_from_dir(&root_b, Some("SecondVault"));
+    app.vaults.push(vault_b.clone());
+
+    app.dispatch(Action::OpenNoteEditor, &mut ui);
+    app.dispatch(Action::Paste("\nFlushedBeforeVaultSwitch".into()), &mut ui);
+    assert!(ui.inline_editor.as_ref().unwrap().dirty);
+    app.dispatch(Action::SwitchVault(vault_b.id.clone()), &mut ui);
+    assert!(ui.inline_editor.is_none());
+    assert_eq!(app.active_vault.id, vault_b.id);
+    assert!(fs::read_to_string(root.join("Storage Engine.md"))
+        .unwrap()
+        .contains("FlushedBeforeVaultSwitch"));
 }

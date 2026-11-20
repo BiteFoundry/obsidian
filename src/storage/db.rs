@@ -21,12 +21,13 @@ use crate::{
     config::{ensure_parent, VaultProfile},
     models::{
         BacklinkEntry, GraphData, GraphEdge, GraphNode, HeadingEntry, IndexStats, NoteDetail,
-        NoteSummary, OutgoingLinkEntry, SearchHit, TagCount, TaskEntry, TaskFilter,
+        NoteSummary, OutgoingLinkEntry, ParsedNote, SearchHit, TagCount, TaskEntry, TaskFilter,
     },
     vault::{
         fs::{
-            hydrate_parsed_note_links, resolve_note_identifier, resolve_wikilink_target,
-            safe_vault_path, scan_vault_markdown_files, title_from_rel_path,
+            folder_from_rel_path, hydrate_parsed_note_links, resolve_note_identifier,
+            resolve_wikilink_target, safe_vault_path, scan_vault_markdown_files,
+            title_from_rel_path,
         },
         parser::parse_markdown,
     },
@@ -153,6 +154,101 @@ impl Storage {
         Ok(())
     }
 
+    /// Fast single-note incremental SQLite upsert (zero filesystem scanning, < 2ms).
+    ///
+    /// Updates only the specified note's rows in `notes`, `notes_fts`, `tags`, `headings`,
+    /// `tasks`, and `links` inside a single transaction (preserving `is_bookmarked`), and
+    /// resolves outgoing links for that note against existing vault paths/aliases.
+    pub fn upsert_single_note(
+        &self,
+        vault: &VaultProfile,
+        rel_path: &str,
+        raw_markdown: &str,
+        mtime_ms: i64,
+        size_bytes: i64,
+    ) -> Result<()> {
+        let vault_id = vault.id.as_str();
+        let title = title_from_rel_path(rel_path);
+        let folder = folder_from_rel_path(rel_path);
+        let parsed = parse_markdown(rel_path, &title, raw_markdown);
+
+        let mut conn = self.conn.lock().map_err(|_| anyhow!("Storage lock poisoned"))?;
+        let tx = conn.transaction()?;
+
+        let prev: Option<(bool, String)> = tx
+            .query_row(
+                "SELECT is_bookmarked, aliases_json FROM notes WHERE vault_id = ?1 AND rel_path = ?2",
+                params![vault_id, rel_path],
+                |r| Ok((r.get::<_, i64>(0)? != 0, r.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let is_bookmarked = prev.as_ref().map(|(bm, _)| *bm).unwrap_or(false);
+        let prev_aliases_json = prev.map(|(_, aj)| aj);
+        let new_aliases_json =
+            serde_json::to_string(&parsed.aliases).unwrap_or_else(|_| "[]".into());
+        let aliases_changed = prev_aliases_json.as_deref() != Some(new_aliases_json.as_str());
+
+        upsert_note_in_tx(
+            &tx,
+            vault_id,
+            rel_path,
+            &title,
+            &folder,
+            &parsed,
+            mtime_ms,
+            size_bytes,
+            is_bookmarked,
+        )?;
+
+        // Load vault paths + aliases from SQLite (pure index read, no disk I/O)
+        let mut all_paths: Vec<String> = Vec::new();
+        let mut aliases_by_path: HashMap<String, Vec<String>> = HashMap::new();
+        {
+            let mut stmt =
+                tx.prepare("SELECT rel_path, aliases_json FROM notes WHERE vault_id = ?1")?;
+            let rows = stmt.query_map(params![vault_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for r in rows {
+                let (rp, aj) = r?;
+                let aliases: Vec<String> = serde_json::from_str(&aj).unwrap_or_default();
+                if !aliases.is_empty() {
+                    aliases_by_path.insert(rp.clone(), aliases);
+                }
+                all_paths.push(rp);
+            }
+        }
+
+        // Resolve outgoing links ONLY for this single note (or all unresolved/targeted links if aliases changed)
+        let mut link_rows: Vec<(i64, String)> = Vec::new();
+        {
+            let sql = if aliases_changed {
+                "SELECT id, target_raw FROM links
+                 WHERE vault_id = ?1 AND (source_path = ?2 OR target_resolved_path = ?2 OR target_resolved_path IS NULL)"
+            } else {
+                "SELECT id, target_raw FROM links WHERE vault_id = ?1 AND source_path = ?2"
+            };
+            let mut stmt = tx.prepare(sql)?;
+            let rows = stmt.query_map(params![vault_id, rel_path], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for r in rows {
+                link_rows.push(r?);
+            }
+        }
+
+        if !link_rows.is_empty() {
+            let mut upd = tx.prepare("UPDATE links SET target_resolved_path = ?1 WHERE id = ?2")?;
+            for (id, target_raw) in link_rows {
+                let resolved = resolve_wikilink_target(&target_raw, &all_paths, &aliases_by_path);
+                upd.execute(params![resolved, id])?;
+            }
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Incrementally scans `vault.path` comparing `(mtime_ms, size_bytes)` against SQLite.
     /// Parses only added/modified `.md` files, removes deleted notes, and refreshes wikilink resolutions.
     pub fn sync_vault(&self, vault: &VaultProfile) -> Result<IndexStats> {
@@ -239,117 +335,16 @@ impl Storage {
                 .get(&entry.rel_path)
                 .map(|t| t.2)
                 .unwrap_or(false);
-            let fm_json = serde_json::to_string(&parsed.frontmatter).unwrap_or_else(|_| "{}".into());
-            let aliases_json = serde_json::to_string(&parsed.aliases).unwrap_or_else(|_| "[]".into());
-            let aliases_text = parsed.aliases.join(" ");
-            let tags_text = parsed.tags.join(" ");
-
-            tx.execute(
-                "INSERT INTO notes (
-                    vault_id, rel_path, title, folder, frontmatter_json, aliases_json,
-                    body_plain, word_count, mtime_ms, size_bytes, is_bookmarked
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-                 ON CONFLICT(vault_id, rel_path) DO UPDATE SET
-                    title = excluded.title,
-                    folder = excluded.folder,
-                    frontmatter_json = excluded.frontmatter_json,
-                    aliases_json = excluded.aliases_json,
-                    body_plain = excluded.body_plain,
-                    word_count = excluded.word_count,
-                    mtime_ms = excluded.mtime_ms,
-                    size_bytes = excluded.size_bytes",
-                params![
-                    vault_id,
-                    entry.rel_path,
-                    entry.title,
-                    entry.folder,
-                    fm_json,
-                    aliases_json,
-                    parsed.body_plain,
-                    parsed.word_count as i64,
-                    entry.mtime_ms,
-                    entry.size_bytes,
-                    i64::from(is_bookmarked),
-                ],
-            )?;
-
-            tx.execute(
-                "DELETE FROM links WHERE vault_id = ?1 AND source_path = ?2",
-                params![vault_id, entry.rel_path],
-            )?;
-            for wl in &parsed.wikilinks {
-                tx.execute(
-                    "INSERT INTO links (
-                        vault_id, source_path, target_raw, target_resolved_path, alias, heading, is_embed
-                     ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6)",
-                    params![
-                        vault_id,
-                        entry.rel_path,
-                        wl.target_raw,
-                        wl.alias,
-                        wl.heading,
-                        i64::from(wl.is_embed),
-                    ],
-                )?;
-            }
-
-            tx.execute(
-                "DELETE FROM tags WHERE vault_id = ?1 AND note_path = ?2",
-                params![vault_id, entry.rel_path],
-            )?;
-            for tag in &parsed.tags {
-                tx.execute(
-                    "INSERT OR IGNORE INTO tags (vault_id, note_path, tag) VALUES (?1, ?2, ?3)",
-                    params![vault_id, entry.rel_path, tag],
-                )?;
-            }
-
-            tx.execute(
-                "DELETE FROM headings WHERE vault_id = ?1 AND note_path = ?2",
-                params![vault_id, entry.rel_path],
-            )?;
-            for h in &parsed.headings {
-                tx.execute(
-                    "INSERT INTO headings (vault_id, note_path, level, text, line_no)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![vault_id, entry.rel_path, h.level as i64, h.text, h.line_no as i64],
-                )?;
-            }
-
-            tx.execute(
-                "DELETE FROM tasks WHERE vault_id = ?1 AND note_path = ?2",
-                params![vault_id, entry.rel_path],
-            )?;
-            for t in &parsed.tasks {
-                tx.execute(
-                    "INSERT INTO tasks (vault_id, note_path, line_no, text, checked)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![
-                        vault_id,
-                        entry.rel_path,
-                        t.line_no as i64,
-                        t.text,
-                        i64::from(t.checked),
-                    ],
-                )?;
-            }
-
-            tx.execute(
-                "DELETE FROM notes_fts WHERE vault_id = ?1 AND rel_path = ?2",
-                params![vault_id, entry.rel_path],
-            )?;
-            tx.execute(
-                "INSERT INTO notes_fts (vault_id, rel_path, title, rel_path_text, aliases, tags, body_plain)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    vault_id,
-                    entry.rel_path,
-                    entry.title,
-                    entry.rel_path,
-                    aliases_text,
-                    tags_text,
-                    parsed.body_plain,
-                ],
+            upsert_note_in_tx(
+                &tx,
+                vault_id,
+                &entry.rel_path,
+                &entry.title,
+                &entry.folder,
+                &parsed,
+                entry.mtime_ms,
+                entry.size_bytes,
+                is_bookmarked,
             )?;
         }
 
@@ -1329,10 +1324,137 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
+fn upsert_note_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    vault_id: &str,
+    rel_path: &str,
+    title: &str,
+    folder: &str,
+    parsed: &ParsedNote,
+    mtime_ms: i64,
+    size_bytes: i64,
+    is_bookmarked: bool,
+) -> Result<()> {
+    let fm_json = serde_json::to_string(&parsed.frontmatter).unwrap_or_else(|_| "{}".into());
+    let aliases_json = serde_json::to_string(&parsed.aliases).unwrap_or_else(|_| "[]".into());
+    let aliases_text = parsed.aliases.join(" ");
+    let tags_text = parsed.tags.join(" ");
+
+    tx.execute(
+        "INSERT INTO notes (
+            vault_id, rel_path, title, folder, frontmatter_json, aliases_json,
+            body_plain, word_count, mtime_ms, size_bytes, is_bookmarked
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+         ON CONFLICT(vault_id, rel_path) DO UPDATE SET
+            title = excluded.title,
+            folder = excluded.folder,
+            frontmatter_json = excluded.frontmatter_json,
+            aliases_json = excluded.aliases_json,
+            body_plain = excluded.body_plain,
+            word_count = excluded.word_count,
+            mtime_ms = excluded.mtime_ms,
+            size_bytes = excluded.size_bytes",
+        params![
+            vault_id,
+            rel_path,
+            title,
+            folder,
+            fm_json,
+            aliases_json,
+            parsed.body_plain,
+            parsed.word_count as i64,
+            mtime_ms,
+            size_bytes,
+            i64::from(is_bookmarked),
+        ],
+    )?;
+
+    tx.execute(
+        "DELETE FROM links WHERE vault_id = ?1 AND source_path = ?2",
+        params![vault_id, rel_path],
+    )?;
+    for wl in &parsed.wikilinks {
+        tx.execute(
+            "INSERT INTO links (
+                vault_id, source_path, target_raw, target_resolved_path, alias, heading, is_embed
+             ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6)",
+            params![
+                vault_id,
+                rel_path,
+                wl.target_raw,
+                wl.alias,
+                wl.heading,
+                i64::from(wl.is_embed),
+            ],
+        )?;
+    }
+
+    tx.execute(
+        "DELETE FROM tags WHERE vault_id = ?1 AND note_path = ?2",
+        params![vault_id, rel_path],
+    )?;
+    for tag in &parsed.tags {
+        tx.execute(
+            "INSERT OR IGNORE INTO tags (vault_id, note_path, tag) VALUES (?1, ?2, ?3)",
+            params![vault_id, rel_path, tag],
+        )?;
+    }
+
+    tx.execute(
+        "DELETE FROM headings WHERE vault_id = ?1 AND note_path = ?2",
+        params![vault_id, rel_path],
+    )?;
+    for h in &parsed.headings {
+        tx.execute(
+            "INSERT INTO headings (vault_id, note_path, level, text, line_no)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![vault_id, rel_path, h.level as i64, h.text, h.line_no as i64],
+        )?;
+    }
+
+    tx.execute(
+        "DELETE FROM tasks WHERE vault_id = ?1 AND note_path = ?2",
+        params![vault_id, rel_path],
+    )?;
+    for t in &parsed.tasks {
+        tx.execute(
+            "INSERT INTO tasks (vault_id, note_path, line_no, text, checked)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                vault_id,
+                rel_path,
+                t.line_no as i64,
+                t.text,
+                i64::from(t.checked),
+            ],
+        )?;
+    }
+
+    tx.execute(
+        "DELETE FROM notes_fts WHERE vault_id = ?1 AND rel_path = ?2",
+        params![vault_id, rel_path],
+    )?;
+    tx.execute(
+        "INSERT INTO notes_fts (vault_id, rel_path, title, rel_path_text, aliases, tags, body_plain)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            vault_id,
+            rel_path,
+            title,
+            rel_path,
+            aliases_text,
+            tags_text,
+            parsed.body_plain,
+        ],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vault::vault_from_dir;
+    use crate::vault::{fs::file_mtime_and_size, vault_from_dir};
 
     #[test]
     fn test_incremental_sync_backlinks_graph_and_korean_fallback() {
@@ -1383,5 +1505,66 @@ mod tests {
         let kr_hits = storage.search_notes(&vault.id, "회의", 10).unwrap();
         assert_eq!(kr_hits.len(), 1);
         assert_eq!(kr_hits[0].rel_path, "Storage Engine.md");
+    }
+
+    #[test]
+    fn test_upsert_single_note_updates_all_tables_preserves_bookmark_and_prevents_redundant_sync() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("Projects")).unwrap();
+        let rfc_abs = root.join("Projects/RFC.md");
+        fs::write(&rfc_abs, "# Initial Title\n\nOld body.\n").unwrap();
+        fs::write(root.join("Target.md"), "# Target\n\nTarget body.\n").unwrap();
+
+        let vault = vault_from_dir(root, Some("FastVault"));
+        let storage = Storage::open_in_memory().unwrap();
+        storage.sync_vault(&vault).unwrap();
+
+        // Bookmark the note before editing
+        assert!(storage.toggle_bookmark(&vault.id, "Projects/RFC.md").unwrap());
+
+        // Write updated content to disk and call upsert_single_note (NO sync_vault!)
+        let new_md = "# Fresh Heading\n\nUniqueSearchToken links to [[Target]] with #instanttag\n\n- [ ] Instant task\n";
+        fs::write(&rfc_abs, new_md).unwrap();
+        let (mtime_ms, size_bytes) = file_mtime_and_size(&rfc_abs);
+
+        storage
+            .upsert_single_note(&vault, "Projects/RFC.md", new_md, mtime_ms, size_bytes)
+            .unwrap();
+
+        // Verify bookmark preserved + summary updated
+        let summary = storage
+            .get_note_summary(&vault.id, "Projects/RFC.md")
+            .unwrap()
+            .unwrap();
+        assert!(summary.is_bookmarked, "upsert_single_note must preserve is_bookmarked");
+        assert!(summary.tags.iter().any(|t| t == "instanttag"));
+        assert_eq!(summary.mtime_ms, mtime_ms);
+        assert_eq!(summary.size_bytes, size_bytes);
+
+        // Verify FTS5, headings, tags, tasks, and resolved links all updated
+        let hits = storage.search_notes(&vault.id, "UniqueSearchToken", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].rel_path, "Projects/RFC.md");
+
+        let headings = storage.get_headings(&vault.id, "Projects/RFC.md").unwrap();
+        assert_eq!(headings.len(), 1);
+        assert_eq!(headings[0].text, "Fresh Heading");
+
+        let tasks = storage
+            .list_tasks(&vault.id, TaskFilter::Open, Some("Projects/RFC.md"))
+            .unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].text, "Instant task");
+
+        let outgoing = storage.get_outgoing_links(&vault.id, "Projects/RFC.md").unwrap();
+        assert_eq!(outgoing.len(), 1);
+        assert!(outgoing[0].resolved);
+        assert_eq!(outgoing[0].target_resolved_path.as_deref(), Some("Target.md"));
+
+        // Verify subsequent sync_vault sees 0 changed files (suppressing redundant watcher scans!)
+        let stats = storage.sync_vault(&vault).unwrap();
+        assert_eq!(stats.updated, 0);
+        assert_eq!(stats.removed, 0);
     }
 }

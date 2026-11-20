@@ -140,7 +140,7 @@ pub const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("Space / x", "Toggle live Markdown checkbox right in the .md file"),
             ("Enter", "Follow [[wikilink]], open note, or jump to heading"),
             ("a / n", "Quick Append / New Note"),
-            ("e / Ctrl+E", "Edit note in terminal / Open in external $EDITOR"),
+            ("e / Ctrl+E", "Inline live edit in pane / Open in external $EDITOR"),
             ("b / w / h", "Toggle Bookmark / Centered-Full Width / Inline Hrefs"),
         ],
     ),

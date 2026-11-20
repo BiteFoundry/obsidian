@@ -56,10 +56,9 @@ pub enum Action {
     OpenQuickAppend,
     OpenNewNoteModal,
     OpenNoteEditor,
-    SubmitNoteEdit {
-        note_path: String,
-        markdown: String,
-    },
+    SaveInlineEdit,
+    FinishInlineEdit,
+    InlineEditTick,
     CreateNoteSubmit {
         title: String,
         folder: String,

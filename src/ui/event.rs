@@ -109,6 +109,41 @@ pub fn key_to_action(
         };
     }
 
+    // In-place inline note editor key routing: typing/editing keys go straight to the inline editor
+    if text_input {
+        if ctrl && !alt {
+            match key.code {
+                KeyCode::Char('s') | KeyCode::Char('S') => return Some(Action::SaveInlineEdit),
+                KeyCode::Char('z') | KeyCode::Char('Z') => return Some(Action::Undo),
+                KeyCode::Char('y') | KeyCode::Char('Y') => return Some(Action::Redo),
+                KeyCode::Char('e') | KeyCode::Char('E') => {
+                    return Some(Action::RequestExternalEditor);
+                }
+                KeyCode::Char('v') | KeyCode::Char('V') => {
+                    return Some(Action::PasteClipboard);
+                }
+                _ => {}
+            }
+        }
+        return match key.code {
+            KeyCode::Esc => Some(Action::FinishInlineEdit),
+            KeyCode::Enter => Some(Action::Newline),
+            KeyCode::Tab => Some(Action::Tab),
+            KeyCode::Backspace => Some(Action::Backspace),
+            KeyCode::Delete => Some(Action::Delete),
+            KeyCode::Up => Some(Action::CursorUp),
+            KeyCode::Down => Some(Action::CursorDown),
+            KeyCode::Left => Some(Action::CursorLeft),
+            KeyCode::Right => Some(Action::CursorRight),
+            KeyCode::Home => Some(Action::CursorHome),
+            KeyCode::End => Some(Action::CursorEnd),
+            KeyCode::PageUp => Some(Action::PageUp),
+            KeyCode::PageDown => Some(Action::PageDown),
+            KeyCode::Char(ch) if !ctrl && !alt => Some(Action::Input(ch)),
+            _ => None,
+        };
+    }
+
     // Graph View specific shortcuts when viewing Knowledge Graph in Canvas
     if canvas_mode == CanvasMode::Graph && focus == Focus::Canvas {
         match key.code {

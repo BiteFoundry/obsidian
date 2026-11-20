@@ -42,14 +42,28 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
         return;
     };
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(48),
-            Constraint::Percentage(32),
-            Constraint::Length(6),
-        ])
-        .split(inner);
+    let show_outline = inner.height >= 18;
+    let chunks = if show_outline {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(34),
+                Constraint::Percentage(24),
+                Constraint::Min(5),
+                Constraint::Length(6),
+            ])
+            .split(inner)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(48),
+                Constraint::Percentage(32),
+                Constraint::Length(0),
+                Constraint::Length(6),
+            ])
+            .split(inner)
+    };
 
     let w = inner.width as usize;
     let total_bl = detail.backlinks.len();
@@ -181,13 +195,91 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
         }
     }
 
-    // 3. Local Graph Mini-Stats Card
+    // 3. Live Outline & Tags (updates on every keystroke in inline edit mode!)
+    if show_outline && chunks[2].height >= 3 {
+        let out_area = chunks[2];
+        let heading_cnt = detail.parsed.headings.len();
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" § Outline ({heading_cnt}) "),
+                Style::default()
+                    .fg(theme.accent_soft)
+                    .add_modifier(Modifier::BOLD),
+            )))
+            .style(Style::default().bg(theme.bg_sidebar)),
+            Rect::new(out_area.x, out_area.y, out_area.width, 1),
+        );
+
+        let mut y = out_area.y + 1;
+        let tags_rows: u16 = if detail.summary.tags.is_empty() || out_area.height < 4 {
+            0
+        } else {
+            1
+        };
+        let heading_limit_y = out_area.bottom().saturating_sub(tags_rows);
+
+        if detail.parsed.headings.is_empty() {
+            if y < heading_limit_y {
+                frame.render_widget(
+                    Paragraph::new(Span::styled("  No headings yet.", theme.muted_style())),
+                    Rect::new(out_area.x, y, out_area.width, 1),
+                );
+            }
+        } else {
+            for h in &detail.parsed.headings {
+                if y >= heading_limit_y {
+                    break;
+                }
+                let indent = " ".repeat((h.level.saturating_sub(1) as usize).min(3));
+                let avail = w.saturating_sub(indent.len() + 5);
+                let line = Line::from(vec![
+                    Span::raw(format!(" {indent}")),
+                    Span::styled(
+                        format!("H{} ", h.level),
+                        Style::default()
+                            .fg(theme.accent)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        truncate_width(&h.text, avail),
+                        Style::default().fg(theme.fg_primary),
+                    ),
+                ]);
+                frame.render_widget(
+                    Paragraph::new(line).style(Style::default().bg(theme.bg_sidebar)),
+                    Rect::new(out_area.x, y, out_area.width, 1),
+                );
+                y += 1;
+            }
+        }
+
+        if tags_rows > 0 {
+            let tags_y = out_area.bottom().saturating_sub(1);
+            let tags_joined = detail
+                .summary
+                .tags
+                .iter()
+                .map(|t| format!("#{t}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    format!(" {}", truncate_width(&tags_joined, w.saturating_sub(2))),
+                    Style::default().fg(theme.tag_fg),
+                ))
+                .style(Style::default().bg(theme.bg_sidebar)),
+                Rect::new(out_area.x, tags_y, out_area.width, 1),
+            );
+        }
+    }
+
+    // 4. Local Graph Mini-Stats Card
     let stats_block = Block::default()
         .borders(Borders::TOP)
         .border_style(Style::default().fg(theme.divider))
         .style(Style::default().bg(theme.bg_card));
-    let stats_inner = stats_block.inner(chunks[2]);
-    frame.render_widget(stats_block, chunks[2]);
+    let stats_inner = stats_block.inner(chunks[3]);
+    frame.render_widget(stats_block, chunks[3]);
 
     let done_tasks = detail.parsed.tasks.iter().filter(|t| t.checked).count();
     let total_tasks = detail.parsed.tasks.len();

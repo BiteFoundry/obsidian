@@ -15,6 +15,8 @@ use ratatui::{
     Frame,
 };
 
+pub use crate::ui::inline_editor::{InlineNoteEditor, InlineSaveStatus};
+
 use crate::{
     config::PageWidthMode,
     models::{InlineSpan, NoteBlock, NoteDetail},
@@ -81,6 +83,14 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiState, hit
 
     let width = content_area.width as usize;
     if width < 10 || content_area.height < 3 {
+        return;
+    }
+
+    // In-place inline live editor directly inside `note_view`'s `content_area` (ZERO popup window!)
+    if let Some(mut editor) = ui.inline_editor.take() {
+        let cursor = editor.draw(frame, content_area, &theme, hitmap);
+        ui.cursor_pos = cursor;
+        ui.inline_editor = Some(editor);
         return;
     }
 
