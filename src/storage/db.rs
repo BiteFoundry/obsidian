@@ -15,7 +15,7 @@ use std::{
 };
 
 use anyhow::{anyhow, Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use crate::{
     config::{ensure_parent, VaultProfile},
@@ -277,6 +277,7 @@ impl Storage {
             size_bytes,
             &content_hash,
             is_bookmarked,
+            true,
         )?;
 
         let mut affected_sources = HashSet::new();
@@ -596,6 +597,7 @@ impl Storage {
                 note.size_bytes,
                 &note.content_hash,
                 is_bookmarked,
+                true,
             )?;
 
             updated_count += 1;
@@ -727,7 +729,22 @@ impl Storage {
         let removed_count = removed_paths.len();
         let needs_link_resolution = updated_count > 0 || removed_count > 0;
 
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(if existing.is_empty() {
+            TransactionBehavior::Immediate
+        } else {
+            TransactionBehavior::Deferred
+        })?;
+        // Recheck under the write lock before clearing FTS rows. Another process may have
+        // indexed this vault while we were reading files.
+        let first_index = existing.is_empty()
+            && !tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM notes WHERE vault_id = ?1)",
+                params![vault_id],
+                |r| r.get::<_, bool>(0),
+            )?;
+        if first_index {
+            tx.execute("DELETE FROM notes_fts WHERE vault_id = ?1", params![vault_id])?;
+        }
 
         // Remove deleted notes
         for rel in &removed_paths {
@@ -749,6 +766,7 @@ impl Storage {
                 entry.size_bytes,
                 disk_hash,
                 *is_bookmarked,
+                !first_index,
             )?;
         }
 
@@ -1098,30 +1116,35 @@ impl Storage {
         let conn = self.conn.lock().map_err(|_| anyhow!("Storage lock poisoned"))?;
         let target_title = title_from_rel_path(target_rel_path);
         let mut stmt = conn.prepare(
-            "SELECT DISTINCT l.source_path, n.title, n.body_plain, l.target_raw, l.heading, l.is_embed
+            "SELECT l.source_path, n.title, l.target_raw, l.heading, l.is_embed
              FROM links l
              JOIN notes n ON n.vault_id = l.vault_id AND n.rel_path = l.source_path
              WHERE l.vault_id = ?1 AND l.target_resolved_path = ?2 AND l.source_path != ?2
-             ORDER BY LOWER(n.title) ASC",
+             ORDER BY LOWER(n.title) ASC, l.id ASC",
+        )?;
+        // Keep the metadata cursor open while fetching bodies so both reads share its snapshot.
+        let mut body_stmt = conn.prepare(
+            "SELECT body_plain FROM notes WHERE vault_id = ?1 AND rel_path = ?2",
         )?;
         let rows = stmt.query_map(params![vault_id, target_rel_path], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, Option<String>>(4)?,
-                r.get::<_, i64>(5)? != 0,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, i64>(4)? != 0,
             ))
         })?;
 
         let mut seen = HashSet::new();
         let mut out = Vec::new();
         for r in rows {
-            let (source_path, source_title, body_plain, target_raw, heading, is_embed) = r?;
+            let (source_path, source_title, target_raw, heading, is_embed) = r?;
             if !seen.insert(source_path.clone()) {
                 continue;
             }
+            let body_plain: String =
+                body_stmt.query_row(params![vault_id, source_path], |r| r.get(0))?;
             let snippet = extract_context_snippet(&body_plain, &target_raw)
                 .or_else(|| extract_context_snippet(&body_plain, &target_title))
                 .unwrap_or_else(|| first_line_preview(&body_plain, 96));
@@ -1902,6 +1925,7 @@ fn upsert_note_in_tx(
     size_bytes: i64,
     content_hash: &str,
     is_bookmarked: bool,
+    replace_fts: bool,
 ) -> Result<()> {
     let fm_json = serde_json::to_string(&parsed.frontmatter).unwrap_or_else(|_| "{}".into());
     let aliases_json = serde_json::to_string(&parsed.aliases).unwrap_or_else(|_| "[]".into());
@@ -2002,10 +2026,12 @@ fn upsert_note_in_tx(
         )?;
     }
 
-    tx.execute(
-        "DELETE FROM notes_fts WHERE vault_id = ?1 AND rel_path = ?2",
-        params![vault_id, rel_path],
-    )?;
+    if replace_fts {
+        tx.execute(
+            "DELETE FROM notes_fts WHERE vault_id = ?1 AND rel_path = ?2",
+            params![vault_id, rel_path],
+        )?;
+    }
     tx.execute(
         "INSERT INTO notes_fts (vault_id, rel_path, title, rel_path_text, aliases, tags, body_plain)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -2026,6 +2052,154 @@ fn upsert_note_in_tx(
 mod tests {
     use super::*;
     use crate::vault::{fs::file_mtime_and_size, vault_from_dir};
+
+    #[test]
+    fn backlinks_keep_first_link_order_and_context_for_matching_titles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir(root.join("A")).unwrap();
+        fs::create_dir(root.join("B")).unwrap();
+        for (path, body) in [
+            ("Target.md", "---\naliases: [Destination]\n---\n# Target\n\n[[Target]]\n"),
+            ("A/Same.md", "See ![[Destination#First|Destination]].\n\n[[Target#Second]]\n\n[[Target#Second]]\n"),
+            ("B/Same.md", "See [[Target#Third|Target]].\n\n![[Destination#Fourth]]\n"),
+            ("later.md", "See [[Target]].\n"),
+        ] {
+            fs::write(root.join(path), body).unwrap();
+        }
+        let vault = vault_from_dir(root, None);
+        let storage = Storage::open_in_memory().unwrap();
+        storage.sync_vault(&vault).unwrap();
+
+        let links = storage.get_backlinks(&vault.id, "Target.md").unwrap();
+        let fields: Vec<_> = links
+            .iter()
+            .map(|link| {
+                (
+                    link.source_path.as_str(),
+                    link.source_title.as_str(),
+                    link.context_snippet.as_str(),
+                    link.heading.as_deref(),
+                    link.is_embed,
+                )
+            })
+            .collect();
+        assert_eq!(
+            fields,
+            [
+                ("later.md", "later", "See Target.", None, false),
+                ("A/Same.md", "Same", "See Destination.", Some("First"), true),
+                ("B/Same.md", "Same", "See Target.", Some("Third"), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn first_index_clears_fts_once_and_keeps_other_vault_searchable() {
+        use rusqlite::ffi;
+        use std::{
+            cell::Cell,
+            ffi::{c_int, c_uint, c_void, CStr},
+            ptr,
+        };
+
+        unsafe extern "C" fn count_deletes(
+            _: c_uint,
+            context: *mut c_void,
+            statement: *mut c_void,
+            _: *mut c_void,
+        ) -> c_int {
+            // SQLITE_TRACE_STMT supplies a live statement and the registered context.
+            unsafe {
+                let sql = ffi::sqlite3_sql(statement.cast());
+                if !sql.is_null()
+                    && CStr::from_ptr(sql)
+                        .to_bytes()
+                        .starts_with(b"DELETE FROM notes_fts WHERE ")
+                {
+                    let deletes = &*context.cast::<Cell<usize>>();
+                    deletes.set(deletes.get() + 1);
+                }
+            }
+            0
+        }
+
+        let first = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let vault = vault_from_dir(first.path(), None);
+        let other_vault = vault_from_dir(other.path(), None);
+        for i in 0..2048 {
+            let body = if i == 0 {
+                "Anchor firstword"
+            } else {
+                "Index filler"
+            };
+            fs::write(first.path().join(format!("Note{i:04}.md")), body).unwrap();
+        }
+        fs::write(other.path().join("Note0000.md"), "secondvault").unwrap();
+
+        let deletes = Cell::new(0usize);
+        let storage = Storage::open_in_memory().unwrap();
+        storage.sync_vault(&other_vault).unwrap();
+        {
+            let conn = storage.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO notes_fts (vault_id, rel_path, body_plain) VALUES (?1, 'Orphan.md', 'stalefts')",
+                params![vault.id],
+            ).unwrap();
+            // The callback is used synchronously by this connection, which drops before `deletes`.
+            assert_eq!(
+                unsafe {
+                    ffi::sqlite3_trace_v2(
+                        conn.handle(),
+                        ffi::SQLITE_TRACE_STMT as c_uint,
+                        Some(count_deletes),
+                        ptr::from_ref(&deletes).cast_mut().cast(),
+                    )
+                },
+                ffi::SQLITE_OK
+            );
+        }
+        storage.sync_vault(&vault).unwrap();
+        assert_eq!(deletes.get(), 1);
+
+        let fts_count = |vault_id: &str, query: &str| -> usize {
+            storage
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM notes_fts WHERE vault_id = ?1 AND notes_fts MATCH ?2",
+                    params![vault_id, query],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        let total: usize = storage
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM notes_fts WHERE vault_id = ?1",
+                params![vault.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(total, 2048);
+        assert_eq!(fts_count(&vault.id, "stalefts"), 0);
+        assert_eq!(fts_count(&vault.id, "Anchor"), 1);
+        assert_eq!(fts_count(&other_vault.id, "secondvault"), 1);
+
+        let anchor = first.path().join("Note0000.md");
+        fs::write(&anchor, "New indexed replacement").unwrap();
+        storage.sync_vault(&vault).unwrap();
+        assert_eq!(fts_count(&vault.id, "firstword"), 0);
+        assert_eq!(fts_count(&vault.id, "replacement"), 1);
+        fs::remove_file(anchor).unwrap();
+        storage.sync_vault(&vault).unwrap();
+        assert_eq!(fts_count(&vault.id, "replacement"), 0);
+        assert_eq!(fts_count(&other_vault.id, "secondvault"), 1);
+    }
 
     #[test]
     fn test_incremental_sync_backlinks_graph_and_korean_fallback() {

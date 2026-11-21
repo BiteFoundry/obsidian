@@ -929,17 +929,27 @@ impl AppState {
         true
     }
 
-    /// Flushes debounced auto-save when `dirty` and idle for >= 250ms.
+    /// Flushes debounced auto-save when due and reports whether the editor or toast changed.
     pub fn tick_inline_autosave(&mut self, ui: &mut UiState) -> bool {
-        if ui
+        let Some(editor) = ui
             .inline_editor
             .as_ref()
-            .is_some_and(InlineNoteEditor::is_autosave_due)
-        {
-            self.flush_inline_save(ui)
-        } else {
-            false
+            .filter(|editor| editor.is_autosave_due())
+        else {
+            return false;
+        };
+        let save_status = editor.save_status.clone();
+        let toast = ui.toasts.current().map(|t| (t.kind, t.message.clone()));
+        if self.flush_inline_save(ui) {
+            return true;
         }
+        ui.inline_editor
+            .as_ref()
+            .is_some_and(|editor| editor.save_status != save_status)
+            || ui.toasts.current().map(|t| (t.kind, t.message.as_str()))
+                != toast
+                    .as_ref()
+                    .map(|(kind, message)| (*kind, message.as_str()))
     }
 
     /// Flushes any pending inline auto-save and exits cleanly back to the rendered reader view

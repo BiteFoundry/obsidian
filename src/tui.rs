@@ -628,8 +628,11 @@ pub async fn run_tui(
     let mut physics_tick = tokio::time::interval(Duration::from_millis(33));
     physics_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    let mut redraw = true;
     loop {
-        draw_frame(&mut terminal, &mut app, &mut ui, &mut guard)?;
+        if redraw {
+            draw_frame(&mut terminal, &mut app, &mut ui, &mut guard)?;
+        }
 
         if ui.should_quit {
             break;
@@ -638,6 +641,7 @@ pub async fn run_tui(
         // Handle pending native localhost HTML serving & browser launch (`o` inside HtmlPreview)
         if let Some((title, html)) = app.pending_html_serve.take() {
             let _ = app.serve_html_and_open(&title, &html, &mut ui, true).await;
+            redraw = true;
             continue;
         }
 
@@ -656,22 +660,25 @@ pub async fn run_tui(
                 }
                 Err(e) => ui.toasts.error(format!("Editor failed: {e}")),
             }
+            redraw = true;
             continue;
         }
 
         let graph_animating =
             ui.canvas_mode == ui::app::CanvasMode::Graph && ui.graph_sim.is_active();
 
-        tokio::select! {
+        redraw = tokio::select! {
             _ = physics_tick.tick(), if graph_animating => {
                 app.dispatch(ui::action::Action::GraphTick, &mut ui);
+                true
             }
             _ = tick.tick() => {
-                ui.toasts.prune();
-                app.dispatch(ui::action::Action::InlineEditTick, &mut ui);
+                let toast_expired = ui.toasts.prune();
+                app.tick_inline_autosave(&mut ui) || toast_expired
             }
             Some(core_ev) = events_rx.recv() => {
                 app.handle_core_event(core_ev, &mut ui);
+                true
             }
             maybe_ev = reader.next() => {
                 match maybe_ev {
@@ -704,8 +711,9 @@ pub async fn run_tui(
                     Some(Err(_)) | None => break,
                     _ => {}
                 }
+                true
             }
-        }
+        };
     }
 
     app.html_server.shutdown();

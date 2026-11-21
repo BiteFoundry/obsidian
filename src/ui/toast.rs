@@ -119,8 +119,11 @@ impl ToastQueue {
         }
     }
 
-    pub fn prune(&mut self) {
+    /// Returns whether pruning removed the toast shown in the status bar.
+    pub fn prune(&mut self) -> bool {
+        let had_toast = !self.toasts.is_empty();
         self.tick(Instant::now());
+        had_toast && self.toasts.is_empty()
     }
 
     pub fn clear(&mut self) {
@@ -222,6 +225,23 @@ mod tests {
         assert_eq!(queue.current().unwrap().message, "b");
         queue.tick(Instant::now());
         assert_eq!(queue.len(), 2);
+    }
+
+    #[test]
+    fn pruning_requests_redraw_when_visible_toast_expires() {
+        let mut queue = ToastQueue::new();
+        let mut expired = Toast::info("Old toast");
+        expired.ttl = Duration::ZERO;
+        queue.push(expired.clone());
+        queue.info("Visible toast");
+        assert!(!queue.prune());
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.current().unwrap().message, "Visible toast");
+
+        queue.clear();
+        queue.push(expired);
+        assert!(queue.prune());
+        assert!(!queue.prune());
     }
 
     #[test]
