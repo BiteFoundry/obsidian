@@ -14,6 +14,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
+pub use super::frontmatter::upsert_frontmatter_in_markdown;
+use super::frontmatter::{closing_delimiter, opening_delimiter, read_properties};
+
 use crate::models::{
     CalloutKind, HeadingEntry, InlineSpan, MarkdownLinkRef, NoteBlock, ParsedNote, TaskEntry,
     WikilinkRef,
@@ -418,185 +421,14 @@ pub fn parse_markdown(rel_path: &str, note_title: &str, raw: &str) -> ParsedNote
 /// Parses YAML frontmatter (`--- ... ---`) at the top of a Markdown file.
 /// Returns `(frontmatter_map, first_body_line_index)`.
 pub fn parse_frontmatter(lines: &[&str]) -> (BTreeMap<String, Value>, usize) {
-    let mut map = BTreeMap::new();
-    if lines.first().map(|l| l.trim()) != Some("---") {
-        return (map, 0);
+    if !lines.first().is_some_and(|line| opening_delimiter(line)) {
+        return (BTreeMap::new(), 0);
     }
-
-    let mut end_idx = None;
-    for (idx, line) in lines.iter().enumerate().skip(1) {
-        let t = line.trim();
-        if t == "---" || t == "..." {
-            end_idx = Some(idx);
-            break;
-        }
-    }
-
-    let Some(end) = end_idx else {
-        return (map, 0);
+    let Some(end) = lines.iter().skip(1).position(|line| closing_delimiter(line)) else {
+        return (BTreeMap::new(), 0);
     };
-
-    let mut current_list_key: Option<String> = None;
-    let mut current_list: Vec<Value> = Vec::new();
-
-    let flush_list = |map: &mut BTreeMap<String, Value>,
-                      key: &mut Option<String>,
-                      list: &mut Vec<Value>| {
-        if let Some(k) = key.take() {
-            map.insert(k, Value::Array(std::mem::take(list)));
-        }
-    };
-
-    for &raw_line in &lines[1..end] {
-        let trimmed = raw_line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-
-        // Continuation YAML list item (`  - item`)
-        if let Some(item_raw) = trimmed.strip_prefix("- ").or_else(|| {
-            if trimmed == "-" {
-                Some("")
-            } else {
-                None
-            }
-        }) {
-            if current_list_key.is_some() {
-                current_list.push(parse_yaml_scalar(item_raw.trim()));
-                continue;
-            }
-        }
-
-        // Key-value pair (`key: value` or `key:`)
-        if let Some((k_raw, v_raw)) = raw_line.split_once(':') {
-            let key = k_raw.trim().trim_matches(['"', '\'']).to_string();
-            if !key.is_empty() {
-                flush_list(&mut map, &mut current_list_key, &mut current_list);
-                let val_str = v_raw.trim();
-                if val_str.is_empty() {
-                    current_list_key = Some(key);
-                } else if val_str.starts_with('[') && val_str.ends_with(']') {
-                    let inner = &val_str[1..val_str.len() - 1];
-                    let items: Vec<Value> = inner
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(parse_yaml_scalar)
-                        .collect();
-                    map.insert(key, Value::Array(items));
-                } else {
-                    map.insert(key, parse_yaml_scalar(val_str));
-                }
-            }
-        }
-    }
-
-    flush_list(&mut map, &mut current_list_key, &mut current_list);
-    (map, end + 1)
-}
-
-fn parse_yaml_scalar(raw: &str) -> Value {
-    let trimmed = raw.trim();
-    if (trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2)
-        || (trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2)
-    {
-        return Value::String(trimmed[1..trimmed.len() - 1].to_string());
-    }
-    match trimmed.to_ascii_lowercase().as_str() {
-        "true" => Value::Bool(true),
-        "false" => Value::Bool(false),
-        "null" | "~" => Value::Null,
-        _ => {
-            if let Ok(i) = trimmed.parse::<i64>() {
-                Value::Number(i.into())
-            } else if let Ok(f) = trimmed.parse::<f64>() {
-                serde_json::Number::from_f64(f)
-                    .map(Value::Number)
-                    .unwrap_or_else(|| Value::String(trimmed.to_string()))
-            } else {
-                Value::String(trimmed.to_string())
-            }
-        }
-    }
-}
-
-/// Cleanly inserts or updates YAML frontmatter keys while preserving existing keys and note body.
-pub fn upsert_frontmatter_in_markdown(raw: &str, updates: &BTreeMap<String, Value>) -> String {
-    let line_ending = if raw.contains("\r\n") { "\r\n" } else { "\n" };
-    let lines: Vec<&str> = raw.lines().collect();
-    let (mut fm, body_start_idx) = parse_frontmatter(&lines);
-
-    for (k, v) in updates {
-        if v.is_null() {
-            fm.remove(k);
-        } else {
-            fm.insert(k.clone(), v.clone());
-        }
-    }
-
-    let body = if body_start_idx <= lines.len() {
-        lines[body_start_idx..].join(line_ending)
-    } else {
-        String::new()
-    };
-
-    if fm.is_empty() {
-        return body;
-    }
-
-    let mut out = String::new();
-    out.push_str("---");
-    out.push_str(line_ending);
-    for (k, v) in &fm {
-        match v {
-            Value::Array(items) => {
-                if items.is_empty() {
-                    out.push_str(&format!("{k}: []{line_ending}"));
-                } else {
-                    let rendered: Vec<String> = items.iter().map(format_yaml_scalar).collect();
-                    out.push_str(&format!("{k}: [{}]{line_ending}", rendered.join(", ")));
-                }
-            }
-            other => {
-                out.push_str(&format!("{k}: {}{line_ending}", format_yaml_scalar(other)));
-            }
-        }
-    }
-    out.push_str("---");
-    out.push_str(line_ending);
-    let body_trimmed = body.trim_start_matches(['\r', '\n']);
-    if !body_trimmed.is_empty() {
-        out.push_str(line_ending);
-        out.push_str(body_trimmed);
-        if !out.ends_with('\n') {
-            out.push_str(line_ending);
-        }
-    }
-    out
-}
-
-fn format_yaml_scalar(v: &Value) -> String {
-    match v {
-        Value::Null => "null".to_string(),
-        Value::Bool(b) => b.to_string(),
-        Value::Number(n) => n.to_string(),
-        Value::String(s) => {
-            if s.is_empty()
-                || s.contains(':')
-                || s.contains('#')
-                || s.contains('[')
-                || s.contains(']')
-                || s.contains(',')
-                || s.starts_with(' ')
-                || s.ends_with(' ')
-            {
-                format!("\"{}\"", s.replace('"', "\\\""))
-            } else {
-                s.clone()
-            }
-        }
-        other => serde_json::to_string(other).unwrap_or_default(),
-    }
+    let yaml = lines[1..=end].join("\n") + "\n";
+    (read_properties(&yaml).unwrap_or_default(), end + 2)
 }
 
 fn extract_string_list(v: &Value) -> Vec<String> {
@@ -1152,7 +984,7 @@ Inline code `#ignore-tag` and `[[ignore-link]]` stay literal.
             "tags".into(),
             Value::Array(vec![Value::String("core".into()), Value::String("rfc".into())]),
         );
-        let updated = upsert_frontmatter_in_markdown(orig, &updates);
+        let updated = upsert_frontmatter_in_markdown(orig, &updates).unwrap();
         assert!(updated.contains("status: published"));
         assert!(updated.contains("tags: [core, rfc]"));
         assert!(updated.contains("# Hello"));

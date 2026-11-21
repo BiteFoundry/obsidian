@@ -1,4 +1,4 @@
-//! Stdio JSON-RPC 2.0 Model Context Protocol (MCP) server (`obsidian mcp`, 18 typed tools).
+//! Stdio JSON-RPC 2.0 Model Context Protocol (MCP) server (`obsidian mcp`, 19 typed tools).
 //!
 //! Tools:
 //! 1.  `list_vaults`
@@ -19,6 +19,7 @@
 //! 16. `toggle_task`
 //! 17. `find_orphans`
 //! 18. `reindex_vault`
+//! 19. `move_note`
 
 use std::{
     collections::BTreeMap,
@@ -213,6 +214,9 @@ impl McpServer {
             "read_note" => {
                 let vault = self.resolve_vault(args)?;
                 let note = req_str(args, "note")?;
+                if args.get("compact").and_then(Value::as_bool) == Some(true) {
+                    return Ok(serde_json::to_value(self.storage.load_note_content(&vault, note)?)?);
+                }
                 let detail = self.storage.load_note_detail(&vault, note)?;
                 Ok(json!({
                     "rel_path": detail.summary.rel_path,
@@ -256,7 +260,9 @@ impl McpServer {
             "append_note" => {
                 let vault = self.resolve_vault(args)?;
                 let note = req_str(args, "note")?;
-                let text = req_str(args, "text")?;
+                let text = args.get("text").and_then(Value::as_str)
+                    .filter(|text| !text.is_empty())
+                    .ok_or_else(|| anyhow!("Missing required string argument 'text'"))?;
                 let rel_path = self.storage.resolve_note_path(&vault.id, note)?;
                 let abs = safe_vault_path(&vault.path, &rel_path)?;
                 append_to_note(&abs, text)?;
@@ -298,6 +304,14 @@ impl McpServer {
                     "rel_path": rel_path,
                     "trash_path": trashed.to_string_lossy(),
                 }))
+            }
+            "move_note" => {
+                let src = req_str(args, "src")?;
+                let dst = req_nonblank_string(args, "dst")?;
+                let vault = self.resolve_vault_unsynced(args)?;
+                self.storage.sync_vault(&vault)?;
+                let moved = self.storage.move_note_with_links(&vault, src, dst)?;
+                Ok(serde_json::to_value(moved)?)
             }
             "daily_note" => {
                 let vault = self.resolve_vault(args)?;
@@ -427,14 +441,17 @@ impl McpServer {
 }
 
 fn req_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
+    req_nonblank_string(args, key).map(str::trim)
+}
+
+fn req_nonblank_string<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
     args.get(key)
         .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.trim().is_empty())
         .ok_or_else(|| anyhow!("Missing required string argument '{key}'"))
 }
 
-/// Returns the 18 typed MCP tool schemas (100% English descriptions).
+/// Returns the typed MCP tool schemas.
 pub fn tool_definitions() -> Vec<Value> {
     vec![
         tool(
@@ -462,6 +479,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "note": { "type": "string", "description": "Relative path, note title, or alias." },
+                    "compact": { "type": "boolean", "description": "Return only rel_path, title, and raw_markdown (default false)." },
                     "vault": { "type": "string", "description": "Optional vault name, ID, or path." }
                 },
                 "required": ["note"]
@@ -648,6 +666,19 @@ pub fn tool_definitions() -> Vec<Value> {
                 "properties": {
                     "vault": { "type": "string", "description": "Optional vault name, ID, or path." }
                 }
+            }),
+        ),
+        tool(
+            "move_note",
+            "Move or rename a note within its vault and update incoming wikilinks that need a new target.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "src": { "type": "string", "description": "Source note path relative to the vault, title, or alias." },
+                    "dst": { "type": "string", "description": "Destination path relative to the same vault, including the new filename. The .md extension is optional." },
+                    "vault": { "type": "string", "description": "Optional vault name, ID, or path." }
+                },
+                "required": ["src", "dst"]
             }),
         ),
     ]

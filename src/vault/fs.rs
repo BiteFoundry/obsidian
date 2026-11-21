@@ -802,8 +802,14 @@ pub fn update_note_frontmatter(
 ) -> Result<()> {
     let raw = fs::read_to_string(abs_path)
         .with_context(|| format!("Failed to read note: {}", abs_path.display()))?;
-    let updated = upsert_frontmatter_in_markdown(&raw, updates);
-    write_atomic(abs_path, updated.as_bytes())
+    let updated = upsert_frontmatter_in_markdown(&raw, updates)?;
+    if updated != raw {
+        if fs::read(abs_path)? != raw.as_bytes() {
+            bail!("Note changed while updating frontmatter: {}", abs_path.display());
+        }
+        write_atomic(abs_path, updated.as_bytes())?;
+    }
+    Ok(())
 }
 
 /// Moves a note to `<vault>/.trash/` (never permanently unlinking user notes).
@@ -848,9 +854,24 @@ pub fn move_note(vault_root: &Path, src_rel: &str, dst_rel: &str) -> Result<Stri
             dst_rel.replace('\\', "/").trim_start_matches('/')
         )
     };
+    if cfg!(windows) && normalized_dst.contains(':') {
+        bail!("Destination must be a path within the vault: {dst_rel}");
+    }
     let dst = safe_vault_path(vault_root, &normalized_dst)?;
-    if dst.exists() {
-        bail!("Destination note already exists: {normalized_dst}");
+    match fs::symlink_metadata(&dst) {
+        Ok(_) => bail!("Destination note already exists: {normalized_dst}"),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err).with_context(|| format!("Cannot inspect {}", dst.display())),
+    }
+    let existing_parent = dst
+        .ancestors()
+        .skip(1)
+        .find(|parent| parent.is_dir())
+        .context("Cannot find the destination's parent directory")?;
+    if !existing_parent.canonicalize()?.starts_with(vault_root.canonicalize()?)
+        || has_symlink_component_in_vault(vault_root, &normalized_dst)
+    {
+        bail!("Destination must be a path within the vault: {dst_rel}");
     }
     ensure_parent(&dst)?;
     fs::rename(&src, &dst)
@@ -948,27 +969,32 @@ fn rewrite_markdown_wikilinks(
     aliases_before: &HashMap<String, Vec<String>>,
     aliases_after: &HashMap<String, Vec<String>>,
 ) -> Option<String> {
-    let line_ending = if raw.contains("\r\n") { "\r\n" } else { "\n" };
-    let had_trailing_newline = raw.ends_with('\n');
-    let mut out_lines = Vec::new();
+    let mut out = String::with_capacity(raw.len());
     let mut changed = false;
     let mut in_fence: Option<(char, usize)> = None;
 
-    for line in raw.lines() {
+    for raw_line in raw.split_inclusive('\n') {
+        let (line, ending) = if let Some(line) = raw_line.strip_suffix("\r\n") {
+            (line, "\r\n")
+        } else if let Some(line) = raw_line.strip_suffix('\n') {
+            (line, "\n")
+        } else {
+            (raw_line, "")
+        };
         let trimmed = line.trim();
         if let Some((fc, flen)) = in_fence {
             let close_len = trimmed.chars().take_while(|&c| c == fc).count();
             if close_len >= flen && trimmed[close_len..].trim().is_empty() {
                 in_fence = None;
             }
-            out_lines.push(line.to_string());
+            out.push_str(raw_line);
             continue;
         }
         if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
             let fc = trimmed.chars().next().unwrap_or('`');
             let flen = trimmed.chars().take_while(|&c| c == fc).count();
             in_fence = Some((fc, flen));
-            out_lines.push(line.to_string());
+            out.push_str(raw_line);
             continue;
         }
 
@@ -982,20 +1008,12 @@ fn rewrite_markdown_wikilinks(
             aliases_before,
             aliases_after,
         );
-        if line_changed {
-            changed = true;
-        }
-        out_lines.push(new_line);
+        changed |= line_changed;
+        out.push_str(&new_line);
+        out.push_str(ending);
     }
 
-    if !changed {
-        return None;
-    }
-    let mut out = out_lines.join(line_ending);
-    if had_trailing_newline {
-        out.push_str(line_ending);
-    }
-    Some(out)
+    changed.then_some(out)
 }
 
 #[allow(clippy::too_many_arguments)]

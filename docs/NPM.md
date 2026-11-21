@@ -18,7 +18,7 @@
 
 - **Linux**: Built with `cargo-zigbuild` targeting `GLIBC 2.28` and verified in CI via `node scripts/verify-glibc.mjs --max 2.28` + AlmaLinux 8 container smoke test.
 - **macOS**: Built with `MACOSX_DEPLOYMENT_TARGET=11.0` (Big Sur and newer).
-- **Zero-Auth, Zero-Native-Keyring**: 100% pure Rust + bundled SQLite — no `libsecret` or system DBus runtime dependencies.
+- **Local vault access**: SQLite and the YAML parser are bundled with the binary. Local vaults require no cloud sign-in, `libsecret`, or system DBus.
 
 ## Maintenance Scripts
 
@@ -26,4 +26,22 @@
 node scripts/sync-version.mjs --check     # Verify Cargo.toml + all 7 package.json versions match
 node scripts/verify-glibc.mjs --self-test # Run ELF GLIBC parser self-tests
 node scripts/build-npm.mjs --all          # Stage release binaries into npm/obsidian-*/bin
+```
+
+## Checklist smoke test
+
+Run the unpacked package's launcher against a temporary vault. Both commands should exit successfully and write the checklist text to the corresponding Markdown file.
+
+```bash
+scratch="$(mktemp -d)"
+export OBSIDIAN_CONFIG_DIR="$scratch/config"
+export OBSIDIAN_DATA_DIR="$scratch/data"
+export OBSIDIAN_APP_CONFIG_PATH="$scratch/obsidian.json"
+export OBSIDIAN_AUTO_DAEMON=0
+printf '%s\n' '{"vaults":{}}' > "$OBSIDIAN_APP_CONFIG_PATH"
+vault="$scratch/vault"
+obsidian init "$vault"
+obsidian --vault "$vault" notes create "Release Review"
+obsidian --vault "$vault" notes append "Release Review" -- "- [ ] Ship v0.1.0"
+obsidian --vault "$vault" daily "--append=- [ ] Review PRs"
 ```

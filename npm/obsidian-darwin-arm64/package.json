@@ -1,6 +1,6 @@
 {
   "name": "@bitefoundry/obsidian-darwin-arm64",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Prebuilt obsidian binary for macOS arm64",
   "repository": {
     "type": "git",

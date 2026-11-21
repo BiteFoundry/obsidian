@@ -1,5 +1,6 @@
 //! Zero-auth local Obsidian vault discovery, multi-vault registry, and starter vault scaffolding.
 
+mod frontmatter;
 pub mod fs;
 pub mod parser;
 

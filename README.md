@@ -6,12 +6,12 @@
 
 [![npm version](https://img.shields.io/npm/v/%40bitefoundry%2Fobsidian?style=flat-square&color=7C3AED)](https://www.npmjs.com/package/@bitefoundry/obsidian)
 [![platforms](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-24292F?style=flat-square)](docs/NPM.md)
-[![Rust & Ratatui](https://img.shields.io/badge/built%20with-Rust%20%2B%20Ratatui-DEA584?style=flat-square&logo=rust)](Cargo.toml)
+[![Rust & Ratatui](https://img.shields.io/badge/built%20with-Rust%20%2B%20Ratatui-DEA584?style=flat-square&logo=rust)](https://github.com/BiteFoundry/obsidian/blob/master/Cargo.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-00875A?style=flat-square)](package.json)
 
 <br />
 
-![Obsidian TUI Demo](assets/demo.gif)
+![Obsidian TUI Demo](https://raw.githubusercontent.com/BiteFoundry/obsidian/master/assets/demo.gif)
 
 </div>
 
@@ -24,7 +24,7 @@
 | **Zero-Auth Native Vault Discovery** | Automatically discovers every local Obsidian vault from `%APPDATA%\obsidian\obsidian.json` (Windows), `~/Library/Application Support/obsidian/obsidian.json` (macOS), or `~/.config/obsidian/obsidian.json` (Linux) — 100% local-first Markdown files on disk, zero API keys or cloud auth required. |
 | **Obsidian-Native 3-Pane TUI** | Signature Obsidian purple (`#a78bfa` / `#7c3aed`) Minimal-Chrome workspace (`obsidian` / `obs`): collapsible **5-Tab Left Sidebar (`[`)** (`1 Files · 2 Tags · 3 Bookmarks · 4 Outline · 5 Tasks`), **Live Note Canvas** with YAML Frontmatter pills, `#tag` chips, semantic Callout cards, interactive `- [ ]` checkboxes (`Space`/`x` updates the `.md` file atomically), clickable `[[wikilinks]]`, inline HD `![[image.png]]` previews (`v`), **Right Backlinks & Outgoing Inspector (`B`)**, **Quick Switcher (`Ctrl+O`)**, **Daily Notes (`D`)**, and **5 curated palettes** (`Obsidian Dark`, `Catppuccin Mocha`, `Tokyo Night`, `Nord`, `Warm Paper`). |
 | **Interactive Knowledge Graph (`G`)** | Force-directed & radial **Braille Canvas Knowledge Graph** rendered right inside the terminal: purple focal edges, 1-hop / 2-hop / unresolved ghost nodes, Local vs Global scope (`l`), hop depth (`+/-`), node cycling (`j`/`k`/`Tab`), and `Enter` jump-to-note. |
-| **SQLite WAL + FTS5 + 4-in-1 Agent Interface** | Incremental `mtime_ms` + `size_bytes` filesystem scanner powering SQLite WAL + FTS5 search (with automatic `<3`-char Korean/CJK `LIKE` fallback), background watcher IPC daemon (`obsidian daemon`), scriptable `--json` CLI, local **HTTP JSON API** (`obsidian serve`, `:8792`), and **stdio MCP server** (`obsidian mcp`, **18 typed tools** with `confirm: true` `.trash/` safety guard). |
+| **SQLite WAL + FTS5 + 4-in-1 Agent Interface** | Incremental `mtime_ms` + `size_bytes` filesystem scanner powering SQLite WAL + FTS5 search (with automatic `<3`-char Korean/CJK `LIKE` fallback), background watcher IPC daemon (`obsidian daemon`), scriptable `--json` CLI, local **HTTP JSON API** (`obsidian serve`, `:8792`), and **stdio MCP server** (`obsidian mcp`, **19 typed tools** with `confirm: true` `.trash/` safety guard). |
 
 ---
 
@@ -57,7 +57,8 @@ obsidian vaults list
 | `B` | Toggle Right Inspector (**Linked Mentions / Backlinks** & Outgoing Links) | Global |
 | `Space` / `x` | Toggle live `- [ ]` / `- [x]` checkbox surgically in the `.md` file | Canvas / Tasks |
 | `Enter` / `Backspace` / `Alt+←` | Follow `[[wikilink]]` / Navigate back in note history stack | Canvas |
-| `a` / `n` / `e` / `b` | Quick Append · New Note · Open in `$EDITOR` (auto-reindexes) · Bookmark | Global |
+| `a` / `n` / `b` | Quick Append · New Note · Bookmark | Global |
+| `e` / `Ctrl+E` | Edit inline · Open in `$VISUAL` or `$EDITOR` and reindex on success | Note |
 | `u` / `h` / `v` / `y` | Link Extractor · Toggle Inline Hrefs · HD Image Preview · Copy Code/Note | Global |
 | `Ctrl+V` / `Ctrl+F` | Paste clipboard PNG into `Attachments/` · File Picker (`z` zoxide jump) | Global |
 | `Ctrl+S` / `Ctrl+,` / `.` / `?` | Vault Switcher · Settings (5 Palettes) · Context Menu · Keybinding Help | Global |
@@ -80,9 +81,11 @@ obsidian reindex
 obsidian search "Architecture" --json
 obsidian notes list --folder Projects --json
 obsidian notes read "Q4 Architecture RFC"
+obsidian notes read "Q4 Architecture RFC" --json --compact
 obsidian notes create "Sprint Retro" --folder Notes --tags "retro,q4"
-obsidian notes append "Q4 Architecture RFC" "- [ ] Ship v0.1.0"
-obsidian daily --append "- [ ] Review PRs"
+obsidian notes append "Q4 Architecture RFC" -- "- [ ] Ship v0.1.0"
+obs notes move "Q4 Architecture RFC" "Archive/Q4 Architecture RFC" --json
+obsidian daily "--append=- [ ] Review PRs"
 obsidian tasks --open --json
 obsidian toggle-task "Q4 Architecture RFC" 14
 
@@ -98,6 +101,8 @@ obsidian daemon start
 obsidian doctor --json
 ```
 
+`notes read` prints raw Markdown. With `--json --compact`, it returns `rel_path`, `title`, and `raw_markdown`. Use `notes edit <NOTE>` for arbitrary body edits in your editor. The npm package provides `obsidian` and `obs` for the same CLI and MCP commands. Use `obs` when the desktop application's CLI is also registered on your PATH. [Obsidian CLI setup](https://obsidian.md/help/cli)
+
 ### Local HTTP JSON API (`obsidian serve`)
 
 ```bash
@@ -108,7 +113,7 @@ curl -H "Authorization: Bearer $API_TOKEN" "http://127.0.0.1:8792/api/v1/graph?n
 
 Full endpoint catalog and OpenAPI schema: **[docs/API.md](docs/API.md)** · **[docs/openapi.yaml](docs/openapi.yaml)**.
 
-### MCP Server (`obsidian mcp` — 18 Tools)
+### MCP Server (`obsidian mcp` / `obs mcp` — 19 Tools)
 
 ```json
 {
@@ -123,6 +128,8 @@ Full endpoint catalog and OpenAPI schema: **[docs/API.md](docs/API.md)** · **[d
 
 Full tool catalog and argument schemas: **[docs/MCP.md](docs/MCP.md)** · npm packaging details: **[docs/NPM.md](docs/NPM.md)**.
 
+`move_note` renames or moves a note within a vault and updates incoming wikilinks that need a new target. Use `append_note`, `toggle_task`, and `update_frontmatter` for edits to Markdown, checkboxes, and properties. [Editing surfaces and move examples](docs/MCP.md#read-and-edit-notes)
+
 ---
 
 ## `@bitefoundry` Enterprise Terminal Suite
@@ -130,9 +137,9 @@ Full tool catalog and argument schemas: **[docs/MCP.md](docs/MCP.md)** · npm pa
 | Package | Commands | Workspace | Interfaces |
 | :--- | :--- | :--- | :--- |
 | [`@bitefoundry/teams`](https://www.npmjs.com/package/@bitefoundry/teams) | `teams` | Microsoft Teams (Chats, Channels, Meetings & Threads) | TUI · CLI · HTTP · MCP |
-| [`@bitefoundry/outlook`](https://www.npmjs.com/package/@bitefoundry/outlook) | `outlook`, `ol` | Microsoft Outlook (Mail, Calendar & Contacts) | TUI · CLI · HTTP · MCP |
-| [`@bitefoundry/onenote`](https://www.npmjs.com/package/@bitefoundry/onenote) | `onenote`, `on` | Microsoft OneNote (Notebooks, Sections & Pages) | TUI · CLI · HTTP · MCP |
-| [`@bitefoundry/sharepoint`](https://www.npmjs.com/package/@bitefoundry/sharepoint) | `sharepoint`, `sp` | Microsoft SharePoint & OneDrive (Sites, Libraries & Lists) | TUI · CLI · HTTP · MCP |
+| [`@bitefoundry/outlook`](https://www.npmjs.com/package/@bitefoundry/outlook) | `outlook` | Microsoft Outlook (Mail, Calendar & Contacts) | TUI · CLI · HTTP · MCP |
+| [`@bitefoundry/onenote`](https://www.npmjs.com/package/@bitefoundry/onenote) | `onenote`, `note` | Microsoft OneNote (Notebooks, Sections & Pages) | TUI · CLI · HTTP · MCP |
+| [`@bitefoundry/sharepoint`](https://www.npmjs.com/package/@bitefoundry/sharepoint) | `sharepoint`, `sp`, `onedrive`, `od` | Microsoft SharePoint & OneDrive (Sites, Libraries & Lists) | TUI · CLI · HTTP · MCP |
 | [`@bitefoundry/atlassian`](https://www.npmjs.com/package/@bitefoundry/atlassian) | `atlassian`, `jira`, `confluence`, `conf` | Atlassian Jira (Kanban, Sprints, JQL) & Confluence Wiki | TUI · CLI · HTTP · MCP |
 | [`@bitefoundry/notion`](https://www.npmjs.com/package/@bitefoundry/notion) | `notion`, `nt` | Notion (Editorial Pages, Interactive Blocks & Databases) | TUI · CLI · HTTP · MCP |
 | **`@bitefoundry/obsidian`** | `obsidian`, `obs` | Obsidian (Local Vaults, Backlinks & Interactive Knowledge Graph) | TUI · CLI · HTTP · MCP |

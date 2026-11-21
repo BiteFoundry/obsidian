@@ -17,8 +17,8 @@ use crate::{
     updater,
     vault::{
         fs::{
-            append_to_note, create_note, ensure_daily_note, move_note, move_note_to_trash,
-            rewrite_wikilinks_for_move, safe_vault_path, toggle_task_at_line_verified,
+            append_to_note, create_note, ensure_daily_note, move_note_to_trash, safe_vault_path,
+            toggle_task_at_line_verified,
         },
         init_starter_vault, merged_vaults, native_obsidian_config_path, resolve_active_vault,
         vault_from_dir,
@@ -143,7 +143,7 @@ pub enum Commands {
         #[arg(long)]
         token: Option<String>,
     },
-    /// Start the stdio JSON-RPC 2.0 MCP server (18 typed tools).
+    /// Start the stdio JSON-RPC 2.0 MCP server (19 typed tools).
     Mcp,
     /// Inspect environment, auto-discovered Obsidian vaults, SQLite index, and terminal capabilities.
     Doctor,
@@ -179,8 +179,13 @@ pub enum NotesCmd {
         #[arg(long)]
         folder: Option<String>,
     },
-    /// Read a note's Markdown content and metadata.
-    Read { note: String },
+    /// Read raw Markdown, or add --json for metadata.
+    Read {
+        note: String,
+        /// With --json, return only the relative path, title, and raw Markdown.
+        #[arg(long, requires = "json")]
+        compact: bool,
+    },
     /// Create a new note atomically.
     Create {
         title: String,
@@ -193,7 +198,7 @@ pub enum NotesCmd {
     },
     /// Append text/task/callout to an existing note.
     Append { note: String, text: String },
-    /// Open a note in `$EDITOR` and reindex on exit.
+    /// Open a note in `$VISUAL` or `$EDITOR` and reindex after a successful exit.
     Edit { note: String },
     /// Move/rename a note within the vault.
     Move { src: String, dst: String },
@@ -407,12 +412,15 @@ pub async fn run(cli: Cli) -> Result<()> {
                     }
                     Ok(())
                 }
-                NotesCmd::Read { note } => {
-                    let detail = storage.load_note_detail(&vault, &note)?;
-                    if cli.json {
+                NotesCmd::Read { note, compact } => {
+                    if compact {
+                        let content = storage.load_note_content(&vault, &note)?;
+                        println!("{}", serde_json::to_string_pretty(&content)?);
+                    } else if cli.json {
+                        let detail = storage.load_note_detail(&vault, &note)?;
                         println!("{}", serde_json::to_string_pretty(&detail)?);
                     } else {
-                        print!("{}", detail.raw_markdown);
+                        print!("{}", storage.load_note_content(&vault, &note)?.raw_markdown);
                     }
                     Ok(())
                 }
@@ -468,39 +476,14 @@ pub async fn run(cli: Cli) -> Result<()> {
                     Ok(())
                 }
                 NotesCmd::Move { src, dst } => {
-                    let src_rel = storage.resolve_note_path(&vault.id, &src)?;
-                    let was_bookmarked = storage
-                        .get_note_summary(&vault.id, &src_rel)?
-                        .map(|s| s.is_bookmarked)
-                        .unwrap_or(false);
-                    let (all_paths_before, aliases_before) =
-                        storage.all_paths_and_aliases(&vault.id)?;
-                    let new_rel = move_note(&vault.path, &src_rel, &dst)?;
-                    let updated_links_in_notes = rewrite_wikilinks_for_move(
-                        &vault.path,
-                        &src_rel,
-                        &new_rel,
-                        &all_paths_before,
-                        &aliases_before,
-                    )?;
-                    storage.sync_vault(&vault)?;
-                    if was_bookmarked {
-                        let _ = storage.set_bookmark(&vault.id, &new_rel, true);
-                    }
+                    let moved = storage.move_note_with_links(&vault, &src, &dst)?;
                     if cli.json {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&json!({
-                                "moved": true,
-                                "from": src_rel,
-                                "to": new_rel,
-                                "updated_links_in_notes": updated_links_in_notes,
-                                "bookmark_preserved": was_bookmarked,
-                            }))?
-                        );
+                        let payload = serde_json::to_value(&moved)?;
+                        println!("{}", serde_json::to_string_pretty(&payload)?);
                     } else {
                         println!(
-                            "Moved {src_rel} -> {new_rel} (updated links in {updated_links_in_notes} note(s))"
+                            "Moved {} -> {} (updated links in {} note(s))",
+                            moved.from, moved.to, moved.updated_links_in_notes
                         );
                     }
                     Ok(())

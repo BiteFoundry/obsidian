@@ -337,6 +337,24 @@ pub struct NoteDetail {
     pub images: Vec<NoteImageRef>,
 }
 
+/// Compact read result shared by CLI and MCP.
+#[derive(Debug, Clone, Serialize)]
+pub struct NoteContent {
+    pub rel_path: String,
+    pub title: String,
+    pub raw_markdown: String,
+}
+
+/// Result of moving a note through the CLI or MCP.
+#[derive(Debug, Serialize)]
+pub struct NoteMove {
+    pub moved: bool,
+    pub from: String,
+    pub to: String,
+    pub updated_links_in_notes: usize,
+    pub bookmark_preserved: bool,
+}
+
 /// Resolved local image embedded in a note (`![[img.png]]` or `![alt](img.png)`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NoteImageRef {

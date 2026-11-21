@@ -23,7 +23,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::{
     ui::{
         action::Action,
-        composer::{normalize, text_layout, truncate_display, MultiLineComposer},
+        composer::{text_layout, truncate_display, MultiLineComposer},
         hitmap::{ButtonId, HitMap, HitTarget},
         theme::Theme,
     },
@@ -58,7 +58,6 @@ pub enum InlineEditEvent {
 pub struct InlineNoteEditor {
     pub note_path: String,
     pub note_title: String,
-    pub original_crlf: bool,
     pub base_content_hash: [u8; 32],
     pub external_conflict: Option<ExternalConflict>,
     pub composer: MultiLineComposer,
@@ -96,17 +95,14 @@ impl InlineNoteEditor {
         base_content_hash: [u8; 32],
         initial_scroll_y: u16,
     ) -> Self {
-        let original_crlf = raw_markdown.contains("\r\n");
-        let normalized = normalize(raw_markdown);
         let mut composer = MultiLineComposer::new();
-        composer.load_text_cursor_start(&normalized);
+        composer.load_text_preserving_line_endings(raw_markdown);
         if initial_scroll_y > 0 {
             composer.set_cursor_line(initial_scroll_y as usize);
         }
         Self {
             note_path: note_path.into(),
             note_title: note_title.into(),
-            original_crlf,
             base_content_hash,
             external_conflict: None,
             composer,
@@ -125,11 +121,9 @@ impl InlineNoteEditor {
     pub fn reload_from_disk(&mut self, raw_markdown: &str, disk_hash: [u8; 32]) {
         let (prev_line, _) = self.cursor_line_col();
         let prev_scroll = self.scroll_y;
-        self.original_crlf = raw_markdown.contains("\r\n");
         self.base_content_hash = disk_hash;
         self.external_conflict = None;
-        let normalized = normalize(raw_markdown);
-        self.composer.load_text_cursor_start(&normalized);
+        self.composer.load_text_preserving_line_endings(raw_markdown);
         if prev_line > 1 {
             self.composer.set_cursor_line(prev_line - 1);
         }
@@ -181,13 +175,9 @@ impl InlineNoteEditor {
                 .is_some_and(|t| t.elapsed() >= Duration::from_millis(INLINE_AUTOSAVE_DEBOUNCE_MS))
     }
 
-    /// Serializes the editor buffer back to disk format, preserving CRLF if the original file used CRLF.
+    /// Serializes the edited buffer with its per-line endings.
     pub fn disk_markdown(&self) -> String {
-        if self.original_crlf {
-            self.composer.text().replace('\n', "\r\n")
-        } else {
-            self.composer.text().to_string()
-        }
+        self.composer.text_with_line_endings()
     }
 
     pub fn cursor_line_col(&self) -> (usize, usize) {
@@ -949,7 +939,6 @@ mod tests {
             "# 제목\r\n\r\n기존 내용",
             0,
         );
-        assert!(ed.original_crlf);
         assert!(!ed.dirty);
         assert_eq!(ed.save_status, InlineSaveStatus::Saved);
         assert_eq!(ed.cursor_line_col(), (1, 1));
@@ -993,6 +982,23 @@ mod tests {
         assert!(!ed.dirty);
         assert!(ed.dirty_since.is_none());
         assert_eq!(ed.save_status, InlineSaveStatus::Saved);
+    }
+
+    #[test]
+    fn mixed_line_endings_survive_text_edits_and_undo() {
+        let raw = "# One\r\nTwo\nThree\r\nFour";
+        let mut editor = InlineNoteEditor::new("Test.md", "Test", raw, 0);
+        editor.handle_edit_action(&Action::Input('!'));
+        assert_eq!(editor.disk_markdown(), format!("!{raw}"));
+        editor.composer.set_cursor_line(2);
+        editor.handle_edit_action(&Action::Backspace);
+        assert_eq!(editor.disk_markdown(), "!# One\r\nTwoThree\r\nFour");
+        editor.handle_edit_action(&Action::Undo);
+        assert_eq!(editor.disk_markdown(), format!("!{raw}"));
+        editor.handle_edit_action(&Action::Redo);
+        assert_eq!(editor.disk_markdown(), "!# One\r\nTwoThree\r\nFour");
+        editor.handle_edit_action(&Action::Newline);
+        assert_eq!(editor.disk_markdown(), "!# One\r\nTwo\r\nThree\r\nFour");
     }
 
     #[test]

@@ -21,13 +21,14 @@ use crate::{
     config::{ensure_parent, VaultProfile},
     models::{
         BacklinkEntry, GraphData, GraphEdge, GraphNode, HeadingEntry, IndexStats, NoteDetail,
-        NoteSummary, OutgoingLinkEntry, ParsedNote, SearchHit, TagCount, TaskEntry, TaskFilter,
+        NoteContent, NoteMove, NoteSummary, OutgoingLinkEntry, ParsedNote, SearchHit, TagCount,
+        TaskEntry, TaskFilter,
     },
     vault::{
         fs::{
             canonical_rel_path_in_vault, content_sha256_hex, file_mtime_ns_and_size,
-            folder_from_rel_path, has_symlink_component_in_vault, hydrate_parsed_note_links,
-            resolve_note_identifier, resolve_wikilink_target, safe_vault_path,
+            folder_from_rel_path, has_symlink_component_in_vault, hydrate_parsed_note_links, move_note,
+            resolve_note_identifier, resolve_wikilink_target, rewrite_wikilinks_for_move, safe_vault_path,
             scan_vault_markdown_files, title_from_rel_path,
         },
         parser::parse_markdown,
@@ -72,7 +73,7 @@ impl Storage {
     }
 
     fn init_schema(&self) -> Result<()> {
-        let conn = self.conn.lock().map_err(|_| anyhow!("Storage lock poisoned"))?;
+        let mut conn = self.conn.lock().map_err(|_| anyhow!("Storage lock poisoned"))?;
         conn.execute_batch(
             "
             PRAGMA journal_mode = WAL;
@@ -161,6 +162,15 @@ impl Storage {
             "ALTER TABLE notes ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''",
             [],
         );
+        // Row metadata produced by the old frontmatter parser needs one rescan.
+        if conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))? == 0 {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if tx.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))? == 0 {
+                tx.execute("UPDATE notes SET mtime_ms = -1, mtime_ns = -1, content_hash = ''", [])?;
+                tx.pragma_update(None, "user_version", 1)?;
+            }
+            tx.commit()?;
+        }
         Ok(())
     }
 
@@ -927,6 +937,34 @@ impl Storage {
         resolve_note_identifier(note_ref, &all_paths, &aliases_map)
     }
 
+    /// Move a note in an indexed vault and refresh its backlinks and bookmark.
+    pub fn move_note_with_links(
+        &self,
+        vault: &VaultProfile,
+        src: &str,
+        dst: &str,
+    ) -> Result<NoteMove> {
+        let (paths, aliases) = self.all_paths_and_aliases(&vault.id)?;
+        let from = resolve_note_identifier(src, &paths, &aliases)?;
+        let was_bookmarked = self
+            .get_note_summary(&vault.id, &from)?
+            .is_some_and(|summary| summary.is_bookmarked);
+        let to = move_note(&vault.path, &from, dst)?;
+        let updated_links_in_notes =
+            rewrite_wikilinks_for_move(&vault.path, &from, &to, &paths, &aliases)?;
+        self.sync_vault(vault)?;
+        if was_bookmarked {
+            self.set_bookmark(&vault.id, &to, true)?;
+        }
+        Ok(NoteMove {
+            moved: true,
+            from,
+            to,
+            updated_links_in_notes,
+            bookmark_preserved: was_bookmarked,
+        })
+    }
+
     pub fn all_paths_and_aliases(
         &self,
         vault_id: &str,
@@ -950,14 +988,22 @@ impl Storage {
         Ok((paths, aliases_map))
     }
 
-    /// Loads complete `NoteDetail` from disk + SQLite index (with resolved wikilinks, images, backlinks, outgoing links).
-    pub fn load_note_detail(&self, vault: &VaultProfile, note_ref: &str) -> Result<NoteDetail> {
+    /// Resolves the note and reads its Markdown without constructing the detail view.
+    pub fn load_note_content(&self, vault: &VaultProfile, note_ref: &str) -> Result<NoteContent> {
         let rel_path = self.resolve_note_path(&vault.id, note_ref)?;
         let abs_path = safe_vault_path(&vault.path, &rel_path)?;
         let raw_bytes = fs::read(&abs_path)
             .with_context(|| format!("Failed to read note: {}", abs_path.display()))?;
-        let raw_markdown = decode_utf8_lossy(raw_bytes);
-        let title = title_from_rel_path(&rel_path);
+        Ok(NoteContent {
+            title: title_from_rel_path(&rel_path),
+            rel_path,
+            raw_markdown: decode_utf8_lossy(raw_bytes),
+        })
+    }
+
+    /// Loads complete `NoteDetail` from disk + SQLite index (with resolved wikilinks, images, backlinks, outgoing links).
+    pub fn load_note_detail(&self, vault: &VaultProfile, note_ref: &str) -> Result<NoteDetail> {
+        let NoteContent { rel_path, title, raw_markdown } = self.load_note_content(vault, note_ref)?;
         let mut parsed = parse_markdown(&rel_path, &title, &raw_markdown);
 
         let (all_paths, aliases_map) = self.all_paths_and_aliases(&vault.id)?;

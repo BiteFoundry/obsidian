@@ -6,7 +6,6 @@ use std::{
     borrow::Cow,
     io::{self, Stdout, Write},
     path::Path,
-    process::Command,
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
@@ -652,9 +651,8 @@ pub async fn run_tui(
             let edit_res = launch_external_editor(&edit_path);
             terminal = guard.resume_after_editor()?;
             reader = EventStream::new();
-            match edit_res {
-                Ok(()) => {
-                    let _ = app.storage.sync_vault(&app.active_vault);
+            match edit_res.and_then(|()| app.storage.sync_vault(&app.active_vault)) {
+                Ok(_) => {
                     app.reload_from_storage(&mut ui);
                     ui.toasts.success("Reloaded note after external edit");
                 }
@@ -721,26 +719,18 @@ pub async fn run_tui(
 }
 
 pub fn launch_external_editor(path: &Path) -> Result<()> {
-    let editor = std::env::var("VISUAL")
-        .or_else(|_| std::env::var("EDITOR"))
-        .unwrap_or_else(|_| {
+    let editor = ["VISUAL", "EDITOR"]
+        .into_iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .find(|command| !command.trim().is_empty())
+        .unwrap_or_else(|| {
             if cfg!(windows) {
                 "notepad".to_string()
             } else {
                 "vi".to_string()
             }
         });
-    let mut parts = editor.split_whitespace();
-    let prog = parts.next().unwrap_or("vi");
-    let mut cmd = Command::new(prog);
-    for arg in parts {
-        cmd.arg(arg);
-    }
-    cmd.arg(path);
-    let status = cmd.status()?;
-    if !status.success() {
-        anyhow::bail!("Editor exited with status {status}");
-    }
+    ui::composer::run_editor_command(&editor, path)?;
     Ok(())
 }
 

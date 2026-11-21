@@ -4,7 +4,7 @@
 //! - Surgical task checkbox toggle file mutation & `.trash/` safe deletion
 //! - SQLite WAL + FTS5 search + Korean `<3` char `LIKE` fallback
 //! - HTTP API (`:8792` router) across all endpoints
-//! - Stdio MCP JSON-RPC 2.0 server across all 18 typed tools
+//! - Stdio MCP JSON-RPC 2.0 tool discovery and vault operations
 //! - `ratatui::TestBackend` rendering across 3-Pane Workspace, Tags, Daily Note, and Braille Knowledge Graph View!
 
 use std::{fs, sync::Arc};
@@ -339,8 +339,8 @@ async fn test_http_api_8792_endpoints() {
 }
 
 #[test]
-fn test_all_18_mcp_tools_json_rpc() {
-    assert_eq!(tool_definitions().len(), 18);
+fn test_mcp_catalog_and_core_tools_json_rpc() {
+    assert_eq!(tool_definitions().len(), 19);
 
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("McpVault");
@@ -362,13 +362,22 @@ fn test_all_18_mcp_tools_json_rpc() {
     let list = mcp
         .handle_rpc(&json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }))
         .unwrap();
-    assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 18);
+    assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 19);
 
-    // Exercise every single one of the 18 tools
+    // Exercise existing tools. Moving notes has a separate byte-level fixture.
     assert!(mcp.dispatch_tool("list_vaults", &json!({})).is_ok());
     assert!(mcp.dispatch_tool("list_notes", &json!({})).is_ok());
     assert!(mcp.dispatch_tool("search_notes", &json!({ "query": "검색" })).is_ok());
     assert!(mcp.dispatch_tool("read_note", &json!({ "note": "RFC-042" })).is_ok());
+    let compact = mcp
+        .dispatch_tool("read_note", &json!({ "note": "RFC-042", "compact": true }))
+        .unwrap();
+    let path = "Projects/Q4 Architecture RFC.md";
+    let markdown = fs::read_to_string(root.join(path)).unwrap();
+    assert_eq!(
+        compact,
+        json!({ "rel_path": path, "title": "Q4 Architecture RFC", "raw_markdown": markdown })
+    );
     assert!(mcp
         .dispatch_tool(
             "create_note",
@@ -381,6 +390,14 @@ fn test_all_18_mcp_tools_json_rpc() {
             &json!({ "note": "MCP Created", "text": "- [ ] MCP task" })
         )
         .is_ok());
+    mcp.dispatch_tool(
+        "append_note",
+        &json!({ "note": "MCP Created", "text": "    line one\nline two  " }),
+    )
+    .unwrap();
+    assert!(fs::read(root.join("MCP Created.md"))
+        .unwrap()
+        .ends_with(b"    line one\nline two  \n"));
     assert!(mcp
         .dispatch_tool(
             "update_frontmatter",
@@ -425,6 +442,84 @@ fn test_all_18_mcp_tools_json_rpc() {
         .dispatch_tool("delete_note", &json!({ "note": "MCP Created", "confirm": true }))
         .unwrap();
     assert_eq!(del["deleted"], true);
+}
+
+#[test]
+fn mcp_move_note_rewrites_link_targets_and_preserves_other_bytes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("vault");
+    fs::create_dir_all(root.join("Inbox")).unwrap();
+    fs::create_dir_all(root.join("Elsewhere")).unwrap();
+    let original = "---\r\n# metadata\naliases: [Release Alias]\r\nid: '00127'\ntracking: {owner: Ops}\r\n---\r\n\n# Scope\r\nBody ^keep";
+    let incoming = "---\r\nstate: 'draft'\n---\r\n[[Draft#Scope|Read this]]\n![[Draft#^keep|Embed]]\r\n[[Release Alias#Scope|Alias]]\n`[[Draft|Code]]`\r\n```\n[[Draft|Fence]]\r\n```\n[Markdown](Inbox/Draft.md#Scope)";
+    let unrelated = "# Other\r\n[[Elsewhere/Review|Other target]]\n";
+    fs::write(root.join("Inbox/Draft.md"), original).unwrap();
+    fs::write(root.join("Incoming.md"), incoming).unwrap();
+    fs::write(root.join("Elsewhere/Review.md"), unrelated).unwrap();
+
+    let vault = vault_from_dir(&root, Some("fixture"));
+    let mut cfg = AppConfig::default();
+    cfg.upsert_vault(vault.clone(), true);
+    let mcp = McpServer::new(cfg, vault.clone(), Storage::open_in_memory().unwrap());
+    mcp.storage.set_bookmark(&vault.id, "Inbox/Draft.md", true).unwrap();
+    let tools = tool_definitions();
+    let schema = &tools.iter().find(|tool| tool["name"] == "move_note").unwrap()["inputSchema"];
+    assert_eq!(schema["required"], json!(["src", "dst"]));
+    assert_eq!(schema["properties"]["vault"]["type"], "string");
+
+    let call_move = |arguments| {
+        mcp.handle_rpc(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "move_note", "arguments": arguments},
+        }))
+        .unwrap()["result"]
+            .clone()
+    };
+    for arguments in [
+        json!({"src":"Release Alias"}),
+        json!({"src":"Missing","dst":"Archive/Review"}),
+        json!({"src":"Release Alias","dst":"Elsewhere/Review"}),
+        json!({"src":"Release Alias","dst":"../Outside"}),
+    ] {
+        assert_eq!(call_move(arguments)["isError"], true);
+    }
+    #[cfg(windows)]
+    {
+        let outside = tmp.path().join("Outside.md");
+        assert_eq!(
+            call_move(json!({"src":"Release Alias","dst":outside}))["isError"],
+            true
+        );
+        assert!(!outside.exists());
+    }
+    assert!(!tmp.path().join("Outside.md").exists());
+    assert_eq!(fs::read(root.join("Inbox/Draft.md")).unwrap(), original.as_bytes());
+    assert_eq!(fs::read(root.join("Incoming.md")).unwrap(), incoming.as_bytes());
+    assert_eq!(fs::read(root.join("Elsewhere/Review.md")).unwrap(), unrelated.as_bytes());
+
+    let result = call_move(json!({"src":"Release Alias","dst":"Archive/Review","vault":"fixture"}));
+    assert_eq!(result["isError"], false, "{result}");
+    let payload: serde_json::Value =
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        payload,
+        json!({
+            "moved": true, "from": "Inbox/Draft.md", "to": "Archive/Review.md",
+            "updated_links_in_notes": 1, "bookmark_preserved": true
+        })
+    );
+    assert!(!root.join("Inbox/Draft.md").exists());
+    assert_eq!(fs::read(root.join("Archive/Review.md")).unwrap(), original.as_bytes());
+    let expected = incoming
+        .replace("[[Draft#Scope", "[[Archive/Review#Scope")
+        .replace("[[Draft#^keep", "[[Archive/Review#^keep");
+    assert_eq!(fs::read(root.join("Incoming.md")).unwrap(), expected.as_bytes());
+    assert_eq!(fs::read(root.join("Elsewhere/Review.md")).unwrap(), unrelated.as_bytes());
+    assert!(mcp.storage.get_note_summary(&vault.id, "Archive/Review.md").unwrap().unwrap().is_bookmarked);
+    let note = mcp.dispatch_tool("read_note", &json!({"note":"Archive/Review.md"})).unwrap();
+    assert_eq!(note["frontmatter"]["id"], "00127");
+    assert_eq!(note["frontmatter"]["tracking"], json!({"owner":"Ops"}));
+    assert!(note["backlinks"].as_array().unwrap().iter().any(|link| link["source_path"] == "Incoming.md"));
 }
 
 #[test]

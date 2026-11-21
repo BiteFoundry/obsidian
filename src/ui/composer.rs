@@ -28,6 +28,37 @@ struct EditDelta {
     removed: String,
     inserted: String,
     cursor: usize,
+    endings: Option<LineEndingEdit>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LineEnding {
+    Lf,
+    CrLf,
+    Cr,
+}
+
+impl LineEnding {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Lf => "\n",
+            Self::CrLf => "\r\n",
+            Self::Cr => "\r",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LineEndings {
+    default: LineEnding,
+    values: Vec<LineEnding>,
+}
+
+#[derive(Debug, Clone)]
+struct LineEndingEdit {
+    index: usize,
+    removed: Vec<LineEnding>,
+    inserted_count: usize,
 }
 
 /// Alias used by in-terminal Markdown editors (e.g. `InlineNoteEditor`).
@@ -36,6 +67,7 @@ pub type MultiLineComposer = ComposerState;
 #[derive(Debug, Clone)]
 pub struct ComposerState {
     text: String,
+    line_endings: Option<LineEndings>,
     cursor: usize,
     pub pending_images: Vec<InlineImageUpload>,
     pub pending_preview: Option<RenderedTerminalImage>,
@@ -59,6 +91,7 @@ impl Default for ComposerState {
     fn default() -> Self {
         Self {
             text: String::new(),
+            line_endings: None,
             cursor: 0,
             pending_images: Vec::new(),
             pending_preview: None,
@@ -184,18 +217,9 @@ impl ComposerState {
         if self.text.is_empty() && self.pending_images.is_empty() {
             return;
         }
-        let cursor_before = self.cursor;
-        let removed = std::mem::take(&mut self.text);
-        self.cursor = 0;
-        self.anchor = None;
+        self.apply_replace(0..self.text.len(), "", 0);
         self.pending_images.clear();
         self.pending_preview = None;
-        self.record_delta(EditDelta {
-            start: 0,
-            removed,
-            inserted: String::new(),
-            cursor: cursor_before,
-        });
     }
 
     pub fn stage_inline_image(
@@ -235,19 +259,51 @@ impl ComposerState {
     }
 
     pub fn load_text(&mut self, value: &str) {
-        self.text = normalize(value);
+        self.load_text_cursor_start(value);
         self.cursor = self.text.len();
+    }
+
+    pub fn load_text_cursor_start(&mut self, value: &str) {
+        self.text = normalize(value);
+        self.line_endings = None;
+        self.cursor = 0;
         self.anchor = None;
         self.undo.clear();
         self.redo.clear();
     }
 
-    pub fn load_text_cursor_start(&mut self, value: &str) {
-        self.text = normalize(value);
-        self.cursor = 0;
-        self.anchor = None;
-        self.undo.clear();
-        self.redo.clear();
+    pub fn load_text_preserving_line_endings(&mut self, value: &str) {
+        self.load_text_cursor_start(value);
+        let mut bytes = value.bytes().peekable();
+        let mut values = Vec::new();
+        while let Some(byte) = bytes.next() {
+            match byte {
+                b'\r' if bytes.next_if_eq(&b'\n').is_some() => values.push(LineEnding::CrLf),
+                b'\r' => values.push(LineEnding::Cr),
+                b'\n' => values.push(LineEnding::Lf),
+                _ => {}
+            }
+        }
+        let default = if value.contains("\r\n") {
+            LineEnding::CrLf
+        } else {
+            values.first().copied().unwrap_or(LineEnding::Lf)
+        };
+        self.line_endings = Some(LineEndings { default, values });
+    }
+
+    pub fn text_with_line_endings(&self) -> String {
+        let Some(endings) = &self.line_endings else {
+            return self.text.clone();
+        };
+        let mut output = String::with_capacity(self.text.len());
+        let mut lines = self.text.split('\n');
+        output.push_str(lines.next().unwrap_or_default());
+        for (ending, line) in endings.values.iter().zip(lines) {
+            output.push_str(ending.as_str());
+            output.push_str(line);
+        }
+        output
     }
 
     fn insert_at(&mut self, pos: usize, value: &str) {
@@ -269,14 +325,29 @@ impl ComposerState {
         debug_assert!(self.text.get(range.start..range.end).is_some());
         let removed = self.text[range.start..range.end].to_string();
         let cursor_before = self.cursor;
-        self.text.replace_range(range.clone(), inserted);
+        let start = range.start;
+        let endings = self.line_endings.as_mut().and_then(|endings| {
+            let removed_count = removed.matches('\n').count();
+            let inserted_count = inserted.matches('\n').count();
+            if removed_count == inserted_count {
+                return None;
+            }
+            let index = self.text[..start].matches('\n').count();
+            let removed = endings
+                .values
+                .splice(index..index + removed_count, std::iter::repeat_n(endings.default, inserted_count))
+                .collect();
+            Some(LineEndingEdit { index, removed, inserted_count })
+        });
+        self.text.replace_range(range, inserted);
         self.cursor = cursor_after;
         self.anchor = None;
         self.record_delta(EditDelta {
-            start: range.start,
+            start,
             removed,
             inserted: inserted.to_string(),
             cursor: cursor_before,
+            endings,
         });
     }
 
@@ -451,6 +522,9 @@ impl ComposerState {
         );
         let redo_cursor = self.cursor;
         self.text.replace_range(delta.start..end, &delta.removed);
+        if let (Some(endings), Some(edit)) = (&mut self.line_endings, &delta.endings) {
+            endings.values.splice(edit.index..edit.index + edit.inserted_count, edit.removed.iter().copied());
+        }
         self.restore_cursor(delta.cursor);
         delta.cursor = redo_cursor;
         self.redo.push(delta);
@@ -468,6 +542,9 @@ impl ComposerState {
         );
         let undo_cursor = self.cursor;
         self.text.replace_range(delta.start..end, &delta.inserted);
+        if let (Some(endings), Some(edit)) = (&mut self.line_endings, &delta.endings) {
+            endings.values.splice(edit.index..edit.index + edit.removed.len(), std::iter::repeat_n(endings.default, edit.inserted_count));
+        }
         self.restore_cursor(delta.cursor);
         delta.cursor = undo_cursor;
         self.undo.push_back(delta);
@@ -860,20 +937,26 @@ pub fn external_edit(current: &str) -> std::io::Result<String> {
         .filter(|value| !value.is_empty())
         .unwrap_or_else(default_editor);
 
-    let parts = parse_editor_command(&editor);
-    let program = parts.first().map(String::as_str).unwrap_or("vi");
-    let args = parts.get(1..).unwrap_or(&[]);
-
-    let status = Command::new(program).args(args).arg(&path).status();
-
-    let contents = std::fs::read_to_string(&path);
+    let result = run_editor_command(&editor, &path).and_then(|()| std::fs::read_to_string(&path));
     let _ = std::fs::remove_file(&path);
 
-    let _ = status?;
-    Ok(normalize(&contents?).trim_end().to_string())
+    Ok(normalize(&result?).trim_end().to_string())
 }
 
-fn parse_editor_command(raw: &str) -> Vec<String> {
+pub(crate) fn run_editor_command(editor: &str, path: &std::path::Path) -> std::io::Result<()> {
+    let parts = parse_editor_command(editor)?;
+    let (program, args) = parts
+        .split_first()
+        .filter(|(program, _)| !program.is_empty())
+        .ok_or_else(|| std::io::Error::other("Editor command is empty"))?;
+    let status = Command::new(program).args(args).arg(path).status()?;
+    if !status.success() {
+        return Err(std::io::Error::other(format!("Editor exited with status {status}")));
+    }
+    Ok(())
+}
+
+fn parse_editor_command(raw: &str) -> std::io::Result<Vec<String>> {
     let mut args = Vec::new();
     let mut current = String::new();
     let mut quote: Option<char> = None;
@@ -904,10 +987,13 @@ fn parse_editor_command(raw: &str) -> Vec<String> {
             }
         }
     }
+    if quote.is_some() {
+        return Err(std::io::Error::other("Unclosed quote in editor command"));
+    }
     if in_token {
         args.push(current);
     }
-    args
+    Ok(args)
 }
 
 /// Copies plain UTF-8 text to the system clipboard.
@@ -933,6 +1019,16 @@ fn default_editor() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn editor_command_preserves_quoted_program_and_arguments() {
+        let command = r#""C:\Program Files\Editor\editor.exe" --wait 'argument with spaces' """#;
+        assert_eq!(
+            parse_editor_command(command).unwrap(),
+            [r"C:\Program Files\Editor\editor.exe", "--wait", "argument with spaces", ""],
+        );
+        assert!(parse_editor_command(r#"editor "unfinished"#).is_err());
+    }
 
     fn composer_with(text: &str) -> ComposerState {
         let mut composer = ComposerState::new();
@@ -1024,7 +1120,7 @@ mod tests {
         assert!(ccol < 8);
 
         assert_eq!(
-            parse_editor_command(r#""C:\Program Files\Sublime Text\subl.exe" -w"#),
+            parse_editor_command(r#""C:\Program Files\Sublime Text\subl.exe" -w"#).unwrap(),
             vec![r"C:\Program Files\Sublime Text\subl.exe", "-w"]
         );
     }
