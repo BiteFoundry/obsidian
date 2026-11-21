@@ -45,7 +45,7 @@ function resolveBinary() {
   process.exit(1);
 }
 
-export function runObsidianCli(argv = process.argv.slice(2)) {
+function runObsidianCli(argv) {
   const binary = resolveBinary();
   if (process.platform !== 'win32') {
     try {
@@ -70,6 +70,4 @@ export function runObsidianCli(argv = process.argv.slice(2)) {
   process.exit(result.status ?? 0);
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  runObsidianCli();
-}
+runObsidianCli(process.argv.slice(2));

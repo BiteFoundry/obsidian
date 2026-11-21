@@ -48,13 +48,13 @@ bitefoundry-obsidian --vault "$vault" daily "--append=- [ ] Review PRs"
 
 ## Standalone updater transition
 
-Version 0.2.0 includes the original asset names for the updater in 0.1.x. Run `obsidian update` with the old standalone binary to install 0.2.0 at the existing path. Rename the updated executable to `bitefoundry-obsidian` on macOS or Linux, or `bitefoundry-obsidian.exe` on Windows. Use `bitefoundry-obsidian update` for later releases. For npm installs, upgrade with npm.
+Versions 0.2.0 and 0.2.1 include the original asset names for the updater in 0.1.x. While either version is the latest release, run `obsidian update` with the old standalone binary to upgrade at the existing path. Rename the updated executable to `bitefoundry-obsidian` on macOS or Linux, or `bitefoundry-obsidian.exe` on Windows. Use `bitefoundry-obsidian update` for later releases. For npm installs, upgrade with npm.
 
 Change `obsidian notes list` or `obs notes list` in scripts to `bitefoundry-obsidian notes list`. Change `{"command":"obsidian","args":["mcp"]}` or `{"command":"obs","args":["mcp"]}` to `{"command":"bitefoundry-obsidian","args":["mcp"]}` in MCP settings.
 
 ## Keep shared commands in an existing npm prefix
 
-If another program supplies `obsidian` or `obs` inside the same global npm prefix used by 0.1.x, install 0.2.0 in a separate prefix. npm can remove the old filenames during an in-place upgrade before the new install script runs.
+If another program supplies `obsidian` or `obs` inside the same global npm prefix used by 0.1.x, install the new version in a separate prefix. npm can remove the old filenames during an in-place upgrade before the new install script runs.
 
 ```powershell
 $obsidianPrefix = Join-Path $env:LOCALAPPDATA 'BiteFoundry\Obsidian'
