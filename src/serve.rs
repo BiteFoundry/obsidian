@@ -56,7 +56,10 @@ pub fn build_router(state: Arc<ServeState>) -> Router {
         .route("/health", get(handle_health))
         .route("/api/v1/vaults", get(handle_list_vaults))
         .route("/api/v1/search", get(handle_search))
-        .route("/api/v1/notes", get(handle_list_notes).post(handle_create_note))
+        .route(
+            "/api/v1/notes",
+            get(handle_list_notes).post(handle_create_note),
+        )
         .route(
             "/api/v1/notes/append",
             get(handle_read_append_note).post(handle_append_note),
@@ -103,7 +106,7 @@ pub async fn run_http_server(
     Ok(())
 }
 
-fn check_auth(state: &ServeState, headers: &HeaderMap) -> Result<(), Response> {
+fn check_auth(state: &ServeState, headers: &HeaderMap) -> Result<(), Box<Response>> {
     let Some(expected) = state.token.as_deref().filter(|t| !t.trim().is_empty()) else {
         return Ok(());
     };
@@ -115,22 +118,28 @@ fn check_auth(state: &ServeState, headers: &HeaderMap) -> Result<(), Response> {
     if got == Some(expected) {
         Ok(())
     } else {
-        Err(err_resp(StatusCode::UNAUTHORIZED, "Missing or invalid Bearer token"))
+        Err(Box::new(err_resp(
+            StatusCode::UNAUTHORIZED,
+            "Missing or invalid Bearer token",
+        )))
     }
 }
 
 fn resolve_req_vault_unsynced(
     state: &ServeState,
     vault_param: Option<&str>,
-) -> Result<VaultProfile, Response> {
+) -> Result<VaultProfile, Box<Response>> {
     match vault_param.map(str::trim).filter(|s| !s.is_empty()) {
         None => Ok(state.default_vault.clone()),
         Some(spec) => resolve_active_vault(&state.cfg, Some(spec))
-            .map_err(|e| err_resp(StatusCode::NOT_FOUND, &e.to_string())),
+            .map_err(|e| Box::new(err_resp(StatusCode::NOT_FOUND, &e.to_string()))),
     }
 }
 
-fn resolve_req_vault(state: &ServeState, vault_param: Option<&str>) -> Result<VaultProfile, Response> {
+fn resolve_req_vault(
+    state: &ServeState,
+    vault_param: Option<&str>,
+) -> Result<VaultProfile, Box<Response>> {
     let vault = resolve_req_vault_unsynced(state, vault_param)?;
     let _ = state.storage.sync_vault(&vault);
     Ok(vault)
@@ -142,7 +151,10 @@ fn err_resp(status: StatusCode, msg: &str) -> Response {
 
 async fn handle_health(State(state): State<Arc<ServeState>>) -> impl IntoResponse {
     let _ = state.storage.sync_vault(&state.default_vault);
-    let notes = state.storage.note_count(&state.default_vault.id).unwrap_or(0);
+    let notes = state
+        .storage
+        .note_count(&state.default_vault.id)
+        .unwrap_or(0);
     Json(json!({
         "ok": true,
         "service": "obsidian-cli",
@@ -153,12 +165,9 @@ async fn handle_health(State(state): State<Arc<ServeState>>) -> impl IntoRespons
     }))
 }
 
-async fn handle_list_vaults(
-    State(state): State<Arc<ServeState>>,
-    headers: HeaderMap,
-) -> Response {
+async fn handle_list_vaults(State(state): State<Arc<ServeState>>, headers: HeaderMap) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let vaults: Vec<VaultSummary> = merged_vaults(&state.cfg)
         .into_iter()
@@ -197,16 +206,19 @@ async fn handle_search(
     Query(q): Query<SearchQuery>,
 ) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let vault = match resolve_req_vault(&state, q.vault.as_deref()) {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let query = q.q.unwrap_or_default();
     let limit = q.limit.unwrap_or(25).clamp(1, 200);
     match state.storage.search_notes(&vault.id, &query, limit) {
-        Ok(hits) => Json(json!({ "ok": true, "query": query, "count": hits.len(), "results": hits })).into_response(),
+        Ok(hits) => {
+            Json(json!({ "ok": true, "query": query, "count": hits.len(), "results": hits }))
+                .into_response()
+        }
         Err(e) => err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
@@ -223,14 +235,16 @@ async fn handle_list_notes(
     Query(q): Query<ListNotesQuery>,
 ) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let vault = match resolve_req_vault(&state, q.vault.as_deref()) {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     match state.storage.list_notes(&vault.id, q.folder.as_deref()) {
-        Ok(notes) => Json(json!({ "ok": true, "count": notes.len(), "notes": notes })).into_response(),
+        Ok(notes) => {
+            Json(json!({ "ok": true, "count": notes.len(), "notes": notes })).into_response()
+        }
         Err(e) => err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
@@ -264,11 +278,11 @@ fn read_note_response(
     vault_param: Option<&str>,
 ) -> Response {
     if let Err(r) = check_auth(state, headers) {
-        return r;
+        return *r;
     }
     let vault = match resolve_req_vault(state, vault_param) {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     match state.storage.load_note_detail(&vault, note_ref) {
         Ok(detail) => Json(json!({ "ok": true, "note": detail })).into_response(),
@@ -292,11 +306,11 @@ async fn handle_create_note(
     Json(req): Json<CreateNoteReq>,
 ) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let vault = match resolve_req_vault(&state, req.vault.as_deref()) {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     match create_note(
         &vault.path,
@@ -331,11 +345,11 @@ async fn handle_append_note(
     Json(req): Json<AppendNoteReq>,
 ) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let vault = match resolve_req_vault(&state, req.vault.as_deref()) {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let rel_path = match state.storage.resolve_note_path(&vault.id, &req.note) {
         Ok(p) => p,
@@ -365,7 +379,7 @@ async fn handle_daily_note(
     body: Option<Json<DailyReq>>,
 ) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let req = body.map(|b| b.0).unwrap_or(DailyReq {
         date: None,
@@ -374,7 +388,7 @@ async fn handle_daily_note(
     });
     let vault = match resolve_req_vault(&state, req.vault.as_deref()) {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     match ensure_daily_note(&vault, req.date.as_deref()) {
         Ok((rel_path, abs_path, created)) => {
@@ -409,11 +423,11 @@ async fn handle_backlinks(
     Query(q): Query<BacklinksQuery>,
 ) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let vault = match resolve_req_vault(&state, q.vault.as_deref()) {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let rel_path = match state.storage.resolve_note_path(&vault.id, &q.note) {
         Ok(p) => p,
@@ -444,11 +458,11 @@ async fn handle_graph(
     Query(q): Query<GraphQuery>,
 ) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let vault = match resolve_req_vault(&state, q.vault.as_deref()) {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let center = match q.note.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(n) => match state.storage.resolve_note_path(&vault.id, n) {
@@ -476,11 +490,11 @@ async fn handle_tags(
     Query(q): Query<TagsQuery>,
 ) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let vault = match resolve_req_vault(&state, q.vault.as_deref()) {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     if let Some(tag) = q.tag.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         match state.storage.find_by_tag(&vault.id, tag) {
@@ -495,7 +509,9 @@ async fn handle_tags(
         }
     } else {
         match state.storage.list_tags(&vault.id) {
-            Ok(tags) => Json(json!({ "ok": true, "count": tags.len(), "tags": tags })).into_response(),
+            Ok(tags) => {
+                Json(json!({ "ok": true, "count": tags.len(), "tags": tags })).into_response()
+            }
             Err(e) => err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
         }
     }
@@ -514,13 +530,18 @@ async fn handle_tasks(
     Query(q): Query<TasksQuery>,
 ) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let vault = match resolve_req_vault(&state, q.vault.as_deref()) {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
-    let filter = match q.status.as_deref().map(|s| s.to_ascii_lowercase()).as_deref() {
+    let filter = match q
+        .status
+        .as_deref()
+        .map(|s| s.to_ascii_lowercase())
+        .as_deref()
+    {
         Some("open") => TaskFilter::Open,
         Some("done") => TaskFilter::Done,
         _ => TaskFilter::All,
@@ -536,7 +557,9 @@ async fn handle_tasks(
         .storage
         .list_tasks(&vault.id, filter, note_path.as_deref())
     {
-        Ok(tasks) => Json(json!({ "ok": true, "count": tasks.len(), "tasks": tasks })).into_response(),
+        Ok(tasks) => {
+            Json(json!({ "ok": true, "count": tasks.len(), "tasks": tasks })).into_response()
+        }
         Err(e) => err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
@@ -557,11 +580,11 @@ async fn handle_toggle_task(
     Json(req): Json<ToggleTaskReq>,
 ) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let vault = match resolve_req_vault(&state, req.vault.as_deref()) {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     let rel_path = match state.storage.resolve_note_path(&vault.id, &req.note) {
         Ok(p) => p,
@@ -616,7 +639,7 @@ async fn handle_reindex(
     body: Option<Json<Value>>,
 ) -> Response {
     if let Err(r) = check_auth(&state, &headers) {
-        return r;
+        return *r;
     }
     let vault_spec = body
         .as_ref()
@@ -624,7 +647,7 @@ async fn handle_reindex(
         .and_then(|v| v.as_str());
     let vault = match resolve_req_vault_unsynced(&state, vault_spec) {
         Ok(v) => v,
-        Err(r) => return r,
+        Err(r) => return *r,
     };
     match state.storage.reindex_vault(&vault) {
         Ok(stats) => Json(json!({ "ok": true, "stats": stats })).into_response(),

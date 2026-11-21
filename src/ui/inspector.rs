@@ -36,7 +36,10 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
 
     let Some(detail) = app.active_note.as_ref() else {
         frame.render_widget(
-            Paragraph::new(Span::styled("  Select a note to inspect.", theme.muted_style())),
+            Paragraph::new(Span::styled(
+                "  Select a note to inspect.",
+                theme.muted_style(),
+            )),
             inner,
         );
         return;
@@ -69,25 +72,21 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
     let total_bl = detail.backlinks.len();
     let total_ol = detail.outgoing_links.len();
     let total_items = total_bl + total_ol;
-    let sel = ui
-        .inspector_selected
-        .min(total_items.saturating_sub(1));
+    let sel = ui.inspector_selected.min(total_items.saturating_sub(1));
 
     // 1. Linked Mentions (Backlinks)
     let bl_area = chunks[0];
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                format!(" ← Linked Mentions ({total_bl}) "),
-                Style::default()
-                    .fg(if focused && sel < total_bl {
-                        theme.accent
-                    } else {
-                        theme.accent_soft
-                    })
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]))
+        Paragraph::new(Line::from(vec![Span::styled(
+            format!(" ← Linked Mentions ({total_bl}) "),
+            Style::default()
+                .fg(if focused && sel < total_bl {
+                    theme.accent
+                } else {
+                    theme.accent_soft
+                })
+                .add_modifier(Modifier::BOLD),
+        )]))
         .style(Style::default().bg(theme.bg_sidebar)),
         Rect::new(bl_area.x, bl_area.y, bl_area.width, 1),
     );
@@ -95,7 +94,10 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
     if detail.backlinks.is_empty() {
         if bl_area.height > 2 {
             frame.render_widget(
-                Paragraph::new(Span::styled("  No incoming links yet.", theme.muted_style())),
+                Paragraph::new(Span::styled(
+                    "  No incoming links yet.",
+                    theme.muted_style(),
+                )),
                 Rect::new(bl_area.x, bl_area.y + 1, bl_area.width, 1),
             );
         }
@@ -106,7 +108,11 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
                 break;
             }
             let is_sel = focused && sel == idx;
-            let row_bg = if is_sel { theme.bg_selected } else { theme.bg_sidebar };
+            let row_bg = if is_sel {
+                theme.bg_selected
+            } else {
+                theme.bg_sidebar
+            };
             let title_line = Line::from(vec![
                 Span::styled(
                     if is_sel { " ▸ " } else { " ▪ " },
@@ -120,7 +126,10 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
                 ),
             ]);
             let r1 = Rect::new(bl_area.x, y, bl_area.width, 1);
-            frame.render_widget(Paragraph::new(title_line).style(Style::default().bg(row_bg)), r1);
+            frame.render_widget(
+                Paragraph::new(title_line).style(Style::default().bg(row_bg)),
+                r1,
+            );
             hitmap.add(r1, HitTarget::InspectorBacklink(idx));
             y += 1;
 
@@ -143,18 +152,16 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
     // 2. Outgoing Links
     let ol_area = chunks[1];
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                format!(" → Outgoing Links ({total_ol}) "),
-                Style::default()
-                    .fg(if focused && sel >= total_bl {
-                        theme.accent
-                    } else {
-                        theme.accent_soft
-                    })
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]))
+        Paragraph::new(Line::from(vec![Span::styled(
+            format!(" → Outgoing Links ({total_ol}) "),
+            Style::default()
+                .fg(if focused && sel >= total_bl {
+                    theme.accent
+                } else {
+                    theme.accent_soft
+                })
+                .add_modifier(Modifier::BOLD),
+        )]))
         .style(Style::default().bg(theme.bg_sidebar)),
         Rect::new(ol_area.x, ol_area.y, ol_area.width, 1),
     );
@@ -162,19 +169,25 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
     if detail.outgoing_links.is_empty() {
         if ol_area.height > 1 {
             frame.render_widget(
-                Paragraph::new(Span::styled("  No outgoing wikilinks.", theme.muted_style())),
+                Paragraph::new(Span::styled(
+                    "  No outgoing wikilinks.",
+                    theme.muted_style(),
+                )),
                 Rect::new(ol_area.x, ol_area.y + 1, ol_area.width, 1),
             );
         }
     } else {
-        let mut y = ol_area.y + 1;
-        for (idx, ol) in detail.outgoing_links.iter().enumerate() {
-            if y >= ol_area.y + ol_area.height {
-                break;
-            }
+        for (y, (idx, ol)) in (ol_area.y.saturating_add(1)
+            ..ol_area.y.saturating_add(ol_area.height))
+            .zip(detail.outgoing_links.iter().enumerate())
+        {
             let flat_idx = total_bl + idx;
             let is_sel = focused && sel == flat_idx;
-            let row_bg = if is_sel { theme.bg_selected } else { theme.bg_sidebar };
+            let row_bg = if is_sel {
+                theme.bg_selected
+            } else {
+                theme.bg_sidebar
+            };
             let glyph = if ol.resolved { "→" } else { "◌" };
             let style = if ol.resolved {
                 Style::default().fg(theme.fg_primary)
@@ -184,14 +197,17 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
             let line = Line::from(vec![
                 Span::styled(
                     format!(" {glyph} "),
-                    Style::default().fg(if ol.resolved { theme.accent } else { theme.warning }),
+                    Style::default().fg(if ol.resolved {
+                        theme.accent
+                    } else {
+                        theme.warning
+                    }),
                 ),
                 Span::styled(truncate_width(&ol.target_title, w.saturating_sub(5)), style),
             ]);
             let r = Rect::new(ol_area.x, y, ol_area.width, 1);
             frame.render_widget(Paragraph::new(line).style(Style::default().bg(row_bg)), r);
             hitmap.add(r, HitTarget::InspectorOutgoing(idx));
-            y += 1;
         }
     }
 

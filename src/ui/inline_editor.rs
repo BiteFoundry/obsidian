@@ -123,7 +123,8 @@ impl InlineNoteEditor {
         let prev_scroll = self.scroll_y;
         self.base_content_hash = disk_hash;
         self.external_conflict = None;
-        self.composer.load_text_preserving_line_endings(raw_markdown);
+        self.composer
+            .load_text_preserving_line_endings(raw_markdown);
         if prev_line > 1 {
             self.composer.set_cursor_line(prev_line - 1);
         }
@@ -414,12 +415,7 @@ impl InlineNoteEditor {
             let ctx = build_line_context(text);
             for &(start, end) in visual.iter().skip(offset).take(view_h) {
                 lines.push(highlight_visual_slice(
-                    text,
-                    start,
-                    end,
-                    &ctx,
-                    selection,
-                    theme,
+                    text, start, end, &ctx, selection, theme,
                 ));
             }
         }
@@ -427,12 +423,7 @@ impl InlineNoteEditor {
         frame.render_widget(Paragraph::new(lines).style(surface_style), editor_area);
 
         if show_scrollbar {
-            let sb_area = Rect::new(
-                content_area.right().saturating_sub(1),
-                body_y,
-                1,
-                body_h,
-            );
+            let sb_area = Rect::new(content_area.right().saturating_sub(1), body_y, 1, body_h);
             let mut sb_state = ScrollbarState::new(max_scroll.saturating_add(1))
                 .position(offset)
                 .viewport_content_length(view_h);
@@ -458,13 +449,7 @@ impl InlineNoteEditor {
         }
     }
 
-    fn draw_header_bar(
-        &self,
-        frame: &mut Frame,
-        area: Rect,
-        theme: &Theme,
-        hitmap: &mut HitMap,
-    ) {
+    fn draw_header_bar(&self, frame: &mut Frame, area: Rect, theme: &Theme, hitmap: &mut HitMap) {
         let header_bg = theme.bg_header;
         let (status_full, status_short, status_color) = match &self.save_status {
             InlineSaveStatus::Saved => ("✓ Live Saved", "✓ Saved", theme.success),
@@ -670,7 +655,7 @@ fn build_line_context(text: &str) -> Vec<LogicalLineInfo> {
     infos
 }
 
-fn find_logical_line<'a>(ctx: &'a [LogicalLineInfo], byte_pos: usize) -> Option<&'a LogicalLineInfo> {
+fn find_logical_line(ctx: &[LogicalLineInfo], byte_pos: usize) -> Option<&LogicalLineInfo> {
     let idx = ctx
         .partition_point(|info| info.end < byte_pos)
         .min(ctx.len().saturating_sub(1));
@@ -718,7 +703,11 @@ fn highlight_visual_slice(
             }
         }
         LogicalLineKind::CodeFence => {
-            byte_styles.fill(Style::default().fg(theme.code_fg).add_modifier(Modifier::DIM));
+            byte_styles.fill(
+                Style::default()
+                    .fg(theme.code_fg)
+                    .add_modifier(Modifier::DIM),
+            );
         }
         LogicalLineKind::CodeBody => {
             byte_styles.fill(Style::default().fg(theme.code_fg));
@@ -797,21 +786,18 @@ fn style_normal_markdown_line(line: &str, styles: &mut [Style], theme: &Theme) {
     }
 
     // 2. Blockquotes & Obsidian Callouts (`> [!tip] ...`)
-    if rest.starts_with('>') {
+    if let Some(after_gt) = rest.strip_prefix('>') {
         styles[trimmed_start..].fill(theme.quote_style());
         styles[trimmed_start] = Style::default()
             .fg(theme.accent)
             .add_modifier(Modifier::BOLD);
-        let after_gt = &rest[1..];
         let ws = after_gt.len() - after_gt.trim_start().len();
         let after_ws = &after_gt[ws..];
         if after_ws.starts_with("[!") {
             if let Some(close) = after_ws.find(']') {
                 let tag_start = trimmed_start + 1 + ws;
                 let tag_end = (tag_start + close + 1).min(styles.len());
-                let callout_style = Style::default()
-                    .fg(theme.info)
-                    .add_modifier(Modifier::BOLD);
+                let callout_style = Style::default().fg(theme.info).add_modifier(Modifier::BOLD);
                 styles[tag_start..tag_end].fill(callout_style);
             }
         }
@@ -872,7 +858,8 @@ fn apply_inline_highlights(line: &str, start_from: usize, styles: &mut [Style], 
         }
 
         // Wikilinks / embeds: `![[...]]` or `[[...]]`
-        let is_embed = i + 2 < len && bytes[i] == b'!' && bytes[i + 1] == b'[' && bytes[i + 2] == b'[';
+        let is_embed =
+            i + 2 < len && bytes[i] == b'!' && bytes[i + 1] == b'[' && bytes[i + 2] == b'[';
         let is_wiki = i + 1 < len && bytes[i] == b'[' && bytes[i + 1] == b'[';
         if is_embed || is_wiki {
             let open_len = if is_embed { 3 } else { 2 };
@@ -933,12 +920,8 @@ mod tests {
 
     #[test]
     fn test_inline_editor_multiline_korean_utf8_dirty_undo_redo_and_crlf() {
-        let mut ed = InlineNoteEditor::new(
-            "Projects/회의록.md",
-            "회의록",
-            "# 제목\r\n\r\n기존 내용",
-            0,
-        );
+        let mut ed =
+            InlineNoteEditor::new("Projects/회의록.md", "회의록", "# 제목\r\n\r\n기존 내용", 0);
         assert!(!ed.dirty);
         assert_eq!(ed.save_status, InlineSaveStatus::Saved);
         assert_eq!(ed.cursor_line_col(), (1, 1));
@@ -972,9 +955,15 @@ mod tests {
         assert_eq!(ed.disk_markdown(), "# 제목\r\n  한글 편집\r\n\r\n기존 내용");
 
         // Undo & Redo
-        assert_eq!(ed.handle_edit_action(&Action::Undo), InlineEditEvent::TextChanged);
+        assert_eq!(
+            ed.handle_edit_action(&Action::Undo),
+            InlineEditEvent::TextChanged
+        );
         assert_eq!(ed.composer.text(), "# 제목\n  한글 편\n\n기존 내용");
-        assert_eq!(ed.handle_edit_action(&Action::Redo), InlineEditEvent::TextChanged);
+        assert_eq!(
+            ed.handle_edit_action(&Action::Redo),
+            InlineEditEvent::TextChanged
+        );
         assert_eq!(ed.composer.text(), "# 제목\n  한글 편집\n\n기존 내용");
 
         // Mark saved resets dirty flags and status
@@ -1031,7 +1020,10 @@ mod tests {
             })
             .unwrap();
 
-        assert!(cursor.is_some(), "inline editor must expose live terminal cursor");
+        assert!(
+            cursor.is_some(),
+            "inline editor must expose live terminal cursor"
+        );
         let screen = buffer_text(&terminal);
         assert!(screen.contains("✎ EDITING"));
         assert!(screen.contains("✓ Live Saved"));
@@ -1039,9 +1031,15 @@ mod tests {
         assert!(screen.contains("[Ctrl+S Save]"));
         assert!(screen.contains("[Ext $EDITOR]"));
         assert!(screen.contains("Ln 1, Col 1"));
-        assert!(hitmap.region_of(HitTarget::Button(ButtonId::FinishInlineEdit)).is_some());
-        assert!(hitmap.region_of(HitTarget::Button(ButtonId::SaveInlineEdit)).is_some());
-        assert!(hitmap.region_of(HitTarget::Button(ButtonId::EditExternal)).is_some());
+        assert!(hitmap
+            .region_of(HitTarget::Button(ButtonId::FinishInlineEdit))
+            .is_some());
+        assert!(hitmap
+            .region_of(HitTarget::Button(ButtonId::SaveInlineEdit))
+            .is_some());
+        assert!(hitmap
+            .region_of(HitTarget::Button(ButtonId::EditExternal))
+            .is_some());
         assert!(hitmap.region_of(HitTarget::InlineEditorBody).is_some());
 
         // Verify syntax highlighting colored Heading 1 differently from body text

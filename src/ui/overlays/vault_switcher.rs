@@ -70,7 +70,7 @@ impl VaultSwitcherOverlay {
         let theme = &ui.theme;
         let rect = centered_rect(
             area,
-            area.width.saturating_sub(10).min(76).max(40),
+            area.width.saturating_sub(10).clamp(40, 76),
             (app.vaults.len() as u16 + 5).clamp(8, 18),
         );
         frame.render_widget(Clear, rect);
@@ -103,7 +103,9 @@ impl VaultSwitcherOverlay {
             let line = Line::from(vec![
                 Span::styled(
                     if is_sel { " ▸ " } else { "   " },
-                    Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     if is_active { "◆ " } else { "◇ " },
@@ -125,7 +127,10 @@ impl VaultSwitcherOverlay {
                 ),
                 Span::styled(format!("  [{badge}]  "), theme.tag_pill_style()),
                 Span::styled(
-                    truncate_width(&v.path.to_string_lossy(), (inner.width as usize).saturating_sub(42)),
+                    truncate_width(
+                        &v.path.to_string_lossy(),
+                        (inner.width as usize).saturating_sub(42),
+                    ),
                     theme.muted_style(),
                 ),
             ]);

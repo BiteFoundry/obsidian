@@ -51,7 +51,7 @@ pub struct DaemonStatus {
     pub uptime_secs: Option<u64>,
     pub attached_clients: usize,
     pub last_sync_at: Option<String>,
-    pub total_notes: usize,
+    pub total_notes: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -175,7 +175,8 @@ pub async fn start_daemon(vault_override: Option<&str>) -> Result<DaemonStatus> 
         cmd.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
     }
 
-    cmd.spawn().context("Failed to spawn obsidian background daemon")?;
+    cmd.spawn()
+        .context("Failed to spawn obsidian background daemon")?;
 
     let deadline = Instant::now() + STARTUP_WAIT_TIMEOUT;
     while Instant::now() < deadline {
@@ -237,10 +238,7 @@ async fn query_status_at(paths: &DaemonPaths) -> Result<DaemonStatus> {
 }
 
 /// Runs the foreground daemon event loop (invoked by `bitefoundry-obsidian daemon run`).
-pub async fn run_daemon_foreground(
-    cfg: AppConfig,
-    vault_override: Option<String>,
-) -> Result<()> {
+pub async fn run_daemon_foreground(cfg: AppConfig, vault_override: Option<String>) -> Result<()> {
     let paths = DaemonPaths::current();
     ensure_parent(&paths.lock_file)?;
     let _lock = acquire_lock(&paths.lock_file)?;
@@ -277,7 +275,8 @@ pub async fn run_daemon_foreground(
     write_atomic_0600(&paths.state_file, &serde_json::to_vec_pretty(&info)?)?;
 
     let (events_tx, mut events_rx) = mpsc::unbounded_channel::<CoreEvent>();
-    let sync_ctrl = sync::spawn_vault_watcher(vault.clone(), storage.clone(), cfg.watch_poll_ms, events_tx);
+    let sync_ctrl =
+        sync::spawn_vault_watcher(vault.clone(), storage.clone(), cfg.watch_poll_ms, events_tx);
 
     let last_sync = Arc::new(Mutex::new((
         Some(chrono::Utc::now().to_rfc3339()),
@@ -359,10 +358,7 @@ async fn handle_client(
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(info.started_at_unix);
-            let (last_at, total_notes) = last_sync
-                .lock()
-                .map(|g| g.clone())
-                .unwrap_or((None, 0));
+            let (last_at, total_notes) = last_sync.lock().map(|g| g.clone()).unwrap_or((None, 0));
             ServerReply::Status {
                 status: DaemonStatus {
                     running: true,
@@ -375,7 +371,7 @@ async fn handle_client(
                     uptime_secs: Some(now_unix.saturating_sub(info.started_at_unix)),
                     attached_clients: attached.load(Ordering::Relaxed),
                     last_sync_at: last_at,
-                    total_notes,
+                    total_notes: Some(total_notes),
                 },
             }
         }
@@ -396,7 +392,10 @@ async fn handle_client(
     write_reply(&mut write_half, &reply).await
 }
 
-async fn write_reply<W: tokio::io::AsyncWrite + Unpin>(w: &mut W, reply: &ServerReply) -> Result<()> {
+async fn write_reply<W: tokio::io::AsyncWrite + Unpin>(
+    w: &mut W,
+    reply: &ServerReply,
+) -> Result<()> {
     let mut payload = serde_json::to_vec(reply)?;
     payload.push(b'\n');
     w.write_all(&payload).await?;

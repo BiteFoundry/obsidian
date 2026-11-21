@@ -13,9 +13,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use bitefoundry_html::{
-    looks_like_html_bytes, HtmlEffect, HtmlTheme, HtmlViewSession,
-};
+use bitefoundry_html::{looks_like_html_bytes, HtmlEffect, HtmlTheme, HtmlViewSession};
 use ratatui::{
     layout::{Position, Rect},
     style::{Modifier, Style},
@@ -98,9 +96,9 @@ pub fn looks_like_embedded_html(text: &str) -> bool {
         "<a ",
         "<img ",
     ];
-    EXTRA_PREFIXES.iter().any(|prefix| {
-        lower.starts_with(prefix) && trimmed.contains('>')
-    })
+    EXTRA_PREFIXES
+        .iter()
+        .any(|prefix| lower.starts_with(prefix) && trimmed.contains('>'))
 }
 
 /// Reconstructs verbatim raw text for a block in `detail.raw_markdown` when available,
@@ -287,7 +285,7 @@ pub fn html_theme_from_ui(theme: &Theme) -> HtmlTheme {
 
 /// Interactive modal HTML preview overlay backed by `bitefoundry_html::HtmlViewSession`.
 pub struct HtmlPreviewOverlay {
-    pub session: HtmlViewSession,
+    pub session: Box<HtmlViewSession>,
     pub title: String,
     pub source_label: String,
     pub source: HtmlPreviewSource,
@@ -314,11 +312,7 @@ impl fmt::Debug for HtmlPreviewOverlay {
 }
 
 impl HtmlPreviewOverlay {
-    pub fn new(
-        title: impl Into<String>,
-        source_label: impl Into<String>,
-        html: String,
-    ) -> Self {
+    pub fn new(title: impl Into<String>, source_label: impl Into<String>, html: String) -> Self {
         let title_str = title.into();
         let mut session = HtmlViewSession::new(
             if title_str.trim().is_empty() {
@@ -328,20 +322,17 @@ impl HtmlPreviewOverlay {
             },
             html,
         );
-        let resolved_title = session
-            .title()
-            .map(ToString::to_string)
-            .unwrap_or_else(|| {
-                if title_str.trim().is_empty() {
-                    "HTML Preview".to_string()
-                } else {
-                    title_str
-                }
-            });
+        let resolved_title = session.title().map(ToString::to_string).unwrap_or_else(|| {
+            if title_str.trim().is_empty() {
+                "HTML Preview".to_string()
+            } else {
+                title_str
+            }
+        });
         // Drain any startup effects so startup alerts show cleanly in last_status.
         let _ = session.take_pending_effects();
         Self {
-            session,
+            session: Box::new(session),
             title: resolved_title,
             source_label: source_label.into(),
             source: HtmlPreviewSource::Inline,
@@ -382,7 +373,7 @@ impl HtmlPreviewOverlay {
         session.raw_mode = was_raw;
         session.scroll_y = prev_scroll;
         session.last_status = Some("Reloaded updated HTML".to_string());
-        self.session = session;
+        *self.session = session;
         true
     }
 
@@ -591,7 +582,10 @@ impl HtmlPreviewOverlay {
                 self.session.scroll_y = 0;
                 OverlayOutcome::Handled
             }
-            Action::CursorEnd | Action::JumpBottom | Action::Input('G') | Action::ToggleGraphView => {
+            Action::CursorEnd
+            | Action::JumpBottom
+            | Action::Input('G')
+            | Action::ToggleGraphView => {
                 self.session.scroll_y = u16::MAX;
                 OverlayOutcome::Handled
             }
@@ -623,10 +617,22 @@ impl HtmlPreviewOverlay {
         frame.render_widget(Clear, rect);
         hitmap.add(rect, HitTarget::OverlayBody);
 
-        let mode_badge = if self.session.raw_mode { "Raw" } else { "Rendered" };
-        let js_badge = if self.session.js_active { "JS:on" } else { "Static" };
+        let mode_badge = if self.session.raw_mode {
+            "Raw"
+        } else {
+            "Rendered"
+        };
+        let js_badge = if self.session.js_active {
+            "JS:on"
+        } else {
+            "Static"
+        };
 
-        let raw_pill = if self.session.raw_mode { "[m View]" } else { "[m Raw]" };
+        let raw_pill = if self.session.raw_mode {
+            "[m View]"
+        } else {
+            "[m Raw]"
+        };
         let open_pill = "[o Browser]";
         let close_pill = "[✕ Esc]";
         let raw_w = raw_pill.width() as u16;
@@ -674,7 +680,12 @@ impl HtmlPreviewOverlay {
                 )),
                 Rect::new(x, rect.y, close_w, 1),
             );
-            hitmap.add_line(x, rect.y, close_w, HitTarget::Button(ButtonId::ConfirmCancel));
+            hitmap.add_line(
+                x,
+                rect.y,
+                close_w,
+                HitTarget::Button(ButtonId::ConfirmCancel),
+            );
             right_cursor = x.saturating_sub(1);
         }
         if show_action_pills {
@@ -707,7 +718,12 @@ impl HtmlPreviewOverlay {
                 Paragraph::new(Span::styled(raw_pill, m_style)),
                 Rect::new(mx, rect.y, raw_w, 1),
             );
-            hitmap.add_line(mx, rect.y, raw_w, HitTarget::Button(ButtonId::HtmlToggleRaw));
+            hitmap.add_line(
+                mx,
+                rect.y,
+                raw_w,
+                HitTarget::Button(ButtonId::HtmlToggleRaw),
+            );
         }
 
         if inner.width == 0 || inner.height == 0 {
@@ -809,11 +825,7 @@ impl HtmlPreviewOverlay {
             };
 
             let scroll_info = if total_lines > visible {
-                format!(
-                    " L{}/{} ",
-                    self.session.scroll_y as usize + 1,
-                    total_lines
-                )
+                format!(" L{}/{} ", self.session.scroll_y as usize + 1, total_lines)
             } else {
                 format!(" {}L ", total_lines)
             };
@@ -896,23 +908,35 @@ mod tests {
         let cfg = AppConfig::default();
         let ui = UiState::from_config(&cfg);
         let mut overlay = HtmlPreviewOverlay::new("Counter", "demo.html", html.to_string());
-        assert!(overlay.session.js_active, "QuickJS should activate for onclick");
+        assert!(
+            overlay.session.js_active,
+            "QuickJS should activate for onclick"
+        );
 
         // Initial render populates last_content_rect & controls
         let (buf0, hitmap0) = render_overlay_text(&mut overlay, &ui, 100, 28);
         assert!(buf0.contains("Count: 0"));
         assert!(buf0.contains("[ Increment ]"));
         assert!(!buf0.contains("Hidden Secret"));
-        assert!(hitmap0.region_of(HitTarget::Button(ButtonId::ConfirmCancel)).is_some());
-        assert!(hitmap0.region_of(HitTarget::Button(ButtonId::HtmlToggleRaw)).is_some());
-        assert!(hitmap0.region_of(HitTarget::Button(ButtonId::HtmlServeBrowser)).is_some());
+        assert!(hitmap0
+            .region_of(HitTarget::Button(ButtonId::ConfirmCancel))
+            .is_some());
+        assert!(hitmap0
+            .region_of(HitTarget::Button(ButtonId::HtmlToggleRaw))
+            .is_some());
+        assert!(hitmap0
+            .region_of(HitTarget::Button(ButtonId::HtmlServeBrowser))
+            .is_some());
 
         // 1. Activate <button onclick> via Tab + Enter
         assert_eq!(overlay.handle(&Action::Tab), OverlayOutcome::Handled);
         assert_eq!(overlay.session.focused_control, Some(0));
         assert_eq!(overlay.handle(&Action::Activate), OverlayOutcome::Handled);
         let (buf1, _) = render_overlay_text(&mut overlay, &ui, 100, 28);
-        assert!(buf1.contains("Count: 1"), "button onclick should update DOM to Count: 1");
+        assert!(
+            buf1.contains("Count: 1"),
+            "button onclick should update DOM to Count: 1"
+        );
 
         // 2. Activate <button onclick> via screen-space mouse click (`click_at`)
         let btn_ctrl = {
@@ -932,7 +956,10 @@ mod tests {
             OverlayOutcome::Handled
         );
         let (buf2, _) = render_overlay_text(&mut overlay, &ui, 100, 28);
-        assert!(buf2.contains("Count: 2"), "click_at should invoke onclick -> Count: 2");
+        assert!(
+            buf2.contains("Count: 2"),
+            "click_at should invoke onclick -> Count: 2"
+        );
 
         // 3. Text input focus + typing + Enter finishes editing
         assert_eq!(overlay.handle(&Action::Tab), OverlayOutcome::Handled);
@@ -965,7 +992,10 @@ mod tests {
 
         // 6. `o` dispatches native browser serving action
         match overlay.handle(&Action::Input('o')) {
-            OverlayOutcome::Dispatch(Action::ServeHtmlInBrowser { title, html: payload }) => {
+            OverlayOutcome::Dispatch(Action::ServeHtmlInBrowser {
+                title,
+                html: payload,
+            }) => {
                 assert_eq!(title, "Counter");
                 assert!(payload.contains("Counter Demo"));
             }
@@ -985,12 +1015,17 @@ mod tests {
     fn test_static_html_keeps_js_inactive_and_scrolls_with_scrollbar() {
         let mut body = String::from("<h1>Long Static Doc</h1>");
         for i in 1..=60 {
-            body.push_str(&format!("<p>Paragraph line number {i} for scrolling check.</p>"));
+            body.push_str(&format!(
+                "<p>Paragraph line number {i} for scrolling check.</p>"
+            ));
         }
         let cfg = AppConfig::default();
         let ui = UiState::from_config(&cfg);
         let mut overlay = HtmlPreviewOverlay::new("Static Doc", "static.html", body);
-        assert!(!overlay.session.js_active, "static HTML must keep QuickJS inactive (0 MB)");
+        assert!(
+            !overlay.session.js_active,
+            "static HTML must keep QuickJS inactive (0 MB)"
+        );
 
         let mut terminal = Terminal::new(TestBackend::new(80, 18)).unwrap();
         let mut hitmap = HitMap::new();
@@ -1003,8 +1038,11 @@ mod tests {
         let sb_x = overlay.last_modal_rect.right() - 2;
         let buf = terminal.backend().buffer();
         assert!(
-            (overlay.last_content_rect.y..overlay.last_content_rect.bottom())
-                .any(|y| !buf[(sb_x, y)].symbol().trim().is_empty())
+            (overlay.last_content_rect.y..overlay.last_content_rect.bottom()).any(|y| !buf
+                [(sb_x, y)]
+                .symbol()
+                .trim()
+                .is_empty())
         );
 
         overlay.handle(&Action::Input('j'));
@@ -1058,8 +1096,12 @@ And a linked HTML page: [Widget](widget.html)
         assert!(note_has_html(&detail));
         let candidates = extract_note_html_candidates(&detail, Some(tmp.path()));
         assert_eq!(candidates.len(), 3);
-        assert!(candidates[0].html.contains("<button onclick=\"alert('hi')\">Tap</button>"));
-        assert!(candidates[1].html.contains("<details><summary>Expand</summary>"));
+        assert!(candidates[0]
+            .html
+            .contains("<button onclick=\"alert('hi')\">Tap</button>"));
+        assert!(candidates[1]
+            .html
+            .contains("<details><summary>Expand</summary>"));
         assert!(candidates[2].html.contains("Vault Widget"));
     }
 }

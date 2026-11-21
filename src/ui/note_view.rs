@@ -134,7 +134,12 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiState, hit
         if let Some(b_idx) = rl.block_idx {
             hitmap.add(row_rect, HitTarget::CanvasBlock(b_idx));
             if let Some(t_ln) = rl.task_line_no {
-                hitmap.add_line(content_area.x, y, 6, HitTarget::TaskCheckbox { line_no: t_ln });
+                hitmap.add_line(
+                    content_area.x,
+                    y,
+                    6,
+                    HitTarget::TaskCheckbox { line_no: t_ln },
+                );
             } else if rl.has_wikilink {
                 hitmap.add(row_rect, HitTarget::WikilinkBlock(b_idx));
             }
@@ -172,21 +177,26 @@ fn build_canvas_lines(
     focused: bool,
 ) -> Vec<RenderedLine> {
     let mut out: Vec<RenderedLine> = Vec::new();
-    let push_plain = |out: &mut Vec<RenderedLine>, line: Line<'static>, bg: Option<ratatui::style::Color>| {
-        out.push(RenderedLine {
-            line,
-            block_idx: None,
-            task_line_no: None,
-            has_wikilink: false,
-            image_idx: None,
-            html_pill: None,
-            action_pills: Vec::new(),
-            bg_override: bg,
-        });
-    };
+    let push_plain =
+        |out: &mut Vec<RenderedLine>, line: Line<'static>, bg: Option<ratatui::style::Color>| {
+            out.push(RenderedLine {
+                line,
+                block_idx: None,
+                task_line_no: None,
+                has_wikilink: false,
+                image_idx: None,
+                html_pill: None,
+                action_pills: Vec::new(),
+                bg_override: bg,
+            });
+        };
 
     // 1. Note Title + Bookmark indicator
-    let bm = if detail.summary.is_bookmarked { " ★" } else { "" };
+    let bm = if detail.summary.is_bookmarked {
+        " ★"
+    } else {
+        ""
+    };
     push_plain(
         &mut out,
         Line::from(vec![
@@ -219,13 +229,25 @@ fn build_canvas_lines(
         };
         let has_html = note_has_html(detail) || !app.html_files.is_empty();
         let pills: Vec<(String, bool, ButtonId)> = vec![
-            (bm_label.to_string(), detail.summary.is_bookmarked, ButtonId::ToggleBookmark),
-            (width_label.to_string(), ui.page_width == PageWidthMode::Full, ButtonId::ToggleWidth),
+            (
+                bm_label.to_string(),
+                detail.summary.is_bookmarked,
+                ButtonId::ToggleBookmark,
+            ),
+            (
+                width_label.to_string(),
+                ui.page_width == PageWidthMode::Full,
+                ButtonId::ToggleWidth,
+            ),
             ("[a Append]".to_string(), false, ButtonId::QuickAppend),
             ("[n New]".to_string(), false, ButtonId::NewNote),
             ("[✎ Edit]".to_string(), false, ButtonId::EditNote),
             ("[u Links]".to_string(), false, ButtonId::LinkExtractor),
-            ("[h Hrefs]".to_string(), ui.show_inline_hrefs, ButtonId::ToggleHrefs),
+            (
+                "[h Hrefs]".to_string(),
+                ui.show_inline_hrefs,
+                ButtonId::ToggleHrefs,
+            ),
             (img_label, !detail.images.is_empty(), ButtonId::ImagePreview),
             ("[H: HTML]".to_string(), has_html, ButtonId::HtmlPreview),
         ];
@@ -332,15 +354,16 @@ fn build_canvas_lines(
     let mut image_counter = 0usize;
     for (b_idx, block) in detail.parsed.blocks.iter().enumerate() {
         let is_sel = focused && b_idx == selected_block;
-        let sel_bg = if is_sel { Some(theme.bg_selected) } else { None };
+        let sel_bg = if is_sel {
+            Some(theme.bg_selected)
+        } else {
+            None
+        };
         let has_wl = block.first_wikilink().is_some();
 
         match block {
             NoteBlock::Heading {
-                level,
-                text,
-                spans,
-                ..
+                level, text, spans, ..
             } => {
                 // Skip duplicate top H1 if identical to note title and first block
                 if b_idx == 0 && *level == 1 && text.eq_ignore_ascii_case(&detail.summary.title) {
@@ -367,7 +390,12 @@ fn build_canvas_lines(
                         .add_modifier(Modifier::BOLD),
                 };
                 let mut line_spans = vec![Span::styled(prefix.to_string(), style)];
-                line_spans.extend(render_inline_spans(spans, theme, ui.show_inline_hrefs, style));
+                line_spans.extend(render_inline_spans(
+                    spans,
+                    theme,
+                    ui.show_inline_hrefs,
+                    style,
+                ));
                 out.push(RenderedLine {
                     line: Line::from(line_spans),
                     block_idx: Some(b_idx),
@@ -401,7 +429,11 @@ fn build_canvas_lines(
                         image_idx: None,
                         html_pill: Some((19, pill_w, b_idx)),
                         action_pills: Vec::new(),
-                        bg_override: Some(if is_sel { theme.bg_selected } else { theme.bg_card }),
+                        bg_override: Some(if is_sel {
+                            theme.bg_selected
+                        } else {
+                            theme.bg_card
+                        }),
                     });
                 }
                 let mut rendered = render_inline_spans(
@@ -413,7 +445,12 @@ fn build_canvas_lines(
                 if is_sel {
                     rendered.insert(
                         0,
-                        Span::styled("▎ ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+                        Span::styled(
+                            "▎ ",
+                            Style::default()
+                                .fg(theme.accent)
+                                .add_modifier(Modifier::BOLD),
+                        ),
                     );
                 }
                 for wrapped in wrap_spans(rendered, width) {
@@ -439,10 +476,17 @@ fn build_canvas_lines(
                 ..
             } => {
                 let c_color = theme.callout_color(*callout_kind);
-                let card_bg = if is_sel { theme.bg_selected } else { theme.bg_card };
+                let card_bg = if is_sel {
+                    theme.bg_selected
+                } else {
+                    theme.bg_card
+                };
                 let fold = if *collapsed { "▸ " } else { "" };
                 let header = Line::from(vec![
-                    Span::styled("┃ ", Style::default().fg(c_color).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        "┃ ",
+                        Style::default().fg(c_color).add_modifier(Modifier::BOLD),
+                    ),
                     Span::styled(
                         format!("{fold}{} {} ", callout_kind.glyph(), callout_kind.label()),
                         Style::default().fg(c_color).add_modifier(Modifier::BOLD),
@@ -517,12 +561,18 @@ fn build_canvas_lines(
                 let mut line_spans = vec![
                     Span::styled(
                         format!("{pad}{cursor}"),
-                        Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(theme.accent)
+                            .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
                         checkbox.to_string(),
                         Style::default()
-                            .fg(if *checked { theme.success } else { theme.accent })
+                            .fg(if *checked {
+                                theme.success
+                            } else {
+                                theme.accent
+                            })
                             .add_modifier(Modifier::BOLD),
                     ),
                 ];
@@ -602,8 +652,16 @@ fn build_canvas_lines(
             }
 
             NoteBlock::CodeBlock { language, code, .. } => {
-                let code_bg = if is_sel { theme.bg_selected } else { theme.bg_code };
-                let lang_label = if language.is_empty() { "code" } else { language.as_str() };
+                let code_bg = if is_sel {
+                    theme.bg_selected
+                } else {
+                    theme.bg_code
+                };
+                let lang_label = if language.is_empty() {
+                    "code"
+                } else {
+                    language.as_str()
+                };
                 let is_html = is_html_code_language(language) && !code.trim().is_empty();
                 let html_suffix = if is_html { " [H: HTML]" } else { "" };
                 let bar_w = width
@@ -613,7 +671,9 @@ fn build_canvas_lines(
                     Span::styled("╭─ ", Style::default().fg(theme.border)),
                     Span::styled(
                         format!("{lang_label} "),
-                        Style::default().fg(theme.accent_soft).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(theme.accent_soft)
+                            .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled("─".repeat(bar_w), Style::default().fg(theme.border)),
                     Span::styled(" [y copy]", theme.muted_style()),

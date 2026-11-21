@@ -164,13 +164,19 @@ impl ContextMenuOverlay {
             let line = Line::from(vec![
                 Span::styled(
                     if is_sel { " ▸ " } else { "   " },
-                    Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     format!("{:<25}", it.label),
                     Style::default()
                         .fg(theme.fg_primary)
-                        .add_modifier(if is_sel { Modifier::BOLD } else { Modifier::empty() }),
+                        .add_modifier(if is_sel {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
                 ),
                 Span::styled(format!(" {}", it.shortcut), theme.muted_style()),
             ]);

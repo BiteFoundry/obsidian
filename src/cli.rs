@@ -10,11 +10,10 @@ use crate::{
     config::{AppConfig, DEFAULT_SERVE_PORT},
     daemon,
     mcp::McpServer,
-    models::{TaskFilter, VaultSummary},
+    models::{LinkStatus, NoteContent, NoteOmittedCounts, TaskFilter, VaultSummary},
     serve,
     storage::Storage,
-    tui,
-    updater,
+    tui, updater,
     vault::{
         fs::{
             append_to_note, create_note, ensure_daily_note, move_note_to_trash, safe_vault_path,
@@ -79,6 +78,9 @@ pub enum Commands {
         /// Optional text to append to the daily note.
         #[arg(long)]
         append: Option<String>,
+        /// With --json, embed the full note detail instead of the compact note object.
+        #[arg(long)]
+        full: bool,
     },
     /// List incoming linked mentions (backlinks) to a note.
     Backlinks {
@@ -94,7 +96,7 @@ pub enum Commands {
     Graph {
         /// Optional center note (omitting outputs global vault graph).
         note: Option<String>,
-        /// Hop depth for local BFS neighborhood (1..5).
+        /// Hop depth for local BFS neighborhood (1..5; other values are clamped and the result reports the depth used).
         #[arg(long, default_value_t = 2)]
         depth: usize,
     },
@@ -116,6 +118,15 @@ pub enum Commands {
         /// Filter tasks to a specific note.
         #[arg(long)]
         note: Option<String>,
+        /// Page size, 1..500. With --json the default is 50; text output lists everything unless set.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=500))]
+        limit: Option<u64>,
+        /// Continue after the next_cursor value of the previous page.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Return every item in one response.
+        #[arg(long, conflicts_with_all = ["limit", "cursor"])]
+        all: bool,
     },
     /// Surgically toggle a Markdown task checkbox (`- [ ]` <-> `- [x]`) at a 1-based line number.
     ToggleTask {
@@ -179,13 +190,25 @@ pub enum NotesCmd {
     List {
         #[arg(long)]
         folder: Option<String>,
+        /// Page size, 1..500. With --json the default is 50; text output lists everything unless set.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=500))]
+        limit: Option<u64>,
+        /// Continue after the next_cursor value of the previous page.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Return every item in one response.
+        #[arg(long, conflicts_with_all = ["limit", "cursor"])]
+        all: bool,
     },
-    /// Read raw Markdown, or add --json for metadata.
+    /// Read raw Markdown, or add --json for a compact object (--full for all metadata).
     Read {
         note: String,
-        /// With --json, return only the relative path, title, and raw Markdown.
-        #[arg(long, requires = "json")]
+        /// With --json, return the compact note object. This is the default; kept for compatibility.
+        #[arg(long)]
         compact: bool,
+        /// With --json, return summary, parsed, backlinks, outgoing_links, and images.
+        #[arg(long, conflicts_with = "compact")]
+        full: bool,
     },
     /// Create a new note atomically.
     Create {
@@ -261,7 +284,21 @@ impl Cli {
         I: IntoIterator<Item = T>,
         T: Into<OsString>,
     {
-        <Self as Parser>::try_parse_from(normalize_cli_args(itr))
+        let cli = <Self as Parser>::try_parse_from(normalize_cli_args(itr))?;
+        let detail_flag = match &cli.command {
+            Some(Commands::Notes {
+                action: NotesCmd::Read { compact, full, .. },
+            }) => *compact || *full,
+            Some(Commands::Daily { full, .. }) => *full,
+            _ => false,
+        };
+        if detail_flag && !cli.json {
+            return Err(<Self as clap::CommandFactory>::command().error(
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "--compact and --full require --json",
+            ));
+        }
+        Ok(cli)
     }
 }
 
@@ -415,10 +452,10 @@ where
         if token == "--" {
             if has_hyphen_positional {
                 out.push(raw[i].clone());
-                out.extend(deferred_positionals.drain(..));
+                out.append(&mut deferred_positionals);
                 out.extend_from_slice(&raw[i + 1..]);
             } else {
-                out.extend(deferred_positionals.drain(..));
+                out.append(&mut deferred_positionals);
                 out.extend_from_slice(&raw[i..]);
             }
             return out;
@@ -517,6 +554,36 @@ where
     }
     out.extend(deferred_positionals);
     out
+}
+
+fn cli_compact_note_json(
+    content: &NoteContent,
+    counts: NoteOmittedCounts,
+    vault_spec: Option<&str>,
+) -> serde_json::Value {
+    let hint = match vault_spec {
+        Some(spec) => format!(
+            "bitefoundry-obsidian --vault {:?} notes read {:?} --json --full",
+            spec, content.rel_path
+        ),
+        None => format!(
+            "bitefoundry-obsidian notes read {:?} --json --full",
+            content.rel_path
+        ),
+    };
+    json!({
+        "rel_path": content.rel_path,
+        "title": content.title,
+        "raw_markdown": content.raw_markdown,
+        "mtime_ms": content.mtime_ms,
+        "omitted": {
+            "backlinks": counts.backlinks,
+            "outgoing_links": counts.outgoing_links,
+            "images": serde_json::Value::Null,
+            "fields": ["summary", "parsed"],
+        },
+        "hint": hint,
+    })
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
@@ -630,7 +697,11 @@ pub async fn run(cli: Cli) -> Result<()> {
                 if cli.json {
                     println!("{}", serde_json::to_string_pretty(&target)?);
                 } else {
-                    println!("Active vault set to '{}' ({})", target.name, target.path.display());
+                    println!(
+                        "Active vault set to '{}' ({})",
+                        target.name,
+                        target.path.display()
+                    );
                 }
                 Ok(())
             }
@@ -645,7 +716,10 @@ pub async fn run(cli: Cli) -> Result<()> {
                     persisted.save()?;
                 }
                 if cli.json {
-                    println!("{}", serde_json::to_string_pretty(&json!({ "removed": removed, "name": name }))?);
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({ "removed": removed, "name": name }))?
+                    );
                 } else if removed {
                     println!("Removed vault '{name}' from registry.");
                 } else {
@@ -706,14 +780,29 @@ pub async fn run(cli: Cli) -> Result<()> {
             let vault = resolve_active_vault(&cfg, cli.vault.as_deref())?;
             let storage = Storage::open_default()?;
             storage.sync_vault(&vault)?;
-            let hits = storage.search_notes(&vault.id, &query, limit)?;
+            let page = storage.search_notes_page(&vault.id, &query, limit)?;
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(&hits)?);
-            } else if hits.is_empty() {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "query": query,
+                        "limit": page.limit,
+                        "returned": page.hits.len(),
+                        "has_more": page.has_more,
+                        "next_cursor": serde_json::Value::Null,
+                        "results": page.hits,
+                    }))?
+                );
+            } else if page.hits.is_empty() {
                 println!("No notes matching '{query}'.");
             } else {
-                for h in hits {
+                for h in &page.hits {
                     println!("{} — {}", h.rel_path, h.snippet);
+                }
+                if page.has_more {
+                    eprintln!(
+                        "More results available. Raise --limit (max 200) or narrow the query."
+                    );
                 }
             }
             Ok(())
@@ -725,30 +814,71 @@ pub async fn run(cli: Cli) -> Result<()> {
             storage.sync_vault(&vault)?;
 
             match action {
-                NotesCmd::List { folder } => {
-                    let notes = storage.list_notes(&vault.id, folder.as_deref())?;
-                    if cli.json {
-                        println!("{}", serde_json::to_string_pretty(&notes)?);
+                NotesCmd::List {
+                    folder,
+                    limit,
+                    cursor,
+                    all,
+                } => {
+                    let effective_limit = if all {
+                        None
+                    } else if let Some(lim) = limit {
+                        Some(lim as usize)
+                    } else if cli.json {
+                        Some(50)
                     } else {
-                        for n in notes {
+                        None
+                    };
+                    let page = storage.list_notes_page(
+                        &vault.id,
+                        folder.as_deref(),
+                        cursor.as_deref(),
+                        effective_limit,
+                    )?;
+                    if cli.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&json!({
+                                "notes": page.items,
+                                "returned": page.items.len(),
+                                "total": page.total,
+                                "has_more": page.has_more,
+                                "next_cursor": page.next_cursor,
+                            }))?
+                        );
+                    } else {
+                        for n in &page.items {
                             let bm = if n.is_bookmarked { "★ " } else { "  " };
                             println!(
                                 "{bm}{:<42} {:>4}w  ←{} →{}",
                                 n.rel_path, n.word_count, n.backlink_count, n.outgoing_count
                             );
                         }
+                        if let Some(next_cursor) =
+                            page.next_cursor.as_deref().filter(|_| page.has_more)
+                        {
+                            eprintln!(
+                                "More results available. Continue with --cursor {next_cursor:?}"
+                            );
+                        }
                     }
                     Ok(())
                 }
-                NotesCmd::Read { note, compact } => {
-                    if compact {
-                        let content = storage.load_note_content(&vault, &note)?;
-                        println!("{}", serde_json::to_string_pretty(&content)?);
-                    } else if cli.json {
+                NotesCmd::Read {
+                    note,
+                    compact: _,
+                    full,
+                } => {
+                    if !cli.json {
+                        print!("{}", storage.load_note_content(&vault, &note)?.raw_markdown);
+                    } else if full {
                         let detail = storage.load_note_detail(&vault, &note)?;
                         println!("{}", serde_json::to_string_pretty(&detail)?);
                     } else {
-                        print!("{}", storage.load_note_content(&vault, &note)?.raw_markdown);
+                        let content = storage.load_note_content(&vault, &note)?;
+                        let counts = storage.note_omitted_counts(&vault.id, &content.rel_path)?;
+                        let payload = cli_compact_note_json(&content, counts, cli.vault.as_deref());
+                        println!("{}", serde_json::to_string_pretty(&payload)?);
                     }
                     Ok(())
                 }
@@ -773,7 +903,12 @@ pub async fn run(cli: Cli) -> Result<()> {
                     )?;
                     storage.sync_vault(&vault)?;
                     if cli.json {
-                        println!("{}", serde_json::to_string_pretty(&json!({ "created": true, "rel_path": rel_path }))?);
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(
+                                &json!({ "created": true, "rel_path": rel_path })
+                            )?
+                        );
                     } else {
                         println!("Created {rel_path}");
                     }
@@ -785,13 +920,22 @@ pub async fn run(cli: Cli) -> Result<()> {
                     append_to_note(&abs, &text)?;
                     storage.sync_vault(&vault)?;
                     if cli.json {
-                        println!("{}", serde_json::to_string_pretty(&json!({ "appended": true, "rel_path": rel_path }))?);
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(
+                                &json!({ "appended": true, "rel_path": rel_path })
+                            )?
+                        );
                     } else {
                         println!("Appended to {rel_path}");
                     }
                     Ok(())
                 }
-                NotesCmd::Replace { note, find, replace } => {
+                NotesCmd::Replace {
+                    note,
+                    find,
+                    replace,
+                } => {
                     let result = storage.replace_note_text(&vault, &note, &find, &replace)?;
                     if cli.json {
                         println!("{}", serde_json::to_string_pretty(&result)?);
@@ -811,7 +955,12 @@ pub async fn run(cli: Cli) -> Result<()> {
                     tui::launch_external_editor(&abs)?;
                     let stats = storage.sync_vault(&vault)?;
                     if cli.json {
-                        println!("{}", serde_json::to_string_pretty(&json!({ "edited": true, "rel_path": rel_path, "stats": stats }))?);
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(
+                                &json!({ "edited": true, "rel_path": rel_path, "stats": stats })
+                            )?
+                        );
                     } else {
                         println!("Edited and reindexed {rel_path}");
                     }
@@ -838,7 +987,12 @@ pub async fn run(cli: Cli) -> Result<()> {
                     let trashed = move_note_to_trash(&vault.path, &rel_path)?;
                     storage.sync_vault(&vault)?;
                     if cli.json {
-                        println!("{}", serde_json::to_string_pretty(&json!({ "deleted": true, "rel_path": rel_path, "trash_path": trashed }))?);
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(
+                                &json!({ "deleted": true, "rel_path": rel_path, "trash_path": trashed })
+                            )?
+                        );
                     } else {
                         println!("Moved {rel_path} -> {}", trashed.display());
                     }
@@ -847,7 +1001,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
         }
 
-        Some(Commands::Daily { date, append }) => {
+        Some(Commands::Daily { date, append, full }) => {
             let vault = resolve_active_vault(&cfg, cli.vault.as_deref())?;
             let storage = Storage::open_default()?;
             let (rel_path, abs, created) = ensure_daily_note(&vault, date.as_deref())?;
@@ -855,18 +1009,26 @@ pub async fn run(cli: Cli) -> Result<()> {
                 append_to_note(&abs, txt)?;
             }
             storage.sync_vault(&vault)?;
-            let detail = storage.load_note_detail(&vault, &rel_path)?;
             if cli.json {
+                let note_val = if full {
+                    let detail = storage.load_note_detail(&vault, &rel_path)?;
+                    serde_json::to_value(&detail)?
+                } else {
+                    let content = storage.load_note_content(&vault, &rel_path)?;
+                    let counts = storage.note_omitted_counts(&vault.id, &content.rel_path)?;
+                    cli_compact_note_json(&content, counts, cli.vault.as_deref())
+                };
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&json!({
                         "rel_path": rel_path,
                         "created": created,
-                        "note": detail,
+                        "note": note_val,
                     }))?
                 );
             } else {
-                println!("{}", detail.raw_markdown);
+                let content = storage.load_note_content(&vault, &rel_path)?;
+                println!("{}", content.raw_markdown);
             }
             Ok(())
         }
@@ -894,15 +1056,32 @@ pub async fn run(cli: Cli) -> Result<()> {
             let storage = Storage::open_default()?;
             storage.sync_vault(&vault)?;
             let rel_path = storage.resolve_note_path(&vault.id, &note)?;
-            let ol = storage.get_outgoing_links(&vault.id, &rel_path)?;
+            let ol = storage.get_outgoing_links(&vault, &rel_path)?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&ol)?);
             } else if ol.is_empty() {
                 println!("No outgoing links from {rel_path}.");
             } else {
                 for l in ol {
-                    let status = if l.resolved { "→" } else { "◌ (unresolved)" };
-                    println!("{status} {} ({})", l.target_raw, l.target_resolved_path.unwrap_or_else(|| "missing".into()));
+                    match l.status {
+                        LinkStatus::Resolved | LinkStatus::Attachment => {
+                            println!(
+                                "→ {} ({})",
+                                l.target_raw,
+                                l.target_resolved_path.unwrap_or_default()
+                            );
+                        }
+                        LinkStatus::Ambiguous => {
+                            println!(
+                                "◌ (unresolved) {} (ambiguous: {})",
+                                l.target_raw,
+                                l.candidates.join(", ")
+                            );
+                        }
+                        LinkStatus::Missing => {
+                            println!("◌ (unresolved) {} (missing)", l.target_raw);
+                        }
+                    }
                 }
             }
             Ok(())
@@ -926,7 +1105,10 @@ pub async fn run(cli: Cli) -> Result<()> {
                     graph.edges.len()
                 );
                 for n in &graph.nodes {
-                    println!("  [d={}] {} (in:{} out:{})", n.depth, n.title, n.in_degree, n.out_degree);
+                    println!(
+                        "  [d={}] {} (in:{} out:{})",
+                        n.depth, n.title, n.in_degree, n.out_degree
+                    );
                 }
             }
             Ok(())
@@ -975,7 +1157,14 @@ pub async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
 
-        Some(Commands::Tasks { open, done, note }) => {
+        Some(Commands::Tasks {
+            open,
+            done,
+            note,
+            limit,
+            cursor,
+            all,
+        }) => {
             let vault = resolve_active_vault(&cfg, cli.vault.as_deref())?;
             let storage = Storage::open_default()?;
             storage.sync_vault(&vault)?;
@@ -990,13 +1179,40 @@ pub async fn run(cli: Cli) -> Result<()> {
                 Some(n) => Some(storage.resolve_note_path(&vault.id, n)?),
                 None => None,
             };
-            let tasks = storage.list_tasks(&vault.id, filter, note_rel.as_deref())?;
-            if cli.json {
-                println!("{}", serde_json::to_string_pretty(&tasks)?);
+            let effective_limit = if all {
+                None
+            } else if let Some(lim) = limit {
+                Some(lim as usize)
+            } else if cli.json {
+                Some(50)
             } else {
-                for t in tasks {
+                None
+            };
+            let page = storage.list_tasks_page(
+                &vault.id,
+                filter,
+                note_rel.as_deref(),
+                cursor.as_deref(),
+                effective_limit,
+            )?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "tasks": page.items,
+                        "returned": page.items.len(),
+                        "total": page.total,
+                        "has_more": page.has_more,
+                        "next_cursor": page.next_cursor,
+                    }))?
+                );
+            } else {
+                for t in &page.items {
                     let box_c = if t.checked { "[x]" } else { "[ ]" };
                     println!("{box_c} {}:{}  {}", t.note_path, t.line_no, t.text);
+                }
+                if let Some(next_cursor) = page.next_cursor.as_deref().filter(|_| page.has_more) {
+                    eprintln!("More results available. Continue with --cursor {next_cursor:?}");
                 }
             }
             Ok(())
@@ -1057,7 +1273,10 @@ pub async fn run(cli: Cli) -> Result<()> {
             DaemonCmd::Stop => {
                 let stopped = daemon::stop_daemon().await?;
                 if cli.json {
-                    println!("{}", serde_json::to_string_pretty(&json!({ "stopped": stopped }))?);
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({ "stopped": stopped }))?
+                    );
                 } else if stopped {
                     println!("bitefoundry-obsidian daemon stopped.");
                 } else {
@@ -1074,7 +1293,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                         "Running (pid={}, vault={}, notes={}, uptime={}s)",
                         st.pid.unwrap_or(0),
                         st.vault_name.as_deref().unwrap_or("—"),
-                        st.total_notes,
+                        st.total_notes.unwrap_or(0),
                         st.uptime_secs.unwrap_or(0)
                     );
                 } else {
@@ -1118,7 +1337,10 @@ pub async fn run(cli: Cli) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 println!("@bitefoundry/obsidian v{}", env!("CARGO_PKG_VERSION"));
-                println!("  Config:        {}", crate::config::config_file_path().display());
+                println!(
+                    "  Config:        {}",
+                    crate::config::config_file_path().display()
+                );
                 println!("  SQLite Index:  {}", crate::config::db_path().display());
                 println!(
                     "  obsidian.json: {}",
@@ -1140,7 +1362,10 @@ pub async fn run(cli: Cli) -> Result<()> {
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&res)?);
             } else if res.updated {
-                println!("Updated obsidian {} -> {}", res.current_version, res.latest_version);
+                println!(
+                    "Updated obsidian {} -> {}",
+                    res.current_version, res.latest_version
+                );
             } else if res.update_available {
                 println!(
                     "Update available: {} -> {} ({})",
@@ -1174,13 +1399,13 @@ mod tests {
             assert!(daily.json);
             assert!(matches!(
                 daily.command,
-                Some(Commands::Daily { date: None, append: Some(ref s) }) if s == sample
+                Some(Commands::Daily { date: None, append: Some(ref s), full: false }) if s == sample
             ));
 
             let daily_eq = parse(&["daily", &format!("--append={sample}")]).unwrap();
             assert!(matches!(
                 daily_eq.command,
-                Some(Commands::Daily { date: None, append: Some(ref s) }) if s == sample
+                Some(Commands::Daily { date: None, append: Some(ref s), full: false }) if s == sample
             ));
 
             let created_body =
@@ -1228,7 +1453,14 @@ mod tests {
             ));
 
             let replaced = parse(&[
-                "notes", "replace", "Note", "--find", sample, "--replace", sample, "--json",
+                "notes",
+                "replace",
+                "Note",
+                "--find",
+                sample,
+                "--replace",
+                sample,
+                "--json",
             ])
             .unwrap();
             assert!(replaced.json);
@@ -1241,8 +1473,7 @@ mod tests {
         }
 
         // Global `--vault` whose value matches a subcommand name does not confuse normalization.
-        let with_vault =
-            parse(&["--vault", "daily", "daily", "--append", "- 목록 항목"]).unwrap();
+        let with_vault = parse(&["--vault", "daily", "daily", "--append", "- 목록 항목"]).unwrap();
         assert_eq!(with_vault.vault.as_deref(), Some("daily"));
         assert!(matches!(
             with_vault.command,
@@ -1250,29 +1481,48 @@ mod tests {
         ));
 
         // Ordinary invocations skip building a second clap command tree.
-        let to_os = |args: &[&str]| -> Vec<OsString> {
-            args.iter().map(OsString::from).collect()
-        };
+        let to_os = |args: &[&str]| -> Vec<OsString> { args.iter().map(OsString::from).collect() };
         assert!(!has_potential_hyphen_option_literal(&to_os(&[
-            "bitefoundry-obsidian", "notes", "list", "--json",
+            "bitefoundry-obsidian",
+            "notes",
+            "list",
+            "--json",
         ])));
         assert!(!has_potential_hyphen_option_literal(&to_os(&[
-            "bitefoundry-obsidian", "daily", "--append", "plain text",
+            "bitefoundry-obsidian",
+            "daily",
+            "--append",
+            "plain text",
         ])));
         assert!(!has_potential_hyphen_option_literal(&to_os(&[
-            "bitefoundry-obsidian", "daily", "--append=- 목록 항목",
+            "bitefoundry-obsidian",
+            "daily",
+            "--append=- 목록 항목",
         ])));
         assert!(!has_potential_hyphen_option_literal(&to_os(&[
-            "bitefoundry-obsidian", "daily", "--help",
+            "bitefoundry-obsidian",
+            "daily",
+            "--help",
         ])));
         assert!(!has_potential_hyphen_option_literal(&to_os(&[
-            "bitefoundry-obsidian", "daily", "-h",
+            "bitefoundry-obsidian",
+            "daily",
+            "-h",
         ])));
         assert!(!has_potential_hyphen_option_literal(&to_os(&[
-            "bitefoundry-obsidian", "notes", "append", "Note", "--", "--append", "- item",
+            "bitefoundry-obsidian",
+            "notes",
+            "append",
+            "Note",
+            "--",
+            "--append",
+            "- item",
         ])));
         assert!(has_potential_hyphen_option_literal(&to_os(&[
-            "bitefoundry-obsidian", "daily", "--append", "- 목록 항목",
+            "bitefoundry-obsidian",
+            "daily",
+            "--append",
+            "- 목록 항목",
         ])));
     }
 
@@ -1350,15 +1600,30 @@ mod tests {
             &["search", "--limit", "5"][..],
             &["notes", "append", "Note", "--json"][..],
             &["notes", "replace", "Note", "--find", "--replace", "new"][..],
-            &["notes", "replace", "Note", "--find", "old", "--replace", "--json"][..],
-            &["notes", "replace", "Note", "--find", "old", "--replace", "--help"][..],
+            &[
+                "notes",
+                "replace",
+                "Note",
+                "--find",
+                "old",
+                "--replace",
+                "--json",
+            ][..],
+            &[
+                "notes",
+                "replace",
+                "Note",
+                "--find",
+                "old",
+                "--replace",
+                "--help",
+            ][..],
             // Non-text options keep standard clap rejection for hyphen-prefixed values.
             &["daily", "--date", "-2026-11-20"][..],
             &["search", "foo", "--limit", "-1"][..],
         ] {
-            let err = parse(missing_value_argv).expect_err(&format!(
-                "expected parse error for {missing_value_argv:?}"
-            ));
+            let err = parse(missing_value_argv)
+                .expect_err(&format!("expected parse error for {missing_value_argv:?}"));
             assert_ne!(
                 err.kind(),
                 ErrorKind::DisplayHelp,
@@ -1373,7 +1638,14 @@ mod tests {
             &["daily", "--append", "- 목록 항목", "--help"][..],
             &["notes", "create", "--help"][..],
             &["notes", "create", "- 목록 항목", "--help"][..],
-            &["notes", "create", "Test", "--content", "- 목록 항목", "--help"][..],
+            &[
+                "notes",
+                "create",
+                "Test",
+                "--content",
+                "- 목록 항목",
+                "--help",
+            ][..],
             &["search", "--help"][..],
             &["search", "-h"][..],
             &["search", "- 목록 항목", "--help"][..],
@@ -1381,10 +1653,19 @@ mod tests {
             &["notes", "append", "Note", "--help"][..],
             &["notes", "append", "Note", "- 목록 항목", "--help"][..],
             &["notes", "replace", "--help"][..],
-            &["notes", "replace", "Note", "--find", "- 목록 항목", "--replace", "new", "--help"][..],
+            &[
+                "notes",
+                "replace",
+                "Note",
+                "--find",
+                "- 목록 항목",
+                "--replace",
+                "new",
+                "--help",
+            ][..],
         ] {
-            let err = parse(help_argv)
-                .expect_err(&format!("expected DisplayHelp for {help_argv:?}"));
+            let err =
+                parse(help_argv).expect_err(&format!("expected DisplayHelp for {help_argv:?}"));
             assert_eq!(
                 err.kind(),
                 ErrorKind::DisplayHelp,

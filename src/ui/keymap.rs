@@ -122,37 +122,79 @@ pub const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
     (
         "Workspace & Navigation",
         &[
-            ("Ctrl+O / Ctrl+K / Ctrl+P", "Quick Switcher & Command Palette"),
-            ("Ctrl+S", "Vault Switcher (auto-discovered & registered vaults)"),
+            (
+                "Ctrl+O / Ctrl+K / Ctrl+P",
+                "Quick Switcher & Command Palette",
+            ),
+            (
+                "Ctrl+S",
+                "Vault Switcher (auto-discovered & registered vaults)",
+            ),
             ("[ / Ctrl+B", "Toggle Left Sidebar"),
-            ("1 2 3 4 5", "Sidebar tabs: Files · Tags · Bookmarks · Outline · Tasks"),
+            (
+                "1 2 3 4 5",
+                "Sidebar tabs: Files · Tags · Bookmarks · Outline · Tasks",
+            ),
             ("B", "Toggle Right Inspector (Backlinks & Outgoing Links)"),
-            ("Tab / Shift+Tab", "Cycle focus across Sidebar, Canvas, and Inspector"),
+            (
+                "Tab / Shift+Tab",
+                "Cycle focus across Sidebar, Canvas, and Inspector",
+            ),
             ("Backspace / Alt+Left", "Navigate back in note history"),
         ],
     ),
     (
         "Obsidian Note Canvas & Knowledge Graph",
         &[
-            ("G", "Toggle Interactive Knowledge Graph View (Braille Canvas)"),
-            ("l / +/- / 0,r / [/]", "In Graph View: Scope, Zoom, Reset, Hop Depth"),
+            (
+                "G",
+                "Toggle Interactive Knowledge Graph View (Braille Canvas)",
+            ),
+            (
+                "l / +/- / 0,r / [/]",
+                "In Graph View: Scope, Zoom, Reset, Hop Depth",
+            ),
             ("D", "Open or create Today's Daily Note"),
-            ("Space / x", "Toggle live Markdown checkbox right in the .md file"),
-            ("Enter", "Follow [[wikilink]], open note, or jump to heading"),
+            (
+                "Space / x",
+                "Toggle live Markdown checkbox right in the .md file",
+            ),
+            (
+                "Enter",
+                "Follow [[wikilink]], open note, or jump to heading",
+            ),
             ("a / n", "Quick Append / New Note"),
-            ("e / Ctrl+E", "Inline live edit in pane / Open in external $EDITOR"),
-            ("b / w / h", "Toggle Bookmark / Centered-Full Width / Inline Hrefs"),
+            (
+                "e / Ctrl+E",
+                "Inline live edit in pane / Open in external $EDITOR",
+            ),
+            (
+                "b / w / h",
+                "Toggle Bookmark / Centered-Full Width / Inline Hrefs",
+            ),
         ],
     ),
     (
         "Media, Links & System",
         &[
             ("u", "Link Extractor overlay (wikilinks & external URLs)"),
-            ("v / Alt+V", "HD Image Preview modal (Kitty/iTerm2/Sixel/Halfblock)"),
-            ("H", "Interactive HTML Preview modal (QuickJS, m Raw, o Browser)"),
-            ("Ctrl+V / Ctrl+F", "Paste clipboard PNG / File Picker (z zoxide jump)"),
+            (
+                "v / Alt+V",
+                "HD Image Preview modal (Kitty/iTerm2/Sixel/Halfblock)",
+            ),
+            (
+                "H",
+                "Interactive HTML Preview modal (QuickJS, m Raw, o Browser)",
+            ),
+            (
+                "Ctrl+V / Ctrl+F",
+                "Paste clipboard PNG / File Picker (z zoxide jump)",
+            ),
             ("y / X", "Copy code or note Markdown / Move note to .trash/"),
-            ("Ctrl+, / . / ?", "Settings (5 palettes) / Context Menu / Keybinding Help"),
+            (
+                "Ctrl+, / . / ?",
+                "Settings (5 palettes) / Context Menu / Keybinding Help",
+            ),
             ("r / q", "Reindex Vault / Quit"),
         ],
     ),

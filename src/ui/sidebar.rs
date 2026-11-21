@@ -83,9 +83,9 @@ pub fn build_sidebar_entries(app: &AppState, ui: &UiState) -> Vec<SidebarEntry> 
                     .notes
                     .iter()
                     .filter(|n| {
-                        n.tags.iter().any(|t| {
-                            t == active_tag || t.starts_with(&format!("{active_tag}/"))
-                        })
+                        n.tags
+                            .iter()
+                            .any(|t| t == active_tag || t.starts_with(&format!("{active_tag}/")))
                     })
                     .collect();
                 out.push(SidebarEntry::TagHeader {
@@ -311,14 +311,16 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
         }
     };
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                truncate_width(&sub_title, tab_area.width as usize),
-                Style::default()
-                    .fg(if focused { theme.accent } else { theme.fg_muted })
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]))
+        Paragraph::new(Line::from(vec![Span::styled(
+            truncate_width(&sub_title, tab_area.width as usize),
+            Style::default()
+                .fg(if focused {
+                    theme.accent
+                } else {
+                    theme.fg_muted
+                })
+                .add_modifier(Modifier::BOLD),
+        )]))
         .style(Style::default().bg(theme.bg_sidebar)),
         Rect::new(tab_area.x, tab_area.y + 1, tab_area.width, 1),
     );
@@ -356,7 +358,8 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
         let y = list_area.y + i as u16;
         let row_rect = Rect::new(list_area.x, y, list_area.width, 1);
         let is_sel = idx == sel;
-        let is_active_note = matches!(entry, SidebarEntry::Note { rel_path, .. } if rel_path == active_rel);
+        let is_active_note =
+            matches!(entry, SidebarEntry::Note { rel_path, .. } if rel_path == active_rel);
 
         let bg = if is_sel && focused {
             theme.bg_selected
@@ -409,7 +412,9 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
                 Line::from(vec![
                     Span::styled(
                         marker.to_string(),
-                        Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(theme.accent)
+                            .add_modifier(Modifier::BOLD),
                     ),
                     Span::raw(indent),
                     Span::styled(
@@ -445,7 +450,9 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
                 Line::from(vec![
                     Span::styled(
                         marker.to_string(),
-                        Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(theme.accent)
+                            .add_modifier(Modifier::BOLD),
                     ),
                     Span::raw(indent),
                     Span::styled("◈ ", Style::default().fg(theme.info)),
@@ -476,7 +483,9 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
                 Line::from(vec![
                     Span::styled(
                         if *active_filter { " ▸ " } else { "   " },
-                        Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(theme.accent)
+                            .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
                         format!("#{}", truncate_width(tag, avail)),
@@ -496,7 +505,9 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
                     Span::raw(format!(" {indent}")),
                     Span::styled(
                         format!("H{level} "),
-                        Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(theme.accent)
+                            .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
                         truncate_width(text, avail),
@@ -504,11 +515,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
                     ),
                 ])
             }
-            SidebarEntry::Task {
-                text,
-                checked,
-                ..
-            } => {
+            SidebarEntry::Task { text, checked, .. } => {
                 let box_str = if *checked { "☑ " } else { "☐ " };
                 let avail = w.saturating_sub(5);
                 Line::from(vec![
@@ -533,7 +540,10 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
             }
         };
 
-        frame.render_widget(Paragraph::new(line).style(Style::default().bg(bg)), row_rect);
+        frame.render_widget(
+            Paragraph::new(line).style(Style::default().bg(bg)),
+            row_rect,
+        );
         hitmap.add(row_rect, HitTarget::SidebarRow(idx));
     }
 }

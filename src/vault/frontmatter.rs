@@ -84,8 +84,7 @@ pub fn upsert_frontmatter_in_markdown(
 
 pub(crate) fn markdown_body_offset(raw: &str) -> usize {
     let bom_end = raw.len() - raw.trim_start_matches('\u{feff}').len();
-    frontmatter_closing_start(raw, line_end(raw, 0))
-        .map_or(bom_end, |start| line_end(raw, start))
+    frontmatter_closing_start(raw, line_end(raw, 0)).map_or(bom_end, |start| line_end(raw, start))
 }
 
 fn frontmatter_closing_start(raw: &str, opening_end: usize) -> Option<usize> {

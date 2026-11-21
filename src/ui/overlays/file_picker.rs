@@ -316,9 +316,7 @@ impl FilePickerOverlay {
             FilePickerMode::Browse => {
                 " Attach File · Enter Open/Select · Backspace Up · z Zoxide · Esc Close "
             }
-            FilePickerMode::ZoxideJump => {
-                " Zoxide Jump · Type to Filter · Enter Jump · Esc Back "
-            }
+            FilePickerMode::ZoxideJump => " Zoxide Jump · Type to Filter · Enter Jump · Esc Back ",
         };
         let block = Block::default()
             .borders(Borders::ALL)
@@ -379,12 +377,8 @@ impl FilePickerOverlay {
                 } else if list_h > 0 {
                     let active_sel = self.selected.min(items.len() - 1);
                     let skip = active_sel.saturating_sub(list_h.saturating_sub(1));
-                    for (row, (idx, entry)) in items
-                        .iter()
-                        .enumerate()
-                        .skip(skip)
-                        .take(list_h)
-                        .enumerate()
+                    for (row, (idx, entry)) in
+                        items.iter().enumerate().skip(skip).take(list_h).enumerate()
                     {
                         let y = list_y + row as u16;
                         let is_sel = idx == active_sel;
@@ -444,12 +438,8 @@ impl FilePickerOverlay {
                 } else if list_h > 0 {
                     let active_sel = self.zoxide_selected.min(dirs.len() - 1);
                     let skip = active_sel.saturating_sub(list_h.saturating_sub(1));
-                    for (row, (idx, dir)) in dirs
-                        .iter()
-                        .enumerate()
-                        .skip(skip)
-                        .take(list_h)
-                        .enumerate()
+                    for (row, (idx, dir)) in
+                        dirs.iter().enumerate().skip(skip).take(list_h).enumerate()
                     {
                         let y = list_y + row as u16;
                         let is_sel = idx == active_sel;
@@ -518,9 +508,11 @@ fn read_dir_entries(dir: &Path) -> std::io::Result<Vec<FilePickerEntry>> {
         });
     }
     entries.sort_by(|a, b| {
-        b.is_dir
-            .cmp(&a.is_dir)
-            .then_with(|| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()))
+        b.is_dir.cmp(&a.is_dir).then_with(|| {
+            a.name
+                .to_ascii_lowercase()
+                .cmp(&b.name.to_ascii_lowercase())
+        })
     });
     Ok(entries)
 }

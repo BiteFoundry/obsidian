@@ -68,7 +68,9 @@ impl SettingsOverlay {
                 self.selected = (self.selected + 1) % ITEMS;
                 OverlayOutcome::Handled
             }
-            Action::Activate | Action::CursorRight | Action::Input(' ') => self.cycle_selected(true),
+            Action::Activate | Action::CursorRight | Action::Input(' ') => {
+                self.cycle_selected(true)
+            }
             Action::CursorLeft => self.cycle_selected(false),
             _ => OverlayOutcome::Handled,
         }
@@ -123,7 +125,7 @@ impl SettingsOverlay {
         hitmap: &mut HitMap,
     ) {
         let theme = &ui.theme;
-        let rect = centered_rect(area, area.width.saturating_sub(6).min(78).max(44), 17);
+        let rect = centered_rect(area, area.width.saturating_sub(6).clamp(44, 78), 17);
         frame.render_widget(Clear, rect);
         hitmap.add(rect, HitTarget::OverlayBody);
 
@@ -145,11 +147,21 @@ impl SettingsOverlay {
             ("List Density", self.density.label().to_string()),
             (
                 "Right Inspector (Backlinks)",
-                if self.show_inspector { "Visible" } else { "Hidden" }.to_string(),
+                if self.show_inspector {
+                    "Visible"
+                } else {
+                    "Hidden"
+                }
+                .to_string(),
             ),
             (
                 "Inline Image Previews",
-                if self.inline_images { "Enabled" } else { "Disabled" }.to_string(),
+                if self.inline_images {
+                    "Enabled"
+                } else {
+                    "Disabled"
+                }
+                .to_string(),
             ),
             ("Image Protocol", self.image_protocol.label().to_string()),
             (
@@ -168,13 +180,19 @@ impl SettingsOverlay {
             let line = Line::from(vec![
                 Span::styled(
                     if is_sel { " ▸ " } else { "   " },
-                    Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     format!("{label:<30}"),
                     Style::default()
                         .fg(theme.fg_primary)
-                        .add_modifier(if is_sel { Modifier::BOLD } else { Modifier::empty() }),
+                        .add_modifier(if is_sel {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
                 ),
                 Span::styled(
                     format!("‹ {value} ›"),
@@ -199,15 +217,30 @@ impl SettingsOverlay {
         if swatch_y > inner.y + 7 {
             let swatches = Line::from(vec![
                 Span::styled("  Palettes: ", theme.muted_style()),
-                Span::styled(" Obsidian Dark ", swatch_pill(self.theme == ThemePreset::ObsidianDark, theme)),
+                Span::styled(
+                    " Obsidian Dark ",
+                    swatch_pill(self.theme == ThemePreset::ObsidianDark, theme),
+                ),
                 Span::raw(" "),
-                Span::styled(" Catppuccin ", swatch_pill(self.theme == ThemePreset::Catppuccin, theme)),
+                Span::styled(
+                    " Catppuccin ",
+                    swatch_pill(self.theme == ThemePreset::Catppuccin, theme),
+                ),
                 Span::raw(" "),
-                Span::styled(" Tokyo Night ", swatch_pill(self.theme == ThemePreset::TokyoNight, theme)),
+                Span::styled(
+                    " Tokyo Night ",
+                    swatch_pill(self.theme == ThemePreset::TokyoNight, theme),
+                ),
                 Span::raw(" "),
-                Span::styled(" Nord ", swatch_pill(self.theme == ThemePreset::Nord, theme)),
+                Span::styled(
+                    " Nord ",
+                    swatch_pill(self.theme == ThemePreset::Nord, theme),
+                ),
                 Span::raw(" "),
-                Span::styled(" Warm Paper ", swatch_pill(self.theme == ThemePreset::WarmPaper, theme)),
+                Span::styled(
+                    " Warm Paper ",
+                    swatch_pill(self.theme == ThemePreset::WarmPaper, theme),
+                ),
             ]);
             frame.render_widget(
                 Paragraph::new(swatches),

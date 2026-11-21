@@ -32,9 +32,9 @@ use crate::{
     models::CoreEvent,
     storage::Storage,
     vault::fs::{
-        content_sha256_hex, has_symlink_component_in_vault, is_html_file_path,
-        is_ignored_dir_name, is_markdown_file_path, rel_path_in_vault, scan_vault_html_files,
-        scan_vault_html_subdir, scan_vault_markdown_subdir,
+        content_sha256_hex, has_symlink_component_in_vault, is_html_file_path, is_ignored_dir_name,
+        is_markdown_file_path, rel_path_in_vault, scan_vault_html_files, scan_vault_html_subdir,
+        scan_vault_markdown_subdir,
     },
 };
 
@@ -407,13 +407,7 @@ pub fn spawn_vault_watcher_with_options(
         diag_bg.initial_scans.fetch_add(1, Ordering::Relaxed);
 
         // 2. Drain any filesystem events queued while initial sync ran
-        drain_pending_native_signals(
-            binding.as_mut(),
-            &mut pending,
-            debounce,
-            max_wait,
-            &diag_bg,
-        );
+        drain_pending_native_signals(binding.as_mut(), &mut pending, debounce, max_wait, &diag_bg);
 
         loop {
             let flush_deadline = pending.flush_at;
@@ -786,7 +780,9 @@ fn classify_notify_event(
         // scans on unrelated temp or non-note files.
         match fs::symlink_metadata(path) {
             Ok(meta) => {
-                if meta.file_type().is_dir() && !meta.file_type().is_symlink() && is_create_or_rename
+                if meta.file_type().is_dir()
+                    && !meta.file_type().is_symlink()
+                    && is_create_or_rename
                 {
                     out.push(ClassifiedChange::DirCreatedOrRenamed(rel));
                 }
@@ -867,7 +863,9 @@ async fn process_batch(
 
         // Expand newly created / moved-in directories ONLY (never full vault).
         for dir_rel in &dir_created {
-            let dir_abs = vault_clone.path.join(dir_rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+            let dir_abs = vault_clone
+                .path
+                .join(dir_rel.replace('/', std::path::MAIN_SEPARATOR_STR));
             if let Ok(meta) = fs::symlink_metadata(&dir_abs) {
                 if meta.file_type().is_dir() && !meta.file_type().is_symlink() {
                     if let Ok(entries) = scan_vault_markdown_subdir(&vault_clone.path, &dir_abs) {
@@ -914,10 +912,8 @@ async fn process_batch(
         let had_md_events = !md_paths.is_empty();
         let outcome = storage_clone.sync_paths(&vault_clone, &md_paths, &dir_removed)?;
         let dv = storage_clone.data_version().ok();
-        let should_emit = outcome.stats.updated > 0
-            || outcome.stats.removed > 0
-            || html_changed
-            || had_md_events;
+        let should_emit =
+            outcome.stats.updated > 0 || outcome.stats.removed > 0 || html_changed || had_md_events;
 
         Ok((
             outcome.stats,
@@ -949,8 +945,10 @@ async fn process_batch(
             if let Some(all_h) = replaced_html {
                 *known_html_paths = all_h.into_iter().collect();
             } else {
-                for hp in html_paths.into_iter().chain(extra_html.into_iter()) {
-                    let abs = vault.path.join(hp.replace('/', std::path::MAIN_SEPARATOR_STR));
+                for hp in html_paths.into_iter().chain(extra_html) {
+                    let abs = vault
+                        .path
+                        .join(hp.replace('/', std::path::MAIN_SEPARATOR_STR));
                     if abs.is_file() {
                         known_html_paths.insert(hp);
                     } else {
@@ -1115,7 +1113,11 @@ mod tests {
         let root = tmp.path().join("WatchVault");
         fs::create_dir_all(root.join("FolderA")).unwrap();
         fs::write(root.join("Alpha.md"), "# Alpha\n\nInitial alpha.\n").unwrap();
-        fs::write(root.join("FolderA/Nested.md"), "# Nested\n\nLinks to [[Alpha]].\n").unwrap();
+        fs::write(
+            root.join("FolderA/Nested.md"),
+            "# Nested\n\nLinks to [[Alpha]].\n",
+        )
+        .unwrap();
 
         let db_file = tmp.path().join("index.db");
         let vault = vault_from_dir(&root, Some("WatchVault"));
@@ -1140,11 +1142,7 @@ mod tests {
         assert_eq!(diag.post_init_full_scans.load(Ordering::Acquire), 0);
 
         // 1. Atomic replace on Alpha.md -> incremental update, 0 full scans
-        write_atomic(
-            &root.join("Alpha.md"),
-            b"# Alpha\n\nATOMIC_TOKEN_101\n",
-        )
-        .unwrap();
+        write_atomic(&root.join("Alpha.md"), b"# Alpha\n\nATOMIC_TOKEN_101\n").unwrap();
         let ev1 = tokio::time::timeout(Duration::from_secs(3), rx.recv())
             .await
             .unwrap()
@@ -1152,7 +1150,9 @@ mod tests {
         assert!(matches!(ev1, CoreEvent::VaultIndexed { .. }));
         assert_eq!(diag.post_init_full_scans.load(Ordering::Acquire), 0);
         assert!(diag.incremental_batches.load(Ordering::Acquire) >= 1);
-        let hits = storage.search_notes(&vault.id, "ATOMIC_TOKEN_101", 10).unwrap();
+        let hits = storage
+            .search_notes(&vault.id, "ATOMIC_TOKEN_101", 10)
+            .unwrap();
         assert_eq!(hits.len(), 1);
 
         // 2. Directory rename FolderA -> FolderB removes old FolderA/Nested.md and indexes FolderB/Nested.md
@@ -1177,7 +1177,10 @@ mod tests {
         // 3. Idle for 1.2s (> 2x watch_poll_ms=500ms) -> 0 full scans and 0 spurious events
         let full_before = diag.post_init_full_scans.load(Ordering::Acquire);
         let spurious = tokio::time::timeout(Duration::from_millis(1200), rx.recv()).await;
-        assert!(spurious.is_err(), "idle vault must not emit spurious events");
+        assert!(
+            spurious.is_err(),
+            "idle vault must not emit spurious events"
+        );
         assert_eq!(
             diag.post_init_full_scans.load(Ordering::Acquire),
             full_before,
@@ -1186,7 +1189,9 @@ mod tests {
 
         // 4. DB-only bookmark toggle from another connection -> detected via PRAGMA data_version
         let storage_other = Storage::open(&db_file).unwrap();
-        assert!(storage_other.toggle_bookmark(&vault.id, "Alpha.md").unwrap());
+        assert!(storage_other
+            .toggle_bookmark(&vault.id, "Alpha.md")
+            .unwrap());
         let ev_bm = tokio::time::timeout(Duration::from_secs(3), rx.recv())
             .await
             .unwrap()

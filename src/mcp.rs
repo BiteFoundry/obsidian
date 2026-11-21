@@ -24,6 +24,7 @@
 
 use std::{
     collections::BTreeMap,
+    fs,
     io::{self, BufRead, Write},
 };
 
@@ -32,7 +33,7 @@ use serde_json::{json, Value};
 
 use crate::{
     config::{AppConfig, VaultProfile},
-    models::{TaskFilter, VaultSummary},
+    models::{NoteOmittedCounts, TaskFilter, VaultSummary},
     storage::Storage,
     vault::{
         fs::{
@@ -209,14 +210,43 @@ impl McpServer {
                 let vault = self.resolve_vault(args)?;
                 let query = req_str(args, "query")?;
                 let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
-                let results = self.storage.search_notes(&vault.id, query, limit)?;
-                Ok(json!({ "query": query, "count": results.len(), "results": results }))
+                let page = self.storage.search_notes_page(&vault.id, query, limit)?;
+                let returned = page.hits.len();
+                Ok(json!({
+                    "query": query,
+                    "limit": page.limit,
+                    "count": returned,
+                    "returned": returned,
+                    "has_more": page.has_more,
+                    "next_cursor": Value::Null,
+                    "results": page.hits,
+                }))
             }
             "read_note" => {
                 let vault = self.resolve_vault(args)?;
                 let note = req_str(args, "note")?;
-                if args.get("compact").and_then(Value::as_bool) == Some(true) {
-                    return Ok(serde_json::to_value(self.storage.load_note_content(&vault, note)?)?);
+                let compact = match args.get("compact") {
+                    None => true,
+                    Some(v) => v
+                        .as_bool()
+                        .ok_or_else(|| anyhow!("Invalid 'compact': expected a boolean"))?,
+                };
+                if compact {
+                    let content = self.storage.load_note_content(&vault, note)?;
+                    let counts = self
+                        .storage
+                        .note_omitted_counts(&vault.id, &content.rel_path)?;
+                    return Ok(json!({
+                        "rel_path": content.rel_path,
+                        "title": content.title,
+                        "raw_markdown": content.raw_markdown,
+                        "mtime_ms": content.mtime_ms,
+                        "omitted": mcp_omitted(
+                            Some(counts),
+                            &["folder", "frontmatter", "word_count"],
+                        ),
+                        "hint": mcp_read_note_hint(&content.rel_path),
+                    }));
                 }
                 let detail = self.storage.load_note_detail(&vault, note)?;
                 Ok(json!({
@@ -227,6 +257,7 @@ impl McpServer {
                     "tags": detail.summary.tags,
                     "aliases": detail.summary.aliases,
                     "word_count": detail.summary.word_count,
+                    "mtime_ms": detail.summary.mtime_ms,
                     "raw_markdown": detail.raw_markdown,
                     "headings": detail.parsed.headings,
                     "tasks": detail.parsed.tasks,
@@ -237,8 +268,20 @@ impl McpServer {
             "list_notes" => {
                 let vault = self.resolve_vault(args)?;
                 let folder = args.get("folder").and_then(|v| v.as_str());
-                let notes = self.storage.list_notes(&vault.id, folder)?;
-                Ok(json!({ "count": notes.len(), "notes": notes }))
+                let limit = parse_page_limit(args)?;
+                let cursor = parse_page_cursor(args)?;
+                let page = self
+                    .storage
+                    .list_notes_page(&vault.id, folder, cursor, Some(limit))?;
+                let returned = page.items.len();
+                Ok(json!({
+                    "count": returned,
+                    "returned": returned,
+                    "total": page.total,
+                    "has_more": page.has_more,
+                    "next_cursor": page.next_cursor,
+                    "notes": page.items,
+                }))
             }
             "create_note" => {
                 let vault = self.resolve_vault(args)?;
@@ -261,7 +304,9 @@ impl McpServer {
             "append_note" => {
                 let vault = self.resolve_vault(args)?;
                 let note = req_str(args, "note")?;
-                let text = args.get("text").and_then(Value::as_str)
+                let text = args
+                    .get("text")
+                    .and_then(Value::as_str)
                     .filter(|text| !text.is_empty())
                     .ok_or_else(|| anyhow!("Missing required string argument 'text'"))?;
                 let rel_path = self.storage.resolve_note_path(&vault.id, note)?;
@@ -281,7 +326,10 @@ impl McpServer {
                     .get("replace")
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow!("Missing required string argument 'replace'"))?;
-                Ok(serde_json::to_value(self.storage.replace_note_text(&vault, note, find, replace)?)?)
+                Ok(serde_json::to_value(
+                    self.storage
+                        .replace_note_text(&vault, note, find, replace)?,
+                )?)
             }
             "update_frontmatter" => {
                 let vault = self.resolve_vault(args)?;
@@ -298,7 +346,9 @@ impl McpServer {
                 let abs = safe_vault_path(&vault.path, &rel_path)?;
                 update_note_frontmatter(&abs, &map)?;
                 let _ = self.storage.sync_vault(&vault);
-                Ok(json!({ "updated": true, "rel_path": rel_path, "keys": map.keys().collect::<Vec<_>>() }))
+                Ok(
+                    json!({ "updated": true, "rel_path": rel_path, "keys": map.keys().collect::<Vec<_>>() }),
+                )
             }
             "delete_note" => {
                 let confirm = args
@@ -335,12 +385,23 @@ impl McpServer {
                 if let Some(txt) = append.filter(|s| !s.trim().is_empty()) {
                     append_to_note(&abs, txt)?;
                 }
-                let _ = self.storage.sync_vault(&vault);
-                let detail = self.storage.load_note_detail(&vault, &rel_path)?;
+                let counts = if self.storage.sync_vault(&vault).is_ok() {
+                    self.storage.note_omitted_counts(&vault.id, &rel_path).ok()
+                } else {
+                    None
+                };
+                let raw_bytes = fs::read(&abs)?;
+                let raw_markdown = String::from_utf8(raw_bytes)
+                    .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
                 Ok(json!({
                     "rel_path": rel_path,
                     "created": created,
-                    "raw_markdown": detail.raw_markdown,
+                    "raw_markdown": raw_markdown,
+                    "omitted": mcp_omitted(
+                        counts,
+                        &["title", "mtime_ms", "folder", "frontmatter", "word_count"],
+                    ),
+                    "hint": mcp_read_note_hint(&rel_path),
                 }))
             }
             "get_backlinks" => {
@@ -354,7 +415,7 @@ impl McpServer {
                 let vault = self.resolve_vault(args)?;
                 let note = req_str(args, "note")?;
                 let rel_path = self.storage.resolve_note_path(&vault.id, note)?;
-                let links = self.storage.get_outgoing_links(&vault.id, &rel_path)?;
+                let links = self.storage.get_outgoing_links(&vault, &rel_path)?;
                 Ok(json!({ "note": rel_path, "count": links.len(), "outgoing_links": links }))
             }
             "get_local_graph" => {
@@ -369,7 +430,9 @@ impl McpServer {
                     None => None,
                 };
                 let depth = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(2) as usize;
-                let graph = self.storage.get_graph(&vault.id, center.as_deref(), depth)?;
+                let graph = self
+                    .storage
+                    .get_graph(&vault.id, center.as_deref(), depth)?;
                 Ok(serde_json::to_value(graph)?)
             }
             "list_tags" => {
@@ -381,7 +444,9 @@ impl McpServer {
                 let vault = self.resolve_vault(args)?;
                 let tag = req_str(args, "tag")?;
                 let notes = self.storage.find_by_tag(&vault.id, tag)?;
-                Ok(json!({ "tag": tag.trim_start_matches('#'), "count": notes.len(), "notes": notes }))
+                Ok(
+                    json!({ "tag": tag.trim_start_matches('#'), "count": notes.len(), "notes": notes }),
+                )
             }
             "list_tasks" => {
                 let vault = self.resolve_vault(args)?;
@@ -404,19 +469,31 @@ impl McpServer {
                     Some(n) => Some(self.storage.resolve_note_path(&vault.id, n)?),
                     None => None,
                 };
-                let tasks = self
-                    .storage
-                    .list_tasks(&vault.id, filter, note_path.as_deref())?;
-                Ok(json!({ "count": tasks.len(), "tasks": tasks }))
+                let limit = parse_page_limit(args)?;
+                let cursor = parse_page_cursor(args)?;
+                let page = self.storage.list_tasks_page(
+                    &vault.id,
+                    filter,
+                    note_path.as_deref(),
+                    cursor,
+                    Some(limit),
+                )?;
+                let returned = page.items.len();
+                Ok(json!({
+                    "count": returned,
+                    "returned": returned,
+                    "total": page.total,
+                    "has_more": page.has_more,
+                    "next_cursor": page.next_cursor,
+                    "tasks": page.items,
+                }))
             }
             "toggle_task" => {
                 let vault = self.resolve_vault(args)?;
                 let note = req_str(args, "note")?;
-                let line = args
-                    .get("line")
-                    .and_then(|v| v.as_u64())
-                    .ok_or_else(|| anyhow!("Missing integer argument 'line' (1-based line number)"))?
-                    as usize;
+                let line = args.get("line").and_then(|v| v.as_u64()).ok_or_else(|| {
+                    anyhow!("Missing integer argument 'line' (1-based line number)")
+                })? as usize;
                 let expected_text = args.get("expected_text").and_then(|v| v.as_str());
                 let expected_checked = args.get("expected_checked").and_then(|v| v.as_bool());
                 let expected_mtime_ms = args.get("expected_mtime_ms").and_then(|v| v.as_i64());
@@ -430,12 +507,8 @@ impl McpServer {
                         );
                     }
                 }
-                let checked = toggle_task_at_line_verified(
-                    &abs,
-                    line,
-                    expected_text,
-                    expected_checked,
-                )?;
+                let checked =
+                    toggle_task_at_line_verified(&abs, line, expected_text, expected_checked)?;
                 let _ = self.storage.sync_vault(&vault);
                 Ok(json!({ "rel_path": rel_path, "line": line, "checked": checked }))
             }
@@ -465,6 +538,56 @@ fn req_nonblank_string<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
         .ok_or_else(|| anyhow!("Missing required string argument '{key}'"))
 }
 
+fn mcp_read_note_hint(rel_path: &str) -> String {
+    format!(
+        "read_note {}",
+        json!({ "note": rel_path, "compact": false })
+    )
+}
+
+fn mcp_omitted(counts: Option<NoteOmittedCounts>, fields: &[&str]) -> Value {
+    match counts {
+        Some(c) => json!({
+            "backlinks": c.backlinks,
+            "outgoing_links": c.outgoing_links,
+            "tags": c.tags,
+            "aliases": c.aliases,
+            "headings": c.headings,
+            "tasks": c.tasks,
+            "fields": fields,
+        }),
+        None => json!({
+            "backlinks": Value::Null,
+            "outgoing_links": Value::Null,
+            "tags": Value::Null,
+            "aliases": Value::Null,
+            "headings": Value::Null,
+            "tasks": Value::Null,
+            "fields": fields,
+        }),
+    }
+}
+
+fn parse_page_limit(args: &Value) -> Result<usize> {
+    match args.get("limit") {
+        None => Ok(50),
+        Some(v) => match v.as_u64() {
+            Some(n) if (1..=500).contains(&n) => Ok(n as usize),
+            _ => bail!("Invalid 'limit': expected an integer from 1 to 500"),
+        },
+    }
+}
+
+fn parse_page_cursor(args: &Value) -> Result<Option<&str>> {
+    match args.get("cursor") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => match v.as_str() {
+            Some(s) => Ok(Some(s)),
+            None => bail!("Invalid 'cursor': expected a string"),
+        },
+    }
+}
+
 /// Returns the typed MCP tool schemas.
 pub fn tool_definitions() -> Vec<Value> {
     vec![
@@ -480,7 +603,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "Search query string." },
-                    "limit": { "type": "integer", "description": "Maximum results (default 20)." },
+                    "limit": { "type": "integer", "description": "Maximum results 1..200 (default 20). Out-of-range values are clamped; the response reports the limit used and has_more." },
                     "vault": { "type": "string", "description": "Optional vault name, ID, or path." }
                 },
                 "required": ["query"]
@@ -488,12 +611,12 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "read_note",
-            "Read a Markdown note including YAML frontmatter, tags, headings, tasks, backlinks, and outgoing wikilinks.",
+            "Read a Markdown note. Returns a compact object by default; pass compact:false for frontmatter, tags, headings, tasks, backlinks, and outgoing links.",
             json!({
                 "type": "object",
                 "properties": {
                     "note": { "type": "string", "description": "Relative path, note title, or alias." },
-                    "compact": { "type": "boolean", "description": "Return only rel_path, title, and raw_markdown (default false)." },
+                    "compact": { "type": "boolean", "description": "Default true: return rel_path, title, raw_markdown, mtime_ms, omitted, and hint. Set false for frontmatter, tags, headings, tasks, backlinks, and outgoing links." },
                     "vault": { "type": "string", "description": "Optional vault name, ID, or path." }
                 },
                 "required": ["note"]
@@ -506,6 +629,8 @@ pub fn tool_definitions() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "folder": { "type": "string", "description": "Optional folder prefix filter." },
+                    "limit": { "type": "integer", "description": "Page size 1..500 (default 50)." },
+                    "cursor": { "type": "string", "description": "next_cursor from the previous page." },
                     "vault": { "type": "string", "description": "Optional vault name, ID, or path." }
                 }
             }),
@@ -580,7 +705,7 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "daily_note",
-            "Open or create today's Daily Note (or a specific YYYY-MM-DD date) and optionally append text.",
+            "Open or create today's Daily Note (or a specific YYYY-MM-DD date) and optionally append text. The result is the write receipt plus the note body; for metadata call read_note with the returned rel_path and compact:false. Each call with append appends again.",
             json!({
                 "type": "object",
                 "properties": {
@@ -604,7 +729,7 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "get_outgoing_links",
-            "Return all outgoing wikilinks and embeds from a note, including resolved and unresolved targets.",
+            "Return all outgoing wikilinks and embeds from a note, including resolved and unresolved targets. Each entry has a status: resolved, attachment, ambiguous, or missing.",
             json!({
                 "type": "object",
                 "properties": {
@@ -616,12 +741,12 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "get_local_graph",
-            "Return the local BFS knowledge graph around a note (or the full vault graph when note is omitted).",
+            "Return the local BFS knowledge graph around a note (or the full vault graph when note is omitted). Omitting note returns every note and edge in the vault; pass note for a bounded neighborhood.",
             json!({
                 "type": "object",
                 "properties": {
                     "note": { "type": "string", "description": "Optional center note path, title, or alias." },
-                    "depth": { "type": "integer", "description": "Neighborhood hop depth 1..5 (default 2)." },
+                    "depth": { "type": "integer", "description": "Neighborhood hop depth 1..5 (default 2; other values are clamped and the result reports the depth used)." },
                     "vault": { "type": "string", "description": "Optional vault name, ID, or path." }
                 }
             }),
@@ -656,6 +781,8 @@ pub fn tool_definitions() -> Vec<Value> {
                 "properties": {
                     "status": { "type": "string", "enum": ["all", "open", "done"], "description": "Filter by task status." },
                     "note": { "type": "string", "description": "Optional note filter." },
+                    "limit": { "type": "integer", "description": "Page size 1..500 (default 50)." },
+                    "cursor": { "type": "string", "description": "next_cursor from the previous page." },
                     "vault": { "type": "string", "description": "Optional vault name, ID, or path." }
                 }
             }),

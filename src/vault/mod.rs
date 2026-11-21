@@ -111,7 +111,11 @@ pub fn discover_native_vaults_from(config_path: &Path) -> Vec<VaultProfile> {
         b.open_in_obsidian
             .cmp(&a.open_in_obsidian)
             .then_with(|| b.ts.cmp(&a.ts))
-            .then_with(|| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()))
+            .then_with(|| {
+                a.name
+                    .to_ascii_lowercase()
+                    .cmp(&b.name.to_ascii_lowercase())
+            })
     });
     vaults
 }
@@ -146,10 +150,7 @@ pub fn merged_vaults(cfg: &AppConfig) -> Vec<VaultProfile> {
 }
 
 /// Resolves the target vault from CLI `--vault`, `OBSIDIAN_VAULT`, active config, or auto-discovery.
-pub fn resolve_active_vault(
-    cfg: &AppConfig,
-    cli_override: Option<&str>,
-) -> Result<VaultProfile> {
+pub fn resolve_active_vault(cfg: &AppConfig, cli_override: Option<&str>) -> Result<VaultProfile> {
     let all = merged_vaults(cfg);
 
     if let Some(spec) = cli_override.map(str::trim).filter(|s| !s.is_empty()) {
@@ -188,11 +189,7 @@ pub fn resolve_active_vault(
     )
 }
 
-fn resolve_explicit_vault(
-    all: &[VaultProfile],
-    spec: &str,
-    _source: &str,
-) -> Result<VaultProfile> {
+fn resolve_explicit_vault(all: &[VaultProfile], spec: &str, _source: &str) -> Result<VaultProfile> {
     if let Some(found) = find_vault_in_slice(all, spec) {
         if found.exists() {
             return Ok(found.clone());

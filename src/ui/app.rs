@@ -16,8 +16,8 @@ use crate::{
         RenderedTerminalImage, TerminalGraphicsCaps, TerminalImageProtocol,
     },
     models::{
-        CoreEvent, GraphData, IndexStats, NoteBlock, NoteDetail, NoteSummary, OutgoingLinkEntry,
-        SidebarTab, TagCount, TaskEntry, TaskFilter,
+        CoreEvent, GraphData, IndexStats, LinkStatus, NoteBlock, NoteDetail, NoteSummary,
+        OutgoingLinkEntry, SidebarTab, TagCount, TaskEntry, TaskFilter,
     },
     storage::Storage,
     sync::SyncController,
@@ -32,9 +32,7 @@ use crate::{
             confirm::ConfirmOverlay,
             context_menu::ContextMenuOverlay,
             file_picker::FilePickerOverlay,
-            html_preview::{
-                extract_note_html_candidates, HtmlPreviewOverlay, HtmlPreviewSource,
-            },
+            html_preview::{extract_note_html_candidates, HtmlPreviewOverlay, HtmlPreviewSource},
             image_preview::ImagePreviewOverlay,
             links::LinkExtractorOverlay,
             note_form::NoteFormOverlay,
@@ -51,10 +49,10 @@ use crate::{
         fs::{
             append_to_note, content_sha256_bytes, create_note, ensure_daily_note,
             extract_local_markdown_note_link, file_mtime_and_size, hydrate_parsed_note_links,
-            inline_image_cache_key, is_html_file_path, move_note_to_trash,
-            resolve_attachment_path, resolve_markdown_link_from_source,
-            resolve_wikilink_from_source, safe_vault_path, save_vault_attachment,
-            scan_vault_html_files, toggle_task_at_line_verified, VaultHtmlFile,
+            inline_image_cache_key, is_html_file_path, move_note_to_trash, resolve_attachment_path,
+            resolve_markdown_link_from_source, resolve_wikilink_from_source, safe_vault_path,
+            save_vault_attachment, scan_vault_html_files, toggle_task_at_line_verified,
+            VaultHtmlFile,
         },
         merged_vaults,
         parser::parse_markdown,
@@ -274,16 +272,23 @@ impl AppState {
             .list_tasks(&vid, TaskFilter::All, None)
             .unwrap_or_default();
 
-        if let Some((ed_path, ed_base_hash, ed_dirty, prev_conflict)) = ui
-            .inline_editor
-            .as_ref()
-            .map(|e| (e.note_path.clone(), e.base_content_hash, e.dirty, e.external_conflict.clone()))
+        if let Some((ed_path, ed_base_hash, ed_dirty, prev_conflict)) =
+            ui.inline_editor.as_ref().map(|e| {
+                (
+                    e.note_path.clone(),
+                    e.base_content_hash,
+                    e.dirty,
+                    e.external_conflict.clone(),
+                )
+            })
         {
             match self.inspect_editor_disk_state(&ed_path, ed_base_hash) {
                 EditorDiskState::Unchanged => {
                     if ed_dirty {
                         self.apply_live_inline_parse(ui);
-                    } else if let Ok(detail) = self.storage.load_note_detail(&self.active_vault, &ed_path) {
+                    } else if let Ok(detail) =
+                        self.storage.load_note_detail(&self.active_vault, &ed_path)
+                    {
                         self.cache_inline_images(&detail);
                         self.active_note = Some(detail);
                     }
@@ -293,7 +298,9 @@ impl AppState {
                         if let Some(ref mut ed) = ui.inline_editor {
                             ed.reload_from_disk(&text, hash);
                         }
-                        if let Ok(detail) = self.storage.load_note_detail(&self.active_vault, &ed_path) {
+                        if let Ok(detail) =
+                            self.storage.load_note_detail(&self.active_vault, &ed_path)
+                        {
                             self.cache_inline_images(&detail);
                             self.active_note = Some(detail);
                         } else {
@@ -426,17 +433,12 @@ impl AppState {
             let prefix = format!("inline:{}:", img.abs_path.to_string_lossy());
             self.preview_cache.retain(|k, _| !k.starts_with(&prefix));
             if let Ok(bytes) = fs::read(&img.abs_path) {
-                if sniff_content_kind(
-                    Some(&img.mime_type),
-                    Some(&img.display_name),
-                    Some(&bytes),
-                ) != ContentKind::RasterImage
+                if sniff_content_kind(Some(&img.mime_type), Some(&img.display_name), Some(&bytes))
+                    != ContentKind::RasterImage
                 {
                     continue;
                 }
-                if let Ok(rendered) =
-                    decode_and_render_halfblocks(&bytes, 48, 10, (19, 19, 24))
-                {
+                if let Ok(rendered) = decode_and_render_halfblocks(&bytes, 48, 10, (19, 19, 24)) {
                     self.preview_cache.insert(key, rendered);
                 }
             }
@@ -527,7 +529,9 @@ impl AppState {
         if open_browser {
             match open::that(&url) {
                 Ok(()) => ui.toasts.success(format!("Opened in browser: {url}")),
-                Err(e) => ui.toasts.warning(format!("Served at {url} (browser failed: {e})")),
+                Err(e) => ui
+                    .toasts
+                    .warning(format!("Served at {url} (browser failed: {e})")),
             }
         } else {
             ui.toasts.success(format!("Served HTML at {url}"));
@@ -643,7 +647,11 @@ impl AppState {
             return;
         }
         if push_history {
-            if let Some(cur) = self.active_note.as_ref().map(|d| d.summary.rel_path.clone()) {
+            if let Some(cur) = self
+                .active_note
+                .as_ref()
+                .map(|d| d.summary.rel_path.clone())
+            {
                 if !cur.eq_ignore_ascii_case(note_ref) {
                     self.history.push(cur);
                     if self.history.len() > 64 {
@@ -666,10 +674,13 @@ impl AppState {
             Err(_) => {
                 // Create note on demand if user clicked an unresolved [[wikilink]]
                 let clean = note_ref.strip_prefix("unresolved:").unwrap_or(note_ref);
-                if let Ok((rel_path, _)) = create_note(&self.active_vault.path, clean, None, None, &[]) {
+                if let Ok((rel_path, _)) =
+                    create_note(&self.active_vault.path, clean, None, None, &[])
+                {
                     let _ = self.storage.sync_vault(&self.active_vault);
                     self.reload_from_storage(ui);
-                    if let Ok(detail) = self.storage.load_note_detail(&self.active_vault, &rel_path) {
+                    if let Ok(detail) = self.storage.load_note_detail(&self.active_vault, &rel_path)
+                    {
                         self.active_note = Some(detail);
                         ui.canvas_mode = CanvasMode::Note;
                         ui.toasts.success(format!("Created note: {rel_path}"));
@@ -764,8 +775,12 @@ impl AppState {
             .wikilinks
             .iter()
             .map(|wl| {
-                let resolved_path =
-                    resolve_wikilink_from_source(&wl.target_raw, &rel_path, &all_paths, &aliases_map);
+                let resolved_path = resolve_wikilink_from_source(
+                    &wl.target_raw,
+                    &rel_path,
+                    &all_paths,
+                    &aliases_map,
+                );
                 let resolved = resolved_path.is_some();
                 let target_title = resolved_path
                     .as_ref()
@@ -779,6 +794,12 @@ impl AppState {
                     heading: wl.heading.clone(),
                     is_embed: wl.is_embed,
                     resolved,
+                    status: if resolved {
+                        LinkStatus::Resolved
+                    } else {
+                        LinkStatus::Missing
+                    },
+                    candidates: Vec::new(),
                 }
             })
             .collect();
@@ -803,6 +824,12 @@ impl AppState {
                     heading,
                     is_embed: false,
                     resolved,
+                    status: if resolved {
+                        LinkStatus::Resolved
+                    } else {
+                        LinkStatus::Missing
+                    },
+                    candidates: Vec::new(),
                 });
             }
         }
@@ -862,7 +889,10 @@ impl AppState {
                         ed.reload_from_disk(&text, hash);
                     }
                     let _ = self.storage.sync_vault(&self.active_vault);
-                    if let Ok(detail) = self.storage.load_note_detail(&self.active_vault, &note_path) {
+                    if let Ok(detail) = self
+                        .storage
+                        .load_note_detail(&self.active_vault, &note_path)
+                    {
                         self.cache_inline_images(&detail);
                         self.active_note = Some(detail);
                     } else {
@@ -941,7 +971,10 @@ impl AppState {
                     detail.summary.backlink_count = bl.len();
                     detail.backlinks = bl;
                 }
-                if let Ok(ol) = self.storage.get_outgoing_links(&vid, &note_path) {
+                if let Ok(ol) = self
+                    .storage
+                    .get_outgoing_links(&self.active_vault, &note_path)
+                {
                     detail.summary.outgoing_count = ol.len();
                     detail.outgoing_links = ol;
                 }
@@ -981,10 +1014,8 @@ impl AppState {
     /// at the exact same scroll offset on frame 0. Returns `false` if save was blocked (e.g.
     /// external conflict) so the editor stays open and local edits remain on screen.
     pub fn finish_inline_edit(&mut self, ui: &mut UiState) -> bool {
-        if ui.inline_editor.as_ref().is_some_and(|e| e.dirty) {
-            if !self.flush_inline_save(ui) {
-                return false;
-            }
+        if ui.inline_editor.as_ref().is_some_and(|e| e.dirty) && !self.flush_inline_save(ui) {
+            return false;
         }
         if let Some(ed) = ui.inline_editor.take() {
             let disk_changed = !matches!(
@@ -1052,8 +1083,7 @@ impl AppState {
                     }
                     OverlayOutcome::NotHandled => {
                         ui.overlay = Some(ov);
-                        matches!(action, Action::Quit | Action::QuitConfirm)
-                            .then(|| action.clone())
+                        matches!(action, Action::Quit | Action::QuitConfirm).then(|| action.clone())
                     }
                 }
             } else {
@@ -1382,7 +1412,8 @@ impl AppState {
                 self.refresh_graph(ui);
             }
             Action::GraphZoomIn => {
-                ui.graph_sim.zoom_by(crate::ui::graph_view::GRAPH_WHEEL_FACTOR);
+                ui.graph_sim
+                    .zoom_by(crate::ui::graph_view::GRAPH_WHEEL_FACTOR);
             }
             Action::GraphZoomOut => {
                 ui.graph_sim
@@ -1428,9 +1459,7 @@ impl AppState {
                 if ui.focus == Focus::Sidebar && ui.sidebar_tab == SidebarTab::Tasks {
                     let entries = build_sidebar_entries(self, ui);
                     if let Some(SidebarEntry::Task {
-                        note_path,
-                        line_no,
-                        ..
+                        note_path, line_no, ..
                     }) = entries.get(ui.sidebar_selected).cloned()
                     {
                         self.dispatch_core(Action::ToggleTaskAtLine { note_path, line_no }, ui);
@@ -1441,7 +1470,13 @@ impl AppState {
                     {
                         let note_path = d.summary.rel_path.clone();
                         let ln = *line_no;
-                        self.dispatch_core(Action::ToggleTaskAtLine { note_path, line_no: ln }, ui);
+                        self.dispatch_core(
+                            Action::ToggleTaskAtLine {
+                                note_path,
+                                line_no: ln,
+                            },
+                            ui,
+                        );
                     }
                 }
             }
@@ -1497,12 +1532,7 @@ impl AppState {
 
             Action::JumpToHeadingLine(line_no) => {
                 if let Some(d) = &self.active_note {
-                    if let Some(idx) = d
-                        .parsed
-                        .blocks
-                        .iter()
-                        .position(|b| b.line_no() >= line_no)
-                    {
+                    if let Some(idx) = d.parsed.blocks.iter().position(|b| b.line_no() >= line_no) {
                         ui.canvas_mode = CanvasMode::Note;
                         ui.canvas_selected_block = idx;
                         ui.canvas_scroll = 0;
@@ -1664,36 +1694,32 @@ impl AppState {
                     }
                 }
             }
-            Action::PasteClipboard => {
-                match read_clipboard_image_png() {
-                    Ok(Some((filename, bytes))) => {
-                        let name = if filename.trim().is_empty() {
-                            format!("pasted-{}.png", Local::now().format("%Y%m%d-%H%M%S"))
-                        } else {
-                            filename
-                        };
-                        match save_vault_attachment(&self.active_vault, &name, &bytes) {
-                            Ok((saved_name, _)) => {
-                                if let Some(d) = &self.active_note {
-                                    if let Ok(abs) = safe_vault_path(
-                                        &self.active_vault.path,
-                                        &d.summary.rel_path,
-                                    ) {
-                                        let _ =
-                                            append_to_note(&abs, &format!("\n![[{saved_name}]]"));
-                                        let _ = self.storage.sync_vault(&self.active_vault);
-                                        self.reload_from_storage(ui);
-                                        ui.toasts.success(format!("Pasted ![[{saved_name}]]"));
-                                    }
+            Action::PasteClipboard => match read_clipboard_image_png() {
+                Ok(Some((filename, bytes))) => {
+                    let name = if filename.trim().is_empty() {
+                        format!("pasted-{}.png", Local::now().format("%Y%m%d-%H%M%S"))
+                    } else {
+                        filename
+                    };
+                    match save_vault_attachment(&self.active_vault, &name, &bytes) {
+                        Ok((saved_name, _)) => {
+                            if let Some(d) = &self.active_note {
+                                if let Ok(abs) =
+                                    safe_vault_path(&self.active_vault.path, &d.summary.rel_path)
+                                {
+                                    let _ = append_to_note(&abs, &format!("\n![[{saved_name}]]"));
+                                    let _ = self.storage.sync_vault(&self.active_vault);
+                                    self.reload_from_storage(ui);
+                                    ui.toasts.success(format!("Pasted ![[{saved_name}]]"));
                                 }
                             }
-                            Err(e) => ui.toasts.error(format!("Clipboard save failed: {e}")),
                         }
+                        Err(e) => ui.toasts.error(format!("Clipboard save failed: {e}")),
                     }
-                    Ok(None) => ui.toasts.info("No image found in clipboard"),
-                    Err(e) => ui.toasts.warning(format!("Clipboard error: {e}")),
                 }
-            }
+                Ok(None) => ui.toasts.info("No image found in clipboard"),
+                Err(e) => ui.toasts.warning(format!("Clipboard error: {e}")),
+            },
 
             Action::OpenLinkExtractor => {
                 if let Some(d) = &self.active_note {
@@ -1879,8 +1905,10 @@ impl AppState {
                         }
                     } else if ui.graph_sim.panning {
                         if let Some((lc, lr)) = ui.graph_sim.last_mouse {
-                            ui.graph_sim
-                                .pan_by_screen_delta(col as i32 - lc as i32, row as i32 - lr as i32);
+                            ui.graph_sim.pan_by_screen_delta(
+                                col as i32 - lc as i32,
+                                row as i32 - lr as i32,
+                            );
                         }
                         ui.graph_sim.last_mouse = Some((col, row));
                     }

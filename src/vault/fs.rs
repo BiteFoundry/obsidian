@@ -69,8 +69,7 @@ pub fn rel_path_in_vault(
                 let matched_rest = if cfg!(windows) {
                     let p_low = p_str.to_ascii_lowercase();
                     let r_low = r_str.to_ascii_lowercase();
-                    if p_low.starts_with(&r_low)
-                        && p_str.as_bytes().get(r_str.len()) == Some(&b'/')
+                    if p_low.starts_with(&r_low) && p_str.as_bytes().get(r_str.len()) == Some(&b'/')
                     {
                         Some(&p_str[r_str.len() + 1..])
                     } else {
@@ -191,7 +190,11 @@ pub fn scan_vault_html_files(vault_root: &Path) -> Result<Vec<VaultHtmlFile>> {
     }
     let mut out = Vec::new();
     walk_html_dir_recursive(vault_root, vault_root, &mut out)?;
-    out.sort_by(|a, b| a.rel_path.to_ascii_lowercase().cmp(&b.rel_path.to_ascii_lowercase()));
+    out.sort_by(|a, b| {
+        a.rel_path
+            .to_ascii_lowercase()
+            .cmp(&b.rel_path.to_ascii_lowercase())
+    });
     Ok(out)
 }
 
@@ -205,7 +208,11 @@ pub fn scan_vault_html_subdir(vault_root: &Path, subdir: &Path) -> Result<Vec<Va
     }
     let mut out = Vec::new();
     walk_html_dir_recursive(vault_root, subdir, &mut out)?;
-    out.sort_by(|a, b| a.rel_path.to_ascii_lowercase().cmp(&b.rel_path.to_ascii_lowercase()));
+    out.sort_by(|a, b| {
+        a.rel_path
+            .to_ascii_lowercase()
+            .cmp(&b.rel_path.to_ascii_lowercase())
+    });
     Ok(out)
 }
 
@@ -257,7 +264,11 @@ pub fn scan_vault_markdown_files(vault_root: &Path) -> Result<Vec<DiskNoteEntry>
     }
     let mut out = Vec::new();
     walk_dir_recursive(vault_root, vault_root, &mut out)?;
-    out.sort_by(|a, b| a.rel_path.to_ascii_lowercase().cmp(&b.rel_path.to_ascii_lowercase()));
+    out.sort_by(|a, b| {
+        a.rel_path
+            .to_ascii_lowercase()
+            .cmp(&b.rel_path.to_ascii_lowercase())
+    });
     Ok(out)
 }
 
@@ -271,7 +282,11 @@ pub fn scan_vault_markdown_subdir(vault_root: &Path, subdir: &Path) -> Result<Ve
     }
     let mut out = Vec::new();
     walk_dir_recursive(vault_root, subdir, &mut out)?;
-    out.sort_by(|a, b| a.rel_path.to_ascii_lowercase().cmp(&b.rel_path.to_ascii_lowercase()));
+    out.sort_by(|a, b| {
+        a.rel_path
+            .to_ascii_lowercase()
+            .cmp(&b.rel_path.to_ascii_lowercase())
+    });
     Ok(out)
 }
 
@@ -459,7 +474,112 @@ pub fn resolve_wikilink_target(
 }
 
 fn wikilink_note_target(raw: &str) -> String {
-    raw.split('#').next().unwrap_or(raw).trim().replace('\\', "/")
+    raw.split('#')
+        .next()
+        .unwrap_or(raw)
+        .trim()
+        .replace('\\', "/")
+}
+
+/// Matches of the stage that decides a wikilink target, sorted. Exactly one entry means resolved.
+pub(crate) fn wikilink_candidates_from_source(
+    target_raw: &str,
+    source_rel: &str,
+    paths: &[String],
+    aliases: &HashMap<String, Vec<String>>,
+) -> Vec<String> {
+    let raw = wikilink_note_target(target_raw);
+    if raw.is_empty() || is_image_target(&raw) {
+        return Vec::new();
+    }
+    let target = raw.to_ascii_lowercase();
+    let target = if target.ends_with(".md") {
+        target
+    } else {
+        format!("{target}.md")
+    };
+    let collect_sorted = |iter: &mut dyn Iterator<Item = &String>| -> Vec<String> {
+        let mut found: Vec<String> = iter.cloned().collect();
+        found.sort();
+        found.dedup();
+        found
+    };
+    let exact_all = |path: &str| -> Vec<String> {
+        let mut found: Vec<String> = paths
+            .iter()
+            .filter(|p| p.eq_ignore_ascii_case(path))
+            .cloned()
+            .collect();
+        found.sort();
+        found.dedup();
+        found
+    };
+    let source_folder = source_rel.rsplit_once('/').map_or("", |(folder, _)| folder);
+
+    if let Some(rooted) = target.strip_prefix('/') {
+        let Some(normalized) = normalize_vault_rel_path("", rooted) else {
+            return Vec::new();
+        };
+        return exact_all(&normalized);
+    }
+    if target.starts_with("./") || target.starts_with("../") {
+        let mut components: Vec<_> = source_folder.split('/').filter(|s| !s.is_empty()).collect();
+        for component in target.split('/') {
+            match component {
+                "." | "" => {}
+                ".." => {
+                    if components.pop().is_none() {
+                        return Vec::new();
+                    }
+                }
+                _ => components.push(component),
+            }
+        }
+        return exact_all(&components.join("/"));
+    }
+    if target.contains('/') {
+        let exact = exact_all(&target);
+        if exact.len() == 1 {
+            return exact;
+        }
+        let suffix = format!("/{target}");
+        let suffix_matches = collect_sorted(
+            &mut paths
+                .iter()
+                .filter(|p| p.to_ascii_lowercase().ends_with(&suffix)),
+        );
+        if !suffix_matches.is_empty() {
+            return suffix_matches;
+        }
+        return exact;
+    }
+
+    let local = if source_folder.is_empty() {
+        target.clone()
+    } else {
+        format!("{source_folder}/{target}")
+    };
+    let local_exact = exact_all(&local);
+    if local_exact.len() == 1 {
+        return local_exact;
+    }
+
+    let by_filename = collect_sorted(&mut paths.iter().filter(|p| {
+        p.rsplit('/')
+            .next()
+            .is_some_and(|filename| filename.eq_ignore_ascii_case(&target))
+    }));
+    if !by_filename.is_empty() {
+        return by_filename;
+    }
+
+    let stem = target.strip_suffix(".md").unwrap_or(&target);
+    collect_sorted(&mut aliases.iter().filter_map(|(path, names)| {
+        names
+            .iter()
+            .any(|name| name.trim().eq_ignore_ascii_case(stem))
+            .then_some(path)
+    }))
 }
 
 /// Resolves a wikilink target relative to `source_rel`.
@@ -469,6 +589,7 @@ fn wikilink_note_target(raw: &str) -> String {
 /// - `./...` and `../...` resolve relative to `source_rel`'s folder
 /// - paths with `/` match exact vault relative path, then a unique suffix match
 /// - bare names check same-folder exact filename -> unique filename across vault -> unique alias
+///
 /// Ambiguous multi-candidate matches return `None` (unresolved).
 pub fn resolve_wikilink_from_source(
     target_raw: &str,
@@ -476,68 +597,8 @@ pub fn resolve_wikilink_from_source(
     paths: &[String],
     aliases: &HashMap<String, Vec<String>>,
 ) -> Option<String> {
-    fn unique<'a>(mut matches: impl Iterator<Item = &'a String>) -> Option<String> {
-        let first = matches.next()?;
-        matches.next().is_none().then(|| first.clone())
-    }
-
-    let raw = wikilink_note_target(target_raw);
-    if raw.is_empty() || is_image_target(&raw) {
-        return None;
-    }
-    let target = raw.to_ascii_lowercase();
-    let target = if target.ends_with(".md") {
-        target
-    } else {
-        format!("{target}.md")
-    };
-    let exact = |path: &str| unique(paths.iter().filter(|p| p.eq_ignore_ascii_case(path)));
-    let source_folder = source_rel.rsplit_once('/').map_or("", |(folder, _)| folder);
-
-    if let Some(rooted) = target.strip_prefix('/') {
-        let normalized = normalize_vault_rel_path("", rooted)?;
-        return exact(&normalized);
-    }
-    if target.starts_with("./") || target.starts_with("../") {
-        let mut components: Vec<_> = source_folder.split('/').filter(|s| !s.is_empty()).collect();
-        for component in target.split('/') {
-            match component {
-                "." | "" => {}
-                ".." => {
-                    components.pop()?;
-                }
-                _ => components.push(component),
-            }
-        }
-        return exact(&components.join("/"));
-    }
-    if target.contains('/') {
-        return exact(&target).or_else(|| {
-            let suffix = format!("/{target}");
-            unique(paths.iter().filter(|p| p.to_ascii_lowercase().ends_with(&suffix)))
-        });
-    }
-
-    let local = if source_folder.is_empty() {
-        target.clone()
-    } else {
-        format!("{source_folder}/{target}")
-    };
-    if let Some(path) = exact(&local) {
-        return Some(path);
-    }
-
-    let mut by_filename = paths.iter().filter(|p| {
-        p.rsplit('/').next().is_some_and(|filename| filename.eq_ignore_ascii_case(&target))
-    }).peekable();
-    if by_filename.peek().is_some() {
-        return unique(by_filename);
-    }
-
-    let stem = target.strip_suffix(".md").unwrap_or(&target);
-    unique(aliases.iter().filter_map(|(path, names)| {
-        names.iter().any(|name| name.trim().eq_ignore_ascii_case(stem)).then_some(path)
-    }))
+    let mut found = wikilink_candidates_from_source(target_raw, source_rel, paths, aliases);
+    (found.len() == 1).then(|| found.remove(0))
 }
 
 fn resolve_move_wikilink_target(
@@ -550,10 +611,7 @@ fn resolve_move_wikilink_target(
 }
 
 fn normalize_vault_rel_path(base_folder: &str, raw_path: &str) -> Option<String> {
-    let mut components: Vec<&str> = base_folder
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .collect();
+    let mut components: Vec<&str> = base_folder.split('/').filter(|s| !s.is_empty()).collect();
     for comp in raw_path.split('/') {
         match comp {
             "" | "." => {}
@@ -589,7 +647,9 @@ fn decode_markdown_link_path(path_raw: &str) -> Option<String> {
         }
         unescaped.push(ch);
     }
-    urlencoding::decode(&unescaped).ok().map(std::borrow::Cow::into_owned)
+    urlencoding::decode(&unescaped)
+        .ok()
+        .map(std::borrow::Cow::into_owned)
 }
 
 /// Splits a Markdown link destination into `(raw_path, optional_heading)` when it targets a
@@ -642,6 +702,14 @@ fn resolve_move_markdown_target(
     source_rel: &str,
     paths: &[String],
 ) -> Option<String> {
+    resolve_move_markdown_target_staged(path_raw, source_rel, paths).map(|(path, _)| path)
+}
+
+fn resolve_move_markdown_target_staged(
+    path_raw: &str,
+    source_rel: &str,
+    paths: &[String],
+) -> Option<(String, PathBase)> {
     fn unique<'a>(mut matches: impl Iterator<Item = &'a String>) -> Option<String> {
         let first = matches.next()?;
         matches.next().is_none().then(|| first.clone())
@@ -673,49 +741,77 @@ fn resolve_move_markdown_target(
 
     if let Some(rooted) = decoded.strip_prefix('/') {
         let normalized = normalize_vault_rel_path("", rooted)?;
-        return match_path(&normalized);
+        return match_path(&normalized).map(|p| (p, PathBase::Rooted));
     }
     if decoded.starts_with("./") || decoded.starts_with("../") {
         let normalized = normalize_vault_rel_path(&source_folder, &decoded)?;
-        return match_path(&normalized);
+        return match_path(&normalized).map(|p| (p, PathBase::Explicit));
     }
 
     if let Some(normalized) = normalize_vault_rel_path(&source_folder, &decoded) {
         if let Some(found) = match_path(&normalized) {
-            return Some(found);
+            return Some((found, PathBase::SourceFolder));
         }
     }
     if !source_folder.is_empty() {
         if let Some(normalized) = normalize_vault_rel_path("", &decoded) {
-            return match_path(&normalized);
+            return match_path(&normalized).map(|p| (p, PathBase::VaultRoot));
         }
     }
     None
 }
 
+/// True for a local destination whose last segment has an extension other than .md.
+fn is_local_attachment_dest(decoded: &str) -> bool {
+    let trimmed = decoded.trim().trim_matches(['<', '>']);
+    let path_part = trimmed
+        .split('#')
+        .next()
+        .unwrap_or(trimmed)
+        .replace('\\', "/");
+    if path_part.is_empty() || path_part.starts_with("//") || has_uri_scheme(&path_part) {
+        return false;
+    }
+    let last = path_part.rsplit('/').next().unwrap_or(&path_part);
+    if last.is_empty() || last == "." || last == ".." {
+        return false;
+    }
+    let Some((_, ext)) = last.rsplit_once('.') else {
+        return false;
+    };
+    !ext.is_empty() && !ext.eq_ignore_ascii_case("md")
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    fs::canonicalize(a)
+        .ok()
+        .zip(fs::canonicalize(b).ok())
+        .is_some_and(|(ca, cb)| ca == cb)
+}
+
 fn relative_markdown_path(source_rel: &str, target_rel: &str) -> String {
     let source_folder = folder_from_rel_path(source_rel);
-    let source_parts: Vec<&str> = source_folder
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .collect();
-    let target_parts: Vec<&str> = target_rel
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .collect();
+    let source_parts: Vec<&str> = source_folder.split('/').filter(|s| !s.is_empty()).collect();
+    let target_parts: Vec<&str> = target_rel.split('/').filter(|s| !s.is_empty()).collect();
 
     let common_len = source_parts
         .iter()
-        .zip(target_parts.iter().take(target_parts.len().saturating_sub(1)))
+        .zip(
+            target_parts
+                .iter()
+                .take(target_parts.len().saturating_sub(1)),
+        )
         .take_while(|(a, b)| a.eq_ignore_ascii_case(b))
         .count();
 
     let mut rel_parts: Vec<&str> = Vec::with_capacity(
-        source_parts.len().saturating_sub(common_len) + target_parts.len().saturating_sub(common_len),
+        source_parts.len().saturating_sub(common_len)
+            + target_parts.len().saturating_sub(common_len),
     );
-    for _ in common_len..source_parts.len() {
-        rel_parts.push("..");
-    }
+    rel_parts.extend(std::iter::repeat_n(
+        "..",
+        source_parts.len().saturating_sub(common_len),
+    ));
     for part in &target_parts[common_len..] {
         rel_parts.push(part);
     }
@@ -753,42 +849,126 @@ fn encode_markdown_link_path(rel_path: &str, angle_bracketed: bool) -> String {
     out
 }
 
+/// How a local link destination was matched. SourceFolder and Explicit depend on the
+/// referring note's folder; the others do not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PathBase {
+    Rooted,
+    Explicit,
+    SourceFolder,
+    VaultRoot,
+    AttachmentDir,
+    NameSearch,
+}
+
+impl PathBase {
+    fn is_file_relative(self) -> bool {
+        matches!(self, Self::Explicit | Self::SourceFolder)
+    }
+}
+
+/// Resolves a local attachment destination and reports the stage that matched.
+pub(crate) fn resolve_attachment_staged(
+    vault_root: &Path,
+    note_rel_path: &str,
+    raw_target: &str,
+) -> Option<(PathBuf, PathBase)> {
+    let trimmed = raw_target.trim().trim_matches(['<', '>']);
+    if let Some(found) = resolve_attachment_staged_once(vault_root, note_rel_path, trimmed) {
+        return Some(found);
+    }
+    let decoded = decode_markdown_link_path(trimmed)?;
+    if decoded != trimmed {
+        return resolve_attachment_staged_once(vault_root, note_rel_path, &decoded);
+    }
+    None
+}
+
+fn resolve_attachment_staged_once(
+    vault_root: &Path,
+    note_rel_path: &str,
+    candidate: &str,
+) -> Option<(PathBuf, PathBase)> {
+    let norm = candidate.replace('\\', "/");
+    if norm.is_empty() || norm.starts_with("//") || has_uri_scheme(&norm) {
+        return None;
+    }
+
+    let rooted = norm.starts_with('/');
+    let t = norm.trim_start_matches('/');
+    if t.is_empty() {
+        return None;
+    }
+
+    let has_parent = t.split('/').any(|seg| seg == "..");
+    let explicit = t.starts_with("./") || t.starts_with("../") || has_parent;
+
+    if !rooted {
+        let note_folder = folder_from_rel_path(note_rel_path);
+        if let Some(rel) = normalize_vault_rel_path(&note_folder, t) {
+            let cand = vault_root.join(&rel);
+            if cand.is_file() {
+                let stage = if explicit {
+                    PathBase::Explicit
+                } else {
+                    PathBase::SourceFolder
+                };
+                return Some((cand, stage));
+            }
+        }
+    }
+
+    if has_parent {
+        if rooted {
+            if let Some(rel) = normalize_vault_rel_path("", t) {
+                let cand = vault_root.join(&rel);
+                if cand.is_file() {
+                    return Some((cand, PathBase::Rooted));
+                }
+            }
+        }
+        return None;
+    }
+
+    let c = t.trim_start_matches("./");
+    if c.is_empty() {
+        return None;
+    }
+    let root_cand = vault_root.join(c);
+    if root_cand.is_file() {
+        let stage = if rooted {
+            PathBase::Rooted
+        } else {
+            PathBase::VaultRoot
+        };
+        return Some((root_cand, stage));
+    }
+
+    for sub in [
+        "Attachments",
+        "attachments",
+        "assets",
+        "Assets",
+        "media",
+        "images",
+    ] {
+        let cand = vault_root.join(sub).join(c);
+        if cand.is_file() {
+            return Some((cand, PathBase::AttachmentDir));
+        }
+    }
+
+    let target_fname = c.rsplit('/').next().unwrap_or(c);
+    find_attachment_by_name(vault_root, target_fname).map(|p| (p, PathBase::NameSearch))
+}
+
 /// Resolves an embedded image/attachment target relative to the note folder, vault root, or common attachment dirs.
 pub fn resolve_attachment_path(
     vault_root: &Path,
     note_rel_path: &str,
     raw_target: &str,
 ) -> Option<PathBuf> {
-    let cleaned = raw_target
-        .trim()
-        .trim_start_matches("./")
-        .replace('\\', "/");
-    if cleaned.is_empty()
-        || cleaned.starts_with("http://")
-        || cleaned.starts_with("https://")
-        || cleaned.contains("..")
-    {
-        return None;
-    }
-
-    let note_folder = folder_from_rel_path(note_rel_path);
-    let mut candidates = Vec::new();
-    if !note_folder.is_empty() {
-        candidates.push(vault_root.join(&note_folder).join(&cleaned));
-    }
-    candidates.push(vault_root.join(&cleaned));
-    for sub in ["Attachments", "attachments", "assets", "Assets", "media", "images"] {
-        candidates.push(vault_root.join(sub).join(&cleaned));
-    }
-    for cand in candidates {
-        if cand.is_file() {
-            return Some(cand);
-        }
-    }
-
-    // Fallback: recursive filename lookup across vault
-    let target_fname = cleaned.rsplit('/').next().unwrap_or(&cleaned);
-    find_attachment_by_name(vault_root, target_fname)
+    resolve_attachment_staged(vault_root, note_rel_path, raw_target).map(|(path, _)| path)
 }
 
 fn find_attachment_by_name(dir: &Path, filename: &str) -> Option<PathBuf> {
@@ -801,7 +981,9 @@ fn find_attachment_by_name(dir: &Path, filename: &str) -> Option<PathBuf> {
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
         if ft.is_dir() {
-            if IGNORED_DIRS.iter().any(|&ig| name_str.eq_ignore_ascii_case(ig))
+            if IGNORED_DIRS
+                .iter()
+                .any(|&ig| name_str.eq_ignore_ascii_case(ig))
                 || name_str.starts_with('.')
             {
                 continue;
@@ -850,8 +1032,12 @@ pub fn hydrate_parsed_note_links(
                 resolved_path,
                 ..
             } => {
-                *resolved_path =
-                    resolve_wikilink_from_source(target, note_rel_path, all_rel_paths, aliases_by_path);
+                *resolved_path = resolve_wikilink_from_source(
+                    target,
+                    note_rel_path,
+                    all_rel_paths,
+                    aliases_by_path,
+                );
             }
             NoteBlock::ImageEmbed {
                 raw_target,
@@ -859,19 +1045,16 @@ pub fn hydrate_parsed_note_links(
                 resolved_path,
                 line_no,
                 ..
-            } => {
-                if is_image_target(raw_target) {
-                    if let Some(abs) = resolve_attachment_path(vault_root, note_rel_path, raw_target)
-                    {
-                        *resolved_path = Some(abs.clone());
-                        images.push(NoteImageRef {
-                            raw_target: raw_target.clone(),
-                            display_name: alt.clone(),
-                            mime_type: mime_type_for_path(raw_target).to_string(),
-                            abs_path: abs,
-                            line_no: *line_no,
-                        });
-                    }
+            } if is_image_target(raw_target) => {
+                if let Some(abs) = resolve_attachment_path(vault_root, note_rel_path, raw_target) {
+                    *resolved_path = Some(abs.clone());
+                    images.push(NoteImageRef {
+                        raw_target: raw_target.clone(),
+                        display_name: alt.clone(),
+                        mime_type: mime_type_for_path(raw_target).to_string(),
+                        abs_path: abs,
+                        line_no: *line_no,
+                    });
                 }
             }
             _ => {}
@@ -1157,7 +1340,10 @@ pub fn update_note_frontmatter(
     let updated = upsert_frontmatter_in_markdown(&raw, updates)?;
     if updated != raw {
         if fs::read(abs_path)? != raw.as_bytes() {
-            bail!("Note changed while updating frontmatter: {}", abs_path.display());
+            bail!(
+                "Note changed while updating frontmatter: {}",
+                abs_path.display()
+            );
         }
         write_atomic(abs_path, updated.as_bytes())?;
     }
@@ -1199,12 +1385,12 @@ pub fn move_note(vault_root: &Path, src_rel: &str, dst_rel: &str) -> Result<Stri
         bail!("Source note not found: {src_rel}");
     }
     let normalized_dst = if dst_rel.to_ascii_lowercase().ends_with(".md") {
-        dst_rel.replace('\\', "/").trim_start_matches('/').to_string()
+        dst_rel
+            .replace('\\', "/")
+            .trim_start_matches('/')
+            .to_string()
     } else {
-        format!(
-            "{}.md",
-            dst_rel.replace('\\', "/").trim_start_matches('/')
-        )
+        format!("{}.md", dst_rel.replace('\\', "/").trim_start_matches('/'))
     };
     if cfg!(windows) && normalized_dst.contains(':') {
         bail!("Destination must be a path within the vault: {dst_rel}");
@@ -1215,13 +1401,10 @@ pub fn move_note(vault_root: &Path, src_rel: &str, dst_rel: &str) -> Result<Stri
         Ok(_) => {
             let same_parent = src.parent() == dst.parent();
             let diff_spelling = src.file_name() != dst.file_name()
-                && src
-                    .file_name()
-                    .zip(dst.file_name())
-                    .is_some_and(|(a, b)| {
-                        a.to_string_lossy()
-                            .eq_ignore_ascii_case(&b.to_string_lossy())
-                    });
+                && src.file_name().zip(dst.file_name()).is_some_and(|(a, b)| {
+                    a.to_string_lossy()
+                        .eq_ignore_ascii_case(&b.to_string_lossy())
+                });
             let same_canonical_entry = same_parent
                 && diff_spelling
                 && fs::canonicalize(&src)
@@ -1242,7 +1425,9 @@ pub fn move_note(vault_root: &Path, src_rel: &str, dst_rel: &str) -> Result<Stri
         .skip(1)
         .find(|parent| parent.is_dir())
         .context("Cannot find the destination's parent directory")?;
-    if !existing_parent.canonicalize()?.starts_with(vault_root.canonicalize()?)
+    if !existing_parent
+        .canonicalize()?
+        .starts_with(vault_root.canonicalize()?)
         || has_symlink_component_in_vault(vault_root, &normalized_dst)
     {
         bail!("Destination must be a path within the vault: {dst_rel}");
@@ -1302,10 +1487,7 @@ pub fn rewrite_wikilinks_for_move(
             }
         })
         .collect();
-    if !all_paths_after
-        .iter()
-        .any(|p| p == new_rel)
-    {
+    if !all_paths_after.iter().any(|p| p == new_rel) {
         all_paths_after.push(new_rel.to_string());
     }
 
@@ -1328,11 +1510,35 @@ pub fn rewrite_wikilinks_for_move(
             continue;
         }
         let source_after = entry.rel_path.as_str();
-        let source_before = if source_after == new_rel { old_rel } else { source_after };
+        let source_before = if source_after == new_rel {
+            old_rel
+        } else {
+            source_after
+        };
         let is_case_only_rename = old_rel != new_rel && old_rel.eq_ignore_ascii_case(new_rel);
         let wikilink_replacement = |target_raw: &str| {
+            if source_after == new_rel && is_image_target(target_raw) {
+                let (before_abs, _) = resolve_attachment_staged(vault_root, old_rel, target_raw)?;
+                if let Some((after_abs, _)) =
+                    resolve_attachment_staged(vault_root, new_rel, target_raw)
+                {
+                    if same_file(&before_abs, &after_abs) {
+                        return None;
+                    }
+                }
+                let cand1 = normalize_rel_path(before_abs.strip_prefix(vault_root).ok()?);
+                if resolve_attachment_staged(vault_root, new_rel, &cand1)
+                    .is_some_and(|(abs, _)| same_file(&before_abs, &abs))
+                {
+                    return Some(cand1);
+                }
+                return Some(format!("/{cand1}"));
+            }
             let before = resolve_move_wikilink_target(
-                target_raw, source_before, all_paths_before_move, aliases_by_path,
+                target_raw,
+                source_before,
+                all_paths_before_move,
+                aliases_by_path,
             )?;
             let expected = if before == old_rel { new_rel } else { &before };
             let resolve_after = |target: &str| {
@@ -1380,31 +1586,68 @@ pub fn rewrite_wikilinks_for_move(
             if resolve_after(&stem).as_deref() == Some(expected) {
                 return Some(stem);
             }
-            let path = expected.strip_suffix(".md").or_else(|| expected.strip_suffix(".MD")).unwrap_or(expected);
-            let explicit = if path.contains('/') { path.to_owned() } else { format!("/{path}") };
+            let path = expected
+                .strip_suffix(".md")
+                .or_else(|| expected.strip_suffix(".MD"))
+                .unwrap_or(expected);
+            let explicit = if path.contains('/') {
+                path.to_owned()
+            } else {
+                format!("/{path}")
+            };
             (resolve_after(&explicit).as_deref() == Some(expected)).then_some(explicit)
         };
         let markdown_replacement = |path_raw: &str, angle_bracketed: bool| {
-            let before = resolve_move_markdown_target(
-                path_raw, source_before, all_paths_before_move,
+            let decoded = decode_markdown_link_path(path_raw)?;
+            if is_local_attachment_dest(&decoded) {
+                if source_after != new_rel {
+                    return None;
+                }
+                let (before_abs, base) = resolve_attachment_staged(vault_root, old_rel, path_raw)?;
+                if let Some((after_abs, after_base)) =
+                    resolve_attachment_staged(vault_root, new_rel, path_raw)
+                {
+                    if same_file(&before_abs, &after_abs)
+                        && (!base.is_file_relative() || after_base.is_file_relative())
+                    {
+                        return None;
+                    }
+                }
+                let target_rel = normalize_rel_path(before_abs.strip_prefix(vault_root).ok()?);
+                let relative = relative_markdown_path(new_rel, &target_rel);
+                let encoded = encode_markdown_link_path(&relative, angle_bracketed);
+                return (encoded != path_raw).then_some(encoded);
+            }
+
+            let (before, base) = resolve_move_markdown_target_staged(
+                path_raw,
+                source_before,
+                all_paths_before_move,
             )?;
             let expected = if before == old_rel { new_rel } else { &before };
             let resolve_after = |path: &str| {
-                resolve_move_markdown_target(path, source_after, &all_paths_after)
+                resolve_move_markdown_target_staged(path, source_after, &all_paths_after)
             };
             let relative = relative_markdown_path(source_after, expected);
             let encoded = encode_markdown_link_path(&relative, angle_bracketed);
             if before == old_rel && is_case_only_rename {
-                if path_raw != encoded && resolve_after(&encoded).as_deref() == Some(expected) {
+                if path_raw != encoded
+                    && resolve_after(&encoded).as_ref().map(|(p, _)| p.as_str()) == Some(expected)
+                {
                     return Some(encoded);
                 }
                 return None;
             }
-            if resolve_after(path_raw).as_deref() == Some(expected) {
-                return None;
+            if let Some((after_path, after_base)) = resolve_after(path_raw) {
+                if after_path == expected
+                    && !(base == PathBase::SourceFolder && after_base == PathBase::VaultRoot)
+                {
+                    return None;
+                }
             }
 
-            (resolve_after(&encoded).as_deref() == Some(expected)).then_some(encoded)
+            (resolve_after(&encoded).as_ref().map(|(p, _)| p.as_str()) == Some(expected))
+                .then_some(encoded)
         };
         let Some(rewritten) =
             rewrite_markdown_links(&raw, &wikilink_replacement, &markdown_replacement)
@@ -1536,8 +1779,7 @@ fn rewrite_line_links(
                         let raw_dest = &line[dest.dest_start..dest.dest_end];
                         let path_len = raw_dest.find('#').unwrap_or(raw_dest.len());
                         let path_raw = &raw_dest[..path_len];
-                        if let Some(new_path) =
-                            markdown_replacement(path_raw, dest.angle_bracketed)
+                        if let Some(new_path) = markdown_replacement(path_raw, dest.angle_bracketed)
                         {
                             out.push_str(&line[i..dest.dest_start]);
                             out.push_str(&new_path);
@@ -1603,7 +1845,10 @@ pub fn obsidian_date_format_to_chrono(fmt: &str) -> String {
 }
 
 /// Opens or creates today's Daily Note, returning `(rel_path, abs_path, created)`.
-pub fn ensure_daily_note(vault: &VaultProfile, date_override: Option<&str>) -> Result<(String, PathBuf, bool)> {
+pub fn ensure_daily_note(
+    vault: &VaultProfile,
+    date_override: Option<&str>,
+) -> Result<(String, PathBuf, bool)> {
     let (folder, fmt) = daily_note_settings(vault);
     let date_str = match date_override.map(str::trim).filter(|s| !s.is_empty()) {
         Some(d) => d.to_string(),
@@ -1680,15 +1925,29 @@ pub fn resolve_note_identifier(
     all_rel_paths: &[String],
     aliases_by_path: &HashMap<String, Vec<String>>,
 ) -> Result<String> {
-    resolve_note_identifier_opt(input, all_rel_paths, aliases_by_path)
-        .ok_or_else(|| anyhow!("Note not found in vault: '{input}'"))
+    let mut candidates = note_identifier_candidates(input, all_rel_paths, aliases_by_path);
+    match candidates.len() {
+        0 => Err(anyhow!("Note not found in vault: '{input}'")),
+        1 => Ok(candidates.remove(0)),
+        n => {
+            let preview = if n > 10 {
+                format!("{}, +{} more", candidates[..10].join(", "), n - 10)
+            } else {
+                candidates.join(", ")
+            };
+            Err(anyhow!(
+                "Ambiguous note reference '{input}': {n} notes match ({preview}). Use a vault-relative path."
+            ))
+        }
+    }
 }
 
-fn resolve_note_identifier_opt(
+/// Candidates from the first stage that matches anything, sorted. One entry means resolved.
+fn note_identifier_candidates(
     input: &str,
     all_rel_paths: &[String],
     aliases_by_path: &HashMap<String, Vec<String>>,
-) -> Option<String> {
+) -> Vec<String> {
     let normalized = input.trim().replace('\\', "/");
     let mut raw = normalized.as_str();
     while let Some(rest) = raw.strip_prefix("./") {
@@ -1696,7 +1955,7 @@ fn resolve_note_identifier_opt(
     }
     let raw = raw.trim_start_matches('/');
     if raw.is_empty() {
-        return None;
+        return Vec::new();
     }
 
     let raw_lower = raw.to_ascii_lowercase();
@@ -1706,50 +1965,79 @@ fn resolve_note_identifier_opt(
     } else {
         format!("{raw_lower}.md")
     };
+    let raw_exact_with_md = format!("{raw}.md");
 
-    // 1. Exact relative path match (case-insensitive)
+    // 1a. Exact relative path match (byte-for-byte; exact input wins over input + ".md")
+    if let Some(exact) = all_rel_paths.iter().find(|p| p.as_str() == raw) {
+        return vec![exact.clone()];
+    }
     if let Some(exact) = all_rel_paths
         .iter()
-        .find(|p| p.to_ascii_lowercase() == raw_with_md || p.to_ascii_lowercase() == raw_lower)
+        .find(|p| p.as_str() == raw_exact_with_md)
     {
-        return Some(exact.clone());
+        return vec![exact.clone()];
     }
 
-    // 2. Suffix path match (e.g. `Projects/RFC` -> `Work/Projects/RFC.md`), shortest path wins
+    // 1b. Exact relative path match (case-insensitive)
+    let mut exact_ci: Vec<String> = all_rel_paths
+        .iter()
+        .filter(|p| {
+            let low = p.to_ascii_lowercase();
+            low == raw_lower || low == raw_with_md
+        })
+        .cloned()
+        .collect();
+    if !exact_ci.is_empty() {
+        exact_ci.sort();
+        exact_ci.dedup();
+        return exact_ci;
+    }
+
+    // 2. Suffix path match (e.g. `Projects/RFC` -> `Work/Projects/RFC.md`)
     let suffix_needle = format!("/{raw_with_md}");
-    let mut suffix_matches: Vec<&String> = all_rel_paths
+    let mut suffix_matches: Vec<String> = all_rel_paths
         .iter()
         .filter(|p| p.to_ascii_lowercase().ends_with(&suffix_needle))
+        .cloned()
         .collect();
     if !suffix_matches.is_empty() {
-        suffix_matches.sort_by_key(|p| (p.matches('/').count(), p.len()));
-        return Some(suffix_matches[0].clone());
+        suffix_matches.sort();
+        suffix_matches.dedup();
+        return suffix_matches;
     }
 
-    // 3. Stem / title match (shortest path wins)
+    // 3. Stem / title match
     let stem_needle = raw_lower.strip_suffix(".md").unwrap_or(&raw_lower);
-    let mut stem_matches: Vec<&String> = all_rel_paths
+    let mut stem_matches: Vec<String> = all_rel_paths
         .iter()
         .filter(|p| title_from_rel_path(p).to_ascii_lowercase() == stem_needle)
+        .cloned()
         .collect();
     if !stem_matches.is_empty() {
-        stem_matches.sort_by_key(|p| (p.matches('/').count(), p.len()));
-        return Some(stem_matches[0].clone());
+        stem_matches.sort();
+        stem_matches.dedup();
+        return stem_matches;
     }
 
     // 4. Frontmatter alias match (skip when caller passed an explicit `.md` path literal)
     if !has_md_ext {
-        for (rel_path, aliases) in aliases_by_path {
-            if aliases
-                .iter()
-                .any(|a| a.trim().eq_ignore_ascii_case(stem_needle))
-            {
-                return Some(rel_path.clone());
-            }
+        let mut alias_matches: Vec<String> = aliases_by_path
+            .iter()
+            .filter(|(_, aliases)| {
+                aliases
+                    .iter()
+                    .any(|a| a.trim().eq_ignore_ascii_case(stem_needle))
+            })
+            .map(|(rel_path, _)| rel_path.clone())
+            .collect();
+        if !alias_matches.is_empty() {
+            alias_matches.sort();
+            alias_matches.dedup();
+            return alias_matches;
         }
     }
 
-    None
+    Vec::new()
 }
 
 #[cfg(test)]
@@ -1842,5 +2130,60 @@ mod tests {
             encode_markdown_link_path("../Projects/계획 초안.md", false),
             "../Projects/계획%20초안.md"
         );
+    }
+
+    #[test]
+    fn staged_attachment_resolution_reports_stage_and_rejects_escapes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("vault");
+        fs::create_dir_all(root.join("n")).unwrap();
+        fs::create_dir_all(root.join("Attachments")).unwrap();
+        fs::create_dir_all(root.join("deep/x")).unwrap();
+        fs::create_dir_all(root.join("my files")).unwrap();
+        fs::write(tmp.path().join("outside.png"), b"escape").unwrap();
+
+        fs::write(root.join("n/Note.md"), "# Note\n").unwrap();
+        fs::write(root.join("n/local.png"), b"local").unwrap();
+        fs::write(root.join("root.png"), b"root").unwrap();
+        fs::write(root.join("Attachments/att.png"), b"att").unwrap();
+        fs::write(root.join("deep/x/found.png"), b"found").unwrap();
+        fs::write(root.join("my files/a b.png"), b"spaced").unwrap();
+
+        let check = |target: &str, expected_rel: &str, expected_stage: PathBase| {
+            let (path, stage) = resolve_attachment_staged(&root, "n/Note.md", target)
+                .unwrap_or_else(|| panic!("expected resolution for {target:?}"));
+            assert_eq!(stage, expected_stage, "wrong stage for {target:?}");
+            assert!(
+                same_file(&path, &root.join(expected_rel)),
+                "wrong file for {target:?}: got {}",
+                path.display()
+            );
+        };
+
+        check("local.png", "n/local.png", PathBase::SourceFolder);
+        check("./local.png", "n/local.png", PathBase::Explicit);
+        check("../root.png", "root.png", PathBase::Explicit);
+        check("root.png", "root.png", PathBase::VaultRoot);
+        check("/root.png", "root.png", PathBase::Rooted);
+        check("att.png", "Attachments/att.png", PathBase::AttachmentDir);
+        check("found.png", "deep/x/found.png", PathBase::NameSearch);
+        check(
+            "../my%20files/a%20b.png",
+            "my files/a b.png",
+            PathBase::Explicit,
+        );
+        check(
+            "<../my files/a b.png>",
+            "my files/a b.png",
+            PathBase::Explicit,
+        );
+
+        for rejected in ["../../outside.png", "https://x/y.png", "//h/y.png", ""] {
+            assert_eq!(
+                resolve_attachment_staged(&root, "n/Note.md", rejected),
+                None,
+                "expected None for {rejected:?}"
+            );
+        }
     }
 }

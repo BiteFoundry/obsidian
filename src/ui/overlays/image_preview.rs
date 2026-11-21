@@ -109,8 +109,8 @@ impl ImagePreviewOverlay {
         let inner_h = rect.height.saturating_sub(3).max(6);
         let base_cols = rect.width.saturating_sub(4).max(12);
         let max_cols = inner_w.saturating_mul(2).max(base_cols).min(240);
-        let scaled_cols = ((base_cols as u32 * self.zoom_pct as u32) / 100)
-            .clamp(8, max_cols as u32) as u16;
+        let scaled_cols =
+            ((base_cols as u32 * self.zoom_pct as u32) / 100).clamp(8, max_cols as u32) as u16;
         // Pass `scrollable_max_rows >= scaled_cols` so `img_preview` fits tall images to width
         // and lets them scroll vertically immediately at 100% zoom.
         let scrollable_max_rows = ((inner_h as u32 * 4 * self.zoom_pct as u32) / 100)
@@ -451,8 +451,16 @@ mod tests {
 
         let area = Rect::new(0, 0, 100, 30);
 
-        for proto in [TerminalImageProtocol::Halfblock, TerminalImageProtocol::Sixel] {
-            let mut app = AppState::new(cfg.clone(), vault.clone(), Storage::open_in_memory().unwrap(), sync_ctrl.clone());
+        for proto in [
+            TerminalImageProtocol::Halfblock,
+            TerminalImageProtocol::Sixel,
+        ] {
+            let mut app = AppState::new(
+                cfg.clone(),
+                vault.clone(),
+                Storage::open_in_memory().unwrap(),
+                sync_ctrl.clone(),
+            );
             app.graphics_caps = TerminalGraphicsCaps {
                 protocol: proto,
                 cell_px: (8, 16),
@@ -501,10 +509,15 @@ mod tests {
             // Scrollbar rendered in right-most inner column
             let sb_x = rect.right() - 2;
             let buf = terminal.backend().buffer();
-            assert!((rect.y + 1..rect.bottom() - 1).any(|y| !buf[(sb_x, y)].symbol().trim().is_empty()));
+            assert!(
+                (rect.y + 1..rect.bottom() - 1).any(|y| !buf[(sb_x, y)].symbol().trim().is_empty())
+            );
 
             if proto == TerminalImageProtocol::Sixel {
-                let pg0 = ui.pending_pixel.clone().expect("expected pending pixel graphic");
+                let pg0 = ui
+                    .pending_pixel
+                    .clone()
+                    .expect("expected pending pixel graphic");
                 assert!(pg0.cache_key.starts_with(&format!("{base_key}#crop:0,0,")));
             }
 

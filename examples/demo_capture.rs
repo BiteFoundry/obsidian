@@ -494,7 +494,9 @@ fn main() {
     // Frame 7: Link Extractor (u) overlay
     ui.close_overlay();
     if let Some(detail) = app.active_note.as_ref() {
-        ui.open_overlay(Overlay::LinkExtractor(LinkExtractorOverlay::from_note(detail)));
+        ui.open_overlay(Overlay::LinkExtractor(LinkExtractorOverlay::from_note(
+            detail,
+        )));
     }
     frames.push(capture_frame(
         &app,

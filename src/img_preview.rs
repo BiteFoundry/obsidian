@@ -360,7 +360,8 @@ pub fn probe_terminal_graphics_caps(pref: ImageProtocolPreference) -> TerminalGr
     }
 
     let get_env = |k: &str| std::env::var(k).ok();
-    let is_mux = non_empty_env(&get_env, "TMUX").is_some() || non_empty_env(&get_env, "STY").is_some();
+    let is_mux =
+        non_empty_env(&get_env, "TMUX").is_some() || non_empty_env(&get_env, "STY").is_some();
     let has_env_override = non_empty_env(&get_env, "OBSIDIAN_IMAGE_PROTOCOL")
         .or_else(|| non_empty_env(&get_env, "TEAMS_IMAGE_PROTOCOL"))
         .and_then(|raw| ImageProtocolPreference::parse_str(&raw))
@@ -677,7 +678,10 @@ fn read_terminal_probe_reply(timeout: Duration) -> Vec<u8> {
         fn GetConsoleMode(h_console_handle: isize, lp_mode: *mut u32) -> i32;
         fn SetConsoleMode(h_console_handle: isize, dw_mode: u32) -> i32;
         fn WaitForSingleObject(h_handle: isize, dw_milliseconds: u32) -> u32;
-        fn GetNumberOfConsoleInputEvents(h_console_input: isize, lpc_number_of_events: *mut u32) -> i32;
+        fn GetNumberOfConsoleInputEvents(
+            h_console_input: isize,
+            lpc_number_of_events: *mut u32,
+        ) -> i32;
         fn PeekConsoleInputW(
             h_console_input: isize,
             lp_buffer: *mut InputRecord,
@@ -1041,8 +1045,7 @@ pub fn looks_like_svg_bytes(bytes: &[u8]) -> bool {
         }
         false
     };
-    if head.starts_with("<svg") {
-        let after = &head[4..];
+    if let Some(after) = head.strip_prefix("<svg") {
         return after.is_empty()
             || after.starts_with(|c: char| c.is_ascii_whitespace() || c == '>' || c == '/');
     }
@@ -1161,9 +1164,11 @@ pub fn decode_and_render_halfblocks(
     let resized = image::imageops::resize(&rgba, target_w, target_h, FilterType::Lanczos3);
     let mut lines = Vec::with_capacity((target_h / 2) as usize);
 
+    type RgbPair = ((u8, u8, u8), (u8, u8, u8));
+
     for y in (0..target_h).step_by(2) {
         let mut spans: Vec<Span<'static>> = Vec::new();
-        let mut current_pair: Option<((u8, u8, u8), (u8, u8, u8))> = None;
+        let mut current_pair: Option<RgbPair> = None;
         let mut run = String::new();
 
         for x in 0..target_w {
@@ -1272,18 +1277,16 @@ pub fn decode_and_render_for_protocol(
                 cell_px: caps.cell_px,
                 rgba: Arc::new(resized.into_raw()),
             };
-            (encode_kitty_tui_payload(png_bytes, occ_cols, occ_rows), Some(backing))
+            (
+                encode_kitty_tui_payload(png_bytes, occ_cols, occ_rows),
+                Some(backing),
+            )
         }
         TerminalImageProtocol::ITerm2 => {
             let encoded_owned;
             let raw_bytes: &[u8] = if matches!(
                 guessed,
-                Some(
-                    ImageFormat::Png
-                        | ImageFormat::Jpeg
-                        | ImageFormat::Gif
-                        | ImageFormat::WebP
-                )
+                Some(ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::Gif | ImageFormat::WebP)
             ) && bytes.len() <= MAX_ITERM2_RAW_BYTES
             {
                 bytes
@@ -1629,7 +1632,7 @@ fn quantize_rgba_to_256(
     let mut indexed = Vec::with_capacity(pixel_count);
     let mut overflow = false;
 
-    for px in flat_rgba.chunks_exact(4).take(pixel_count) {
+    for px in flat_rgba.as_chunks::<4>().0.iter().take(pixel_count) {
         let key = ((px[0] as u32) << 16) | ((px[1] as u32) << 8) | (px[2] as u32);
         if let Some(&idx) = exact_map.get(&key) {
             indexed.push(idx);
@@ -1650,10 +1653,9 @@ fn quantize_rgba_to_256(
 
     // Median-cut over 5-bit-per-channel RGB buckets for > 256 distinct colors.
     let mut hist: HashMap<u16, (u32, u64, u64, u64)> = HashMap::new();
-    for px in flat_rgba.chunks_exact(4).take(pixel_count) {
-        let qkey = (((px[0] as u16) >> 3) << 10)
-            | (((px[1] as u16) >> 3) << 5)
-            | ((px[2] as u16) >> 3);
+    for px in flat_rgba.as_chunks::<4>().0.iter().take(pixel_count) {
+        let qkey =
+            (((px[0] as u16) >> 3) << 10) | (((px[1] as u16) >> 3) << 5) | ((px[2] as u16) >> 3);
         let entry = hist.entry(qkey).or_insert((0, 0, 0, 0));
         entry.0 += 1;
         entry.1 += px[0] as u64;
@@ -1763,11 +1765,11 @@ fn quantize_rgba_to_256(
                 sg += b.sum_g;
                 sb += b.sum_b;
             }
-            if cnt == 0 {
-                (0, 0, 0)
-            } else {
-                ((sr / cnt) as u8, (sg / cnt) as u8, (sb / cnt) as u8)
-            }
+            (
+                sr.checked_div(cnt).unwrap_or(0) as u8,
+                sg.checked_div(cnt).unwrap_or(0) as u8,
+                sb.checked_div(cnt).unwrap_or(0) as u8,
+            )
         })
         .collect();
 
@@ -1895,12 +1897,7 @@ fn render_ansi_stdout_with_caps(
             let encoded_owned;
             let raw_bytes: &[u8] = if matches!(
                 guessed,
-                Some(
-                    ImageFormat::Png
-                        | ImageFormat::Jpeg
-                        | ImageFormat::Gif
-                        | ImageFormat::WebP
-                )
+                Some(ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::Gif | ImageFormat::WebP)
             ) && bytes.len() <= MAX_ITERM2_RAW_BYTES
             {
                 bytes
@@ -2038,7 +2035,10 @@ mod tests {
     fn test_is_image_mime_or_name() {
         assert!(is_image_mime_or_name("image/png", None));
         assert!(is_image_mime_or_name("hostedContent", None));
-        assert!(is_image_mime_or_name("application/octet-stream", Some("photo.WEBP")));
+        assert!(is_image_mime_or_name(
+            "application/octet-stream",
+            Some("photo.WEBP")
+        ));
         assert!(!is_image_mime_or_name("application/pdf", Some("doc.pdf")));
     }
 
@@ -2057,20 +2057,18 @@ mod tests {
 
         // Every line must contain half-block characters summing to `cols`
         for line in &rendered.lines {
-            let char_count: usize = line
+            let char_count: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+            assert_eq!(char_count, 16);
+            assert!(line
                 .spans
                 .iter()
-                .map(|s| s.content.chars().count())
-                .sum();
-            assert_eq!(char_count, 16);
-            assert!(line.spans.iter().all(|s| s.content.chars().all(|c| c == '▀')));
+                .all(|s| s.content.chars().all(|c| c == '▀')));
         }
 
         // Uniform solid image coalesces every row into a single Span
         let solid: RgbaImage = ImageBuffer::from_pixel(10, 4, Rgba([255, 0, 0, 255]));
         let solid_png = encode_png(&DynamicImage::ImageRgba8(solid)).unwrap();
-        let solid_rendered =
-            decode_and_render_halfblocks(&solid_png, 20, 10, (0, 0, 0)).unwrap();
+        let solid_rendered = decode_and_render_halfblocks(&solid_png, 20, 10, (0, 0, 0)).unwrap();
         assert_eq!(solid_rendered.lines.len(), 2);
         assert_eq!(solid_rendered.lines[0].spans.len(), 1);
         assert_eq!(solid_rendered.lines[0].spans[0].content, "▀▀▀▀▀▀▀▀▀▀");
@@ -2156,7 +2154,10 @@ mod tests {
 
         // WezTerm + WT_SESSION both set -> ITerm2 wins over WT_SESSION
         let mut wez_wt_env = HashMap::new();
-        wez_wt_env.insert("WEZTERM_EXECUTABLE", "C:\\Program Files\\WezTerm\\wezterm-gui.exe");
+        wez_wt_env.insert(
+            "WEZTERM_EXECUTABLE",
+            "C:\\Program Files\\WezTerm\\wezterm-gui.exe",
+        );
         wez_wt_env.insert("WT_SESSION", "00000000-0000-0000-0000-000000000001");
         assert_eq!(
             resolve_protocol_from_env_map(ImageProtocolPreference::Auto, &wez_wt_env),
@@ -2207,8 +2208,7 @@ mod tests {
             cell_px: (8, 16),
             cell_px_exact: true,
         };
-        let rendered =
-            decode_and_render_for_protocol(&solid_png, 40, 20, (0, 0, 0), caps).unwrap();
+        let rendered = decode_and_render_for_protocol(&solid_png, 40, 20, (0, 0, 0), caps).unwrap();
         assert_eq!(rendered.protocol, TerminalImageProtocol::Sixel);
         assert!(rendered.lines.is_empty());
         let payload = rendered.pixel_payload.as_deref().unwrap();
@@ -2413,10 +2413,22 @@ mod tests {
 
     #[test]
     fn test_protocol_helpers_and_cell_size_parser() {
-        assert_eq!(TerminalImageProtocol::Kitty.next_manual(), TerminalImageProtocol::ITerm2);
-        assert_eq!(TerminalImageProtocol::ITerm2.next_manual(), TerminalImageProtocol::Sixel);
-        assert_eq!(TerminalImageProtocol::Sixel.next_manual(), TerminalImageProtocol::Halfblock);
-        assert_eq!(TerminalImageProtocol::Halfblock.next_manual(), TerminalImageProtocol::Kitty);
+        assert_eq!(
+            TerminalImageProtocol::Kitty.next_manual(),
+            TerminalImageProtocol::ITerm2
+        );
+        assert_eq!(
+            TerminalImageProtocol::ITerm2.next_manual(),
+            TerminalImageProtocol::Sixel
+        );
+        assert_eq!(
+            TerminalImageProtocol::Sixel.next_manual(),
+            TerminalImageProtocol::Halfblock
+        );
+        assert_eq!(
+            TerminalImageProtocol::Halfblock.next_manual(),
+            TerminalImageProtocol::Kitty
+        );
 
         assert!(TerminalImageProtocol::Kitty.is_pixel());
         assert!(TerminalImageProtocol::ITerm2.is_pixel());
@@ -2444,10 +2456,7 @@ mod tests {
     #[test]
     fn test_terminal_probe_reply_parsers() {
         // CSI 16 t: height;width -> (width, height)
-        assert_eq!(
-            parse_csi_cell_size_reply(b"\x1b[6;24;12t"),
-            Some((12, 24))
-        );
+        assert_eq!(parse_csi_cell_size_reply(b"\x1b[6;24;12t"), Some((12, 24)));
         assert_eq!(
             parse_csi_cell_size_reply(b"noise\x1b[6;20;10t\x1b[?62;4c"),
             Some((10, 20))
@@ -2474,7 +2483,9 @@ mod tests {
 
         // Kitty Graphics query OK
         assert!(parse_kitty_query_ok(b"\x1b_Gi=31;OK\x1b\\"));
-        assert!(parse_kitty_query_ok(b"\x1b[6;20;10t\x1b_Gi=31,s=1;OK\x07\x1b[?62c"));
+        assert!(parse_kitty_query_ok(
+            b"\x1b[6;20;10t\x1b_Gi=31,s=1;OK\x07\x1b[?62c"
+        ));
         assert!(!parse_kitty_query_ok(b"\x1b_Gi=31;ENOENT:not found\x1b\\"));
         assert!(!parse_kitty_query_ok(b"\x1b_Gi=99;OK\x1b\\"));
         assert!(!parse_kitty_query_ok(b"\x1b[?62;4c"));
@@ -2553,7 +2564,10 @@ mod tests {
     fn test_windows_console_mode_restore_bits_clear_quick_edit_and_set_extended_flags() {
         // QuickEdit (0x0040) set without ExtendedFlags (0x0080) -> clears 0x0040 and sets 0x0080
         let restored = restore_windows_console_mode_flags(0x0040 | 0x0018);
-        assert_eq!(restored & WIN_ENABLE_EXTENDED_FLAGS, WIN_ENABLE_EXTENDED_FLAGS);
+        assert_eq!(
+            restored & WIN_ENABLE_EXTENDED_FLAGS,
+            WIN_ENABLE_EXTENDED_FLAGS
+        );
         assert_eq!(restored & WIN_ENABLE_QUICK_EDIT_MODE, 0);
         assert_eq!(restored & 0x0018, 0x0018);
 
@@ -2567,13 +2581,21 @@ mod tests {
     #[test]
     fn test_html_and_svg_sniff_and_image_classification_rejection() {
         // HTML sniffing
-        assert!(looks_like_html_bytes(b"<!DOCTYPE html><html><body>Login</body></html>"));
-        assert!(looks_like_html_bytes(b"\xEF\xBB\xBF  \n<HTML lang=\"en\"><head></head></html>"));
-        assert!(looks_like_html_bytes(b"<!-- proxy --><html><body>403</body></html>"));
+        assert!(looks_like_html_bytes(
+            b"<!DOCTYPE html><html><body>Login</body></html>"
+        ));
+        assert!(looks_like_html_bytes(
+            b"\xEF\xBB\xBF  \n<HTML lang=\"en\"><head></head></html>"
+        ));
+        assert!(looks_like_html_bytes(
+            b"<!-- proxy --><html><body>403</body></html>"
+        ));
         assert!(!looks_like_html_bytes(&make_test_png(4, 4)));
 
         // SVG sniffing
-        assert!(looks_like_svg_bytes(b"<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>"));
+        assert!(looks_like_svg_bytes(
+            b"<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>"
+        ));
         assert!(looks_like_svg_bytes(
             b"\xEF\xBB\xBF<?xml version=\"1.0\"?><svg viewBox=\"0 0 10 10\"/>"
         ));
@@ -2584,12 +2606,21 @@ mod tests {
         // is_image_mime_or_name rejects HTML and SVG even if paired with misleading extension/MIME
         assert!(!is_image_mime_or_name("text/html", Some("photo.png")));
         assert!(!is_image_mime_or_name("text/html; charset=utf-8", None));
-        assert!(!is_image_mime_or_name("application/xhtml+xml", Some("page.png")));
+        assert!(!is_image_mime_or_name(
+            "application/xhtml+xml",
+            Some("page.png")
+        ));
         assert!(!is_image_mime_or_name("image/svg+xml", Some("icon.svg")));
-        assert!(!is_image_mime_or_name("image/svg+xml; charset=utf-8", Some("icon.png")));
+        assert!(!is_image_mime_or_name(
+            "image/svg+xml; charset=utf-8",
+            Some("icon.png")
+        ));
         assert!(!is_image_mime_or_name("image/png", Some("diagram.svg")));
         assert!(!is_image_mime_or_name("hostedContent", Some("page.html")));
-        assert!(!is_image_mime_or_name("application/octet-stream", Some("index.HTM?x=1")));
+        assert!(!is_image_mime_or_name(
+            "application/octet-stream",
+            Some("index.HTM?x=1")
+        ));
 
         // Clear descriptive errors from decode_and_render_* and render_ansi_stdout
         let html = b"<!DOCTYPE html><html><body>Not an image</body></html>";
@@ -2603,7 +2634,10 @@ mod tests {
         let html_hb_err = decode_and_render_halfblocks(html, 20, 10, (0, 0, 0))
             .unwrap_err()
             .to_string();
-        assert!(html_hb_err.contains("HTML"), "unexpected error: {html_hb_err}");
+        assert!(
+            html_hb_err.contains("HTML"),
+            "unexpected error: {html_hb_err}"
+        );
 
         let svg_hb_err = decode_and_render_halfblocks(svg, 20, 10, (0, 0, 0))
             .unwrap_err()
@@ -2613,12 +2647,18 @@ mod tests {
         let html_proto_err = decode_and_render_for_protocol(html, 20, 10, (0, 0, 0), sixel_caps)
             .unwrap_err()
             .to_string();
-        assert!(html_proto_err.contains("HTML"), "unexpected error: {html_proto_err}");
+        assert!(
+            html_proto_err.contains("HTML"),
+            "unexpected error: {html_proto_err}"
+        );
 
         let svg_proto_err = decode_and_render_for_protocol(svg, 20, 10, (0, 0, 0), sixel_caps)
             .unwrap_err()
             .to_string();
-        assert!(svg_proto_err.contains("SVG"), "unexpected error: {svg_proto_err}");
+        assert!(
+            svg_proto_err.contains("SVG"),
+            "unexpected error: {svg_proto_err}"
+        );
     }
 
     #[test]
@@ -2690,8 +2730,7 @@ mod tests {
             cell_px: (8, 16),
             cell_px_exact: true,
         };
-        let sixel =
-            decode_and_render_for_protocol(&png, 80, 100, (0, 0, 0), sixel_caps).unwrap();
+        let sixel = decode_and_render_for_protocol(&png, 80, 100, (0, 0, 0), sixel_caps).unwrap();
         assert!(sixel.rows > 15);
         let (top_sixel, top_w, top_h) = sixel.viewport_pixel_payload(0, 0, 40, 15).unwrap();
         let (mid_sixel, mid_w, mid_h) = sixel.viewport_pixel_payload(0, 10, 40, 15).unwrap();
@@ -2715,8 +2754,7 @@ mod tests {
             cell_px: (8, 16),
             cell_px_exact: true,
         };
-        let kitty =
-            decode_and_render_for_protocol(&png, 80, 100, (0, 0, 0), kitty_caps).unwrap();
+        let kitty = decode_and_render_for_protocol(&png, 80, 100, (0, 0, 0), kitty_caps).unwrap();
         assert!(kitty.rows > 15);
         let (top_kitty, kw0, kh0) = kitty.viewport_pixel_payload(0, 0, 40, 15).unwrap();
         let (mid_kitty, kw1, kh1) = kitty.viewport_pixel_payload(0, 10, 40, 15).unwrap();

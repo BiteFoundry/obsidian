@@ -1,6 +1,6 @@
 [package]
 name = "obsidian-cli"
-version = "0.2.3"
+version = "0.3.0"
 edition = "2021"
 description = "Obsidian-native terminal workspace, interactive knowledge graph & AI agent toolkit — Local Vaults, Backlinks, Graph View, CLI, TUI, HTTP API & MCP"
 license = "MIT"

@@ -60,10 +60,10 @@ pub fn clip_line_unit_rect(x1: f64, y1: f64, x2: f64, y2: f64) -> Option<(f64, f
     let mut t1 = 1.0_f64;
 
     let checks = [
-        (-dx, x1),       // x >= 0.0
-        (dx, 1.0 - x1),  // x <= 1.0
-        (-dy, y1),       // y >= 0.0
-        (dy, 1.0 - y1),  // y <= 1.0
+        (-dx, x1),      // x >= 0.0
+        (dx, 1.0 - x1), // x <= 1.0
+        (-dy, y1),      // y >= 0.0
+        (dy, 1.0 - y1), // y <= 1.0
     ];
 
     for (p, q) in checks {
@@ -253,12 +253,17 @@ impl GraphSim {
 
         // Same center & already positioned: preserve camera and existing node positions!
         let current_ids: HashSet<&str> = graph.nodes.iter().map(|n| n.id.as_str()).collect();
-        self.positions.retain(|id, _| current_ids.contains(id.as_str()));
+        self.positions
+            .retain(|id, _| current_ids.contains(id.as_str()));
         self.rest_positions
             .retain(|id, _| current_ids.contains(id.as_str()));
         self.velocities
             .retain(|id, _| current_ids.contains(id.as_str()));
-        if self.focal_hub_id.as_deref().is_none_or(|id| !current_ids.contains(id)) {
+        if self
+            .focal_hub_id
+            .as_deref()
+            .is_none_or(|id| !current_ids.contains(id))
+        {
             self.focal_hub_id = focal_node_id(graph).map(String::from);
         }
 
@@ -498,10 +503,7 @@ impl GraphSim {
             return;
         };
 
-        let pinned_focal = graph
-            .center
-            .as_deref()
-            .or(self.focal_hub_id.as_deref());
+        let pinned_focal = graph.center.as_deref().or(self.focal_hub_id.as_deref());
 
         // Direct 1-hop neighbors of the dragged node (excluding the pinned focal node)
         let mut neighbors: Vec<&str> = graph
@@ -540,9 +542,9 @@ impl GraphSim {
             v
         };
 
+        type NodeKinematics = (String, (f64, f64), (f64, f64));
         let mut max_speed = 0.0_f64;
-        let mut next_updates: Vec<(String, (f64, f64), (f64, f64))> =
-            Vec::with_capacity(neighbors.len());
+        let mut next_updates: Vec<NodeKinematics> = Vec::with_capacity(neighbors.len());
 
         for nid in neighbors {
             let Some(&(px, py)) = self.positions.get(nid) else {
@@ -636,9 +638,9 @@ pub fn compute_graph_layout(graph: &GraphData) -> HashMap<String, (f64, f64)> {
     let mut outer: Vec<&GraphNode> = Vec::new();
 
     for &node in &sorted[1..] {
-        if center_is_local && node.depth <= 1 && ring1.len() < MAX_RING1_NODES {
-            ring1.push(node);
-        } else if !center_is_local && ring1.len() < 8 {
+        if (center_is_local && node.depth <= 1 && ring1.len() < MAX_RING1_NODES)
+            || (!center_is_local && ring1.len() < 8)
+        {
             ring1.push(node);
         } else {
             outer.push(node);
@@ -701,7 +703,8 @@ pub fn compute_graph_layout(graph: &GraphData) -> HashMap<String, (f64, f64)> {
     let ideal = (0.58 / (n as f64).sqrt()).clamp(0.10, 0.26);
     let rep_cutoff = ideal * 1.55;
     let rep_cutoff_sq = rep_cutoff * rep_cutoff;
-    let mut vel: HashMap<&str, (f64, f64)> = ids.iter().map(|id| (id.as_str(), (0.0, 0.0))).collect();
+    let mut vel: HashMap<&str, (f64, f64)> =
+        ids.iter().map(|id| (id.as_str(), (0.0, 0.0))).collect();
 
     const ITERS: usize = 30;
     for iter in 0..ITERS {
@@ -817,9 +820,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
         .split(area);
 
     let graph = &app.graph;
-    let selected_idx = ui
-        .graph_selected
-        .min(graph.nodes.len().saturating_sub(1));
+    let selected_idx = ui.graph_selected.min(graph.nodes.len().saturating_sub(1));
     let selected_node = graph.nodes.get(selected_idx);
 
     // 1. Graph Header HUD + Clickable Zoom/Reset/Scope Controls
@@ -860,7 +861,11 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
         chunks[0].width
     };
     let counts_str = if left_w >= 44 {
-        format!("   {} nodes · {} edges", graph.nodes.len(), graph.edges.len())
+        format!(
+            "   {} nodes · {} edges",
+            graph.nodes.len(),
+            graph.edges.len()
+        )
     } else {
         format!("  {} nodes", graph.nodes.len())
     };
@@ -920,7 +925,12 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
             Paragraph::new(Span::styled(zoom_out_pill, btn_style)),
             Rect::new(rx, py, zoom_out_w, 1),
         );
-        hitmap.add_line(rx, py, zoom_out_w, HitTarget::Button(ButtonId::GraphZoomOut));
+        hitmap.add_line(
+            rx,
+            py,
+            zoom_out_w,
+            HitTarget::Button(ButtonId::GraphZoomOut),
+        );
         rx += zoom_out_w;
 
         // {zoom%}
@@ -1030,8 +1040,8 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
             }
             // Draw focal & hovered/selected edges on top in vivid Obsidian purple
             for edge in &graph.edges {
-                let is_sel_edge = sel_id == Some(edge.source.as_str())
-                    || sel_id == Some(edge.target.as_str());
+                let is_sel_edge =
+                    sel_id == Some(edge.source.as_str()) || sel_id == Some(edge.target.as_str());
                 let is_focal_edge = focal_id == Some(edge.source.as_str())
                     || focal_id == Some(edge.target.as_str());
                 if !is_sel_edge && !is_focal_edge {
@@ -1145,10 +1155,10 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
     };
 
     for (idx, node, nx, ny) in visible {
-        let cx = canvas_area.x
-            + ((nx * (canvas_area.width.saturating_sub(1) as f64)).round() as u16);
-        let cy = canvas_area.y
-            + ((ny * (canvas_area.height.saturating_sub(1) as f64)).round() as u16);
+        let cx =
+            canvas_area.x + ((nx * (canvas_area.width.saturating_sub(1) as f64)).round() as u16);
+        let cy =
+            canvas_area.y + ((ny * (canvas_area.height.saturating_sub(1) as f64)).round() as u16);
 
         let is_focal = focal_id == Some(node.id.as_str());
         let is_sel = idx == selected_idx;
@@ -1235,7 +1245,10 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
     // Draw & register HitMap in reverse priority order so highest-priority nodes (focal/selected/hovered)
     // always paint on top and win hit-testing.
     for item in placed_nodes.into_iter().rev() {
-        frame.render_widget(Paragraph::new(Span::styled(item.badge, item.style)), item.rect);
+        frame.render_widget(
+            Paragraph::new(Span::styled(item.badge, item.style)),
+            item.rect,
+        );
         hitmap.add(item.rect, HitTarget::GraphNode(item.idx));
     }
 
@@ -1420,7 +1433,10 @@ mod tests {
 
         assert!((sim.zoom - 2.15).abs() < 1e-9, "zoom must be preserved");
         assert!((sim.pan_x - 0.32).abs() < 1e-9, "pan_x must be preserved");
-        assert!((sim.pan_y - (-0.18)).abs() < 1e-9, "pan_y must be preserved");
+        assert!(
+            (sim.pan_y - (-0.18)).abs() < 1e-9,
+            "pan_y must be preserved"
+        );
         assert_eq!(sim.positions["Alpha.md"], (0.22, 0.77));
         assert_eq!(sim.positions["Beta.md"], beta_before);
         assert!(sim.positions.contains_key("Gamma.md"));
@@ -1477,8 +1493,15 @@ mod tests {
 
         let pos_a = compute_graph_layout(&graph_a);
         let pos_b = compute_graph_layout(&graph_b);
-        assert_eq!(pos_a, pos_b, "layout must be 100% deterministic regardless of input order");
-        assert_eq!(pos_a["Hub.md"], (0.50, 0.50), "focal node must be pinned at center");
+        assert_eq!(
+            pos_a, pos_b,
+            "layout must be 100% deterministic regardless of input order"
+        );
+        assert_eq!(
+            pos_a["Hub.md"],
+            (0.50, 0.50),
+            "focal node must be pinned at center"
+        );
 
         // All positions strictly within [0.08, 0.92]
         for (id, &(x, y)) in &pos_a {
@@ -1529,7 +1552,10 @@ mod tests {
                 make_node("A.md", 1, 1),
                 make_node("B.md", 1, 1),
             ],
-            edges: vec![make_edge("Center.md", "A.md"), make_edge("Center.md", "B.md")],
+            edges: vec![
+                make_edge("Center.md", "A.md"),
+                make_edge("Center.md", "B.md"),
+            ],
         };
 
         let mut sim = GraphSim::default();
@@ -1547,7 +1573,10 @@ mod tests {
         for _ in 0..10 {
             sim.step_physics(&graph);
         }
-        assert_eq!(sim.positions, before, "clicking without drag must move 0 nodes");
+        assert_eq!(
+            sim.positions, before,
+            "clicking without drag must move 0 nodes"
+        );
         assert_eq!(sim.energy, 0.0);
     }
 

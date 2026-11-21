@@ -51,7 +51,10 @@ pub enum Action {
     ToggleBookmark,
     OpenDailyNote,
     ToggleSelectedTask,
-    ToggleTaskAtLine { note_path: String, line_no: usize },
+    ToggleTaskAtLine {
+        note_path: String,
+        line_no: usize,
+    },
     JumpToHeadingLine(usize),
     FollowSelectedWikilink,
 
@@ -102,7 +105,10 @@ pub enum Action {
 
     // Vault & Overlays
     OpenOverlay(OverlayKind),
-    OpenContextMenu { col: u16, row: u16 },
+    OpenContextMenu {
+        col: u16,
+        row: u16,
+    },
     CloseOverlay,
     OverlaySubmit,
     SwitchVault(String),
@@ -131,10 +137,28 @@ pub enum Action {
     CursorEnd,
 
     // Mouse
-    MouseClick { col: u16, row: u16 },
-    MouseDrag { col: u16, row: u16 },
-    MouseUp { col: u16, row: u16 },
-    MouseMove { col: u16, row: u16 },
-    MouseScrollUp { col: u16, row: u16 },
-    MouseScrollDown { col: u16, row: u16 },
+    MouseClick {
+        col: u16,
+        row: u16,
+    },
+    MouseDrag {
+        col: u16,
+        row: u16,
+    },
+    MouseUp {
+        col: u16,
+        row: u16,
+    },
+    MouseMove {
+        col: u16,
+        row: u16,
+    },
+    MouseScrollUp {
+        col: u16,
+        row: u16,
+    },
+    MouseScrollDown {
+        col: u16,
+        row: u16,
+    },
 }

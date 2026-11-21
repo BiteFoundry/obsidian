@@ -86,14 +86,16 @@ bitefoundry-obsidian reindex
 # Search, read, author, daily notes & surgical checkbox toggles
 bitefoundry-obsidian search "Architecture" --json
 bitefoundry-obsidian notes list --folder Projects --json
+bitefoundry-obsidian notes list --folder Projects --json --limit 50 --cursor "<next_cursor>"
 bitefoundry-obsidian notes read "Q4 Architecture RFC"
-bitefoundry-obsidian notes read "Q4 Architecture RFC" --json --compact
+bitefoundry-obsidian notes read "Q4 Architecture RFC" --json
+bitefoundry-obsidian notes read "Q4 Architecture RFC" --json --full
 bitefoundry-obsidian notes create "Sprint Retro" --folder Notes --tags "retro,q4"
 bitefoundry-obsidian notes append "Q4 Architecture RFC" "- [ ] Verify the release"
 bitefoundry-obsidian notes replace "Q4 Architecture RFC" --find "Draft review" --replace "Review complete" --json
 bitefoundry-obsidian notes move "Q4 Architecture RFC" "Archive/Q4 Architecture RFC" --json
 bitefoundry-obsidian daily "--append=- [ ] Review PRs"
-bitefoundry-obsidian tasks --open --json
+bitefoundry-obsidian tasks --open --json   # paginated response (default 50; use --cursor or --all)
 bitefoundry-obsidian toggle-task "Q4 Architecture RFC" 14
 
 # Knowledge Graph & Link Intelligence
@@ -108,7 +110,15 @@ bitefoundry-obsidian daemon start
 bitefoundry-obsidian doctor --json
 ```
 
-`notes read` prints raw Markdown. With `--json --compact`, it returns `rel_path`, `title`, and `raw_markdown`. Use `notes edit <NOTE>` for arbitrary body edits in your editor. `notes replace` edits a single literal match in the Markdown body. The JSON result gives `replaced`, `matches`, and `rel_path`.
+`notes read` prints raw Markdown. With `--json`, it returns a compact object by default (`rel_path`, `title`, `raw_markdown`, `mtime_ms`, `omitted`, and `hint`); add `--full` to include `summary`, `parsed`, `backlinks`, `outgoing_links`, and `images` (`--compact` is kept as an alias for the default compact output). `daily --json` follows the same compact-by-default and `--full` rule. `notes list --json` and `tasks --json` return paginated objects with `returned`, `total`, `has_more`, `next_cursor`, and `notes`/`tasks` (default page size 50, max 500; pass `--cursor` to continue or `--all` for every item). `search --json` returns `query`, `limit` (clamped to `1..200`), `returned`, `has_more`, `next_cursor` (`null`), and `results`. Use `notes edit <NOTE>` for arbitrary body edits in your editor. `notes replace` edits a single literal match in the Markdown body and returns `replaced`, `matches`, and `rel_path`.
+
+| v0.2.3 | Equivalent command |
+| :--- | :--- |
+| `notes list --json \| jq '.[]'` | `notes list --json --all \| jq '.notes[]'` |
+| `tasks --open --json \| jq '.[]'` | `tasks --open --json --all \| jq '.tasks[]'` |
+| `search Q --json \| jq '.[]'` | `search Q --json \| jq '.results[]'` |
+| `notes read X --json \| jq '.summary'` | `notes read X --json --full \| jq '.summary'` |
+| `daily --json \| jq '.note.summary'` | `daily --json --full \| jq '.note.summary'` |
 
 ### Local HTTP JSON API (`bitefoundry-obsidian serve`)
 
@@ -135,7 +145,7 @@ Full endpoint catalog and OpenAPI schema: **[docs/API.md](docs/API.md)** · **[d
 
 Full tool catalog and argument schemas: **[docs/MCP.md](docs/MCP.md)** · npm packaging details: **[docs/NPM.md](docs/NPM.md)**.
 
-`move_note` renames or moves a note within a vault and updates incoming wikilinks that need a new target. Use `append_note` and `replace_note_text` for Markdown, `toggle_task` for checkboxes, and `update_frontmatter` for YAML properties. [Editing surfaces and move examples](docs/MCP.md#read-and-edit-notes)
+`move_note` renames or moves a note within a vault, updates incoming wikilinks and Markdown links that need a new target, and rewrites relative Markdown links, images, and attachments inside the moved note so they keep pointing to the same files. Ambiguous note references return an error; pass a vault-relative path when multiple notes share a title or alias. Use `append_note` and `replace_note_text` for Markdown, `toggle_task` for checkboxes, and `update_frontmatter` for YAML properties. [Editing surfaces and move examples](docs/MCP.md#read-and-edit-notes)
 
 ---
 

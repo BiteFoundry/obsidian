@@ -139,8 +139,8 @@ fn draw_help_overlay(
     let theme = &ui.theme;
     let rect = centered_rect(
         area,
-        area.width.saturating_sub(6).min(86).max(40),
-        area.height.saturating_sub(4).min(28).max(12),
+        area.width.saturating_sub(6).clamp(40, 86),
+        area.height.saturating_sub(4).clamp(12, 28),
     );
     frame.render_widget(Clear, rect);
     hitmap.add(rect, HitTarget::OverlayBody);

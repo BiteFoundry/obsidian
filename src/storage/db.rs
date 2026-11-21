@@ -14,28 +14,33 @@ use std::{
     time::Instant,
 };
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use crate::{
     config::{ensure_parent, VaultProfile},
     models::{
-        BacklinkEntry, GraphData, GraphEdge, GraphNode, HeadingEntry, IndexStats, NoteDetail,
-        NoteContent, NoteMove, NoteSummary, NoteTextReplacement, OutgoingLinkEntry, ParsedNote, SearchHit, TagCount,
+        BacklinkEntry, GraphData, GraphEdge, GraphNode, HeadingEntry, IndexStats, LinkStatus,
+        ListPage, NoteContent, NoteDetail, NoteMove, NoteOmittedCounts, NoteSummary,
+        NoteTextReplacement, OutgoingLinkEntry, ParsedNote, SearchHit, SearchPage, TagCount,
         TaskEntry, TaskFilter,
     },
     vault::{
         fs::{
             canonical_rel_path_in_vault, content_sha256_hex, extract_local_markdown_note_link,
-            file_mtime_ns_and_size, folder_from_rel_path, has_symlink_component_in_vault,
-            hydrate_parsed_note_links, move_note, replace_note_text,
+            file_mtime_and_size, file_mtime_ns_and_size, folder_from_rel_path,
+            has_symlink_component_in_vault, hydrate_parsed_note_links, move_note,
+            normalize_rel_path, replace_note_text, resolve_attachment_staged,
             resolve_markdown_link_from_source, resolve_note_identifier,
             resolve_wikilink_from_source, rewrite_wikilinks_for_move, safe_vault_path,
-            scan_vault_markdown_files, title_from_rel_path,
+            scan_vault_markdown_files, title_from_rel_path, wikilink_candidates_from_source,
         },
         parser::parse_markdown,
     },
 };
+
+/// Indexed note paths paired with frontmatter aliases keyed by `rel_path`.
+pub type VaultPathsAndAliases = (Vec<String>, HashMap<String, Vec<String>>);
 
 /// Result of an incremental path-scoped sync batch.
 #[derive(Debug, Clone, Default)]
@@ -75,7 +80,10 @@ impl Storage {
     }
 
     fn init_schema(&self) -> Result<()> {
-        let mut conn = self.conn.lock().map_err(|_| anyhow!("Storage lock poisoned"))?;
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("Storage lock poisoned"))?;
         conn.execute_batch(
             "
             PRAGMA journal_mode = WAL;
@@ -193,7 +201,10 @@ impl Storage {
     /// Returns SQLite's `PRAGMA data_version`, an O(1) counter that increments whenever
     /// any *other* database connection commits a write to `index.db` (e.g. bookmarks or CLI writes).
     pub fn data_version(&self) -> Result<i64> {
-        let conn = self.conn.lock().map_err(|_| anyhow!("Storage lock poisoned"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("Storage lock poisoned"))?;
         let ver: i64 = conn.query_row("PRAGMA data_version", [], |r| r.get(0))?;
         Ok(ver)
     }
@@ -201,7 +212,10 @@ impl Storage {
     /// Computes a deterministic fingerprint of the vault's indexed note state in SQLite,
     /// allowing long-lived watchers to detect cross-process updates (e.g. CLI/HTTP/MCP/Daemon).
     pub fn vault_index_fingerprint(&self, vault_id: &str) -> Result<String> {
-        let conn = self.conn.lock().map_err(|_| anyhow!("Storage lock poisoned"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("Storage lock poisoned"))?;
         let mut stmt = conn.prepare(
             "SELECT rel_path, mtime_ms, mtime_ns, size_bytes, word_count, is_bookmarked, content_hash
              FROM notes
@@ -242,7 +256,10 @@ impl Storage {
 
     /// Marks a single note's cached `mtime_ms` stale so the next `sync_vault` unconditionally re-indexes it.
     pub fn invalidate_note_mtime(&self, vault_id: &str, rel_path: &str) -> Result<()> {
-        let conn = self.conn.lock().map_err(|_| anyhow!("Storage lock poisoned"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("Storage lock poisoned"))?;
         conn.execute(
             "UPDATE notes SET mtime_ms = -1, mtime_ns = -1, content_hash = '' WHERE vault_id = ?1 AND rel_path = ?2",
             params![vault_id, rel_path],
@@ -274,7 +291,10 @@ impl Storage {
             .map(|p| file_mtime_ns_and_size(&p).0)
             .unwrap_or_else(|| mtime_ms.saturating_mul(1_000_000));
 
-        let mut conn = self.conn.lock().map_err(|_| anyhow!("Storage lock poisoned"))?;
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("Storage lock poisoned"))?;
         let tx = conn.transaction()?;
 
         let prev: Option<(bool, String)> = tx
@@ -338,7 +358,10 @@ impl Storage {
         removed: usize,
         elapsed_ms: u64,
     ) -> Result<IndexStats> {
-        let conn = self.conn.lock().map_err(|_| anyhow!("Storage lock poisoned"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("Storage lock poisoned"))?;
         index_stats_on_conn(&conn, vault, scanned, updated, removed, elapsed_ms)
     }
 
@@ -362,7 +385,11 @@ impl Storage {
         let mut candidate_paths: Vec<String> = Vec::with_capacity(rel_paths.len());
         let mut seen_candidates: HashSet<String> = HashSet::new();
         for rp in rel_paths {
-            let clean = rp.trim().replace('\\', "/").trim_start_matches('/').to_string();
+            let clean = rp
+                .trim()
+                .replace('\\', "/")
+                .trim_start_matches('/')
+                .to_string();
             if !clean.is_empty() && seen_candidates.insert(clean.clone()) {
                 candidate_paths.push(clean);
             }
@@ -370,7 +397,10 @@ impl Storage {
 
         // Expand any removed/renamed-away directory prefixes against indexed notes in SQLite.
         if !removed_dir_prefixes.is_empty() {
-            let conn = self.conn.lock().map_err(|_| anyhow!("Storage lock poisoned"))?;
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|_| anyhow!("Storage lock poisoned"))?;
             let mut stmt = if cfg!(windows) {
                 conn.prepare(
                     "SELECT rel_path FROM notes
@@ -392,7 +422,8 @@ impl Storage {
                     continue;
                 }
                 let like_pat = format!("{p}/%");
-                let rows = stmt.query_map(params![vault_id, p, like_pat], |r| r.get::<_, String>(0))?;
+                let rows =
+                    stmt.query_map(params![vault_id, p, like_pat], |r| r.get::<_, String>(0))?;
                 for r in rows {
                     let rp = r?;
                     if seen_candidates.insert(rp.clone()) {
@@ -497,7 +528,10 @@ impl Storage {
         if removed_paths.is_empty() && live_notes.len() == 1 {
             let note = &live_notes[0];
             let unchanged = {
-                let conn = self.conn.lock().map_err(|_| anyhow!("Storage lock poisoned"))?;
+                let conn = self
+                    .conn
+                    .lock()
+                    .map_err(|_| anyhow!("Storage lock poisoned"))?;
                 conn.query_row(
                     "SELECT mtime_ms, mtime_ns, size_bytes, content_hash
                      FROM notes WHERE vault_id = ?1 AND rel_path = ?2",
@@ -544,7 +578,10 @@ impl Storage {
             });
         }
 
-        let mut conn = self.conn.lock().map_err(|_| anyhow!("Storage lock poisoned"))?;
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("Storage lock poisoned"))?;
         let tx = conn.transaction()?;
 
         let mut updated_count = 0usize;
@@ -685,7 +722,10 @@ impl Storage {
         let disk_entries = scan_vault_markdown_files(&vault.path)?;
         let vault_id = vault.id.as_str();
 
-        let mut conn = self.conn.lock().map_err(|_| anyhow!("Storage lock poisoned"))?;
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("Storage lock poisoned"))?;
 
         // Load existing (rel_path -> (mtime_ms, mtime_ns, size_bytes, content_hash, is_bookmarked))
         let mut existing: HashMap<String, (i64, i64, i64, String, bool)> = HashMap::new();
@@ -769,7 +809,10 @@ impl Storage {
                 |r| r.get::<_, bool>(0),
             )?;
         if first_index {
-            tx.execute("DELETE FROM notes_fts WHERE vault_id = ?1", params![vault_id])?;
+            tx.execute(
+                "DELETE FROM notes_fts WHERE vault_id = ?1",
+                params![vault_id],
+            )?;
         }
 
         // Remove deleted notes
@@ -801,9 +844,8 @@ impl Storage {
             let mut all_paths: Vec<String> = Vec::new();
             let mut aliases_by_path: HashMap<String, Vec<String>> = HashMap::new();
             {
-                let mut stmt = tx.prepare(
-                    "SELECT rel_path, aliases_json FROM notes WHERE vault_id = ?1",
-                )?;
+                let mut stmt =
+                    tx.prepare("SELECT rel_path, aliases_json FROM notes WHERE vault_id = ?1")?;
                 let rows = stmt.query_map(params![vault_id], |r| {
                     Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
                 })?;
@@ -865,7 +907,10 @@ impl Storage {
     }
 
     pub fn note_count(&self, vault_id: &str) -> Result<usize> {
-        let conn = self.conn.lock().map_err(|_| anyhow!("Storage lock poisoned"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("Storage lock poisoned"))?;
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM notes WHERE vault_id = ?1",
             params![vault_id],
@@ -876,12 +921,20 @@ impl Storage {
 
     /// Lists all indexed notes in a vault, optionally filtered by folder prefix.
     pub fn list_notes(&self, vault_id: &str, folder: Option<&str>) -> Result<Vec<NoteSummary>> {
-        let conn = self.conn.lock().map_err(|_| anyhow!("Storage lock poisoned"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("Storage lock poisoned"))?;
         let tags_map = load_tags_map(&conn, vault_id)?;
         let (in_counts, out_counts) = load_degree_maps(&conn, vault_id)?;
 
         let folder_norm = folder
-            .map(|f| f.trim().replace('\\', "/").trim_matches('/').to_ascii_lowercase())
+            .map(|f| {
+                f.trim()
+                    .replace('\\', "/")
+                    .trim_matches('/')
+                    .to_ascii_lowercase()
+            })
             .filter(|f| !f.is_empty());
 
         let mut stmt = conn.prepare(
@@ -889,7 +942,7 @@ impl Storage {
                     mtime_ms, size_bytes, is_bookmarked
              FROM notes
              WHERE vault_id = ?1
-             ORDER BY LOWER(folder) ASC, LOWER(title) ASC",
+             ORDER BY LOWER(folder) ASC, LOWER(title) ASC, rel_path ASC",
         )?;
         let rows = stmt.query_map(params![vault_id], |r| {
             let rel_path: String = r.get(0)?;
@@ -961,6 +1014,30 @@ impl Storage {
         Ok(out)
     }
 
+    /// Lists indexed notes using deterministic keyset pagination.
+    pub fn list_notes_page(
+        &self,
+        vault_id: &str,
+        folder: Option<&str>,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<ListPage<NoteSummary>> {
+        let after = cursor.map(parse_note_cursor).transpose()?;
+        let all = self.list_notes(vault_id, folder)?;
+        let keyed: Vec<((String, String, String), NoteSummary)> = all
+            .into_iter()
+            .map(|n| {
+                let key = (
+                    n.folder.to_ascii_lowercase(),
+                    n.title.to_ascii_lowercase(),
+                    n.rel_path.clone(),
+                );
+                (key, n)
+            })
+            .collect();
+        Ok(page_after(keyed, after, limit, |n| n.rel_path.clone()))
+    }
+
     /// Resolves any user-provided note identifier (relative path, title, stem, or alias) in `vault_id`.
     pub fn resolve_note_path(&self, vault_id: &str, note_ref: &str) -> Result<String> {
         let (all_paths, aliases_map) = self.all_paths_and_aliases(vault_id)?;
@@ -981,7 +1058,11 @@ impl Storage {
         if replaced {
             self.sync_vault(vault)?;
         }
-        Ok(NoteTextReplacement { replaced, matches, rel_path })
+        Ok(NoteTextReplacement {
+            replaced,
+            matches,
+            rel_path,
+        })
     }
 
     /// Move a note in an indexed vault and refresh its backlinks and bookmark.
@@ -1012,11 +1093,11 @@ impl Storage {
         })
     }
 
-    pub fn all_paths_and_aliases(
-        &self,
-        vault_id: &str,
-    ) -> Result<(Vec<String>, HashMap<String, Vec<String>>)> {
-        let conn = self.conn.lock().map_err(|_| anyhow!("Storage lock poisoned"))?;
+    pub fn all_paths_and_aliases(&self, vault_id: &str) -> Result<VaultPathsAndAliases> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("Storage lock poisoned"))?;
         let mut stmt =
             conn.prepare("SELECT rel_path, aliases_json FROM notes WHERE vault_id = ?1")?;
         let rows = stmt.query_map(params![vault_id], |r| {
@@ -1039,18 +1120,73 @@ impl Storage {
     pub fn load_note_content(&self, vault: &VaultProfile, note_ref: &str) -> Result<NoteContent> {
         let rel_path = self.resolve_note_path(&vault.id, note_ref)?;
         let abs_path = safe_vault_path(&vault.path, &rel_path)?;
+        let (mtime_ms, _) = file_mtime_and_size(&abs_path);
         let raw_bytes = fs::read(&abs_path)
             .with_context(|| format!("Failed to read note: {}", abs_path.display()))?;
         Ok(NoteContent {
             title: title_from_rel_path(&rel_path),
             rel_path,
             raw_markdown: decode_utf8_lossy(raw_bytes),
+            mtime_ms,
+        })
+    }
+
+    /// Counts for the omitted object of a compact read. One query, no file access.
+    pub fn note_omitted_counts(&self, vault_id: &str, rel_path: &str) -> Result<NoteOmittedCounts> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("Storage lock poisoned"))?;
+        let (backlinks, outgoing_links, tags, headings, tasks, aliases_json): (
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            Option<String>,
+        ) = conn.query_row(
+            "SELECT
+              (SELECT COUNT(DISTINCT source_path) FROM links
+                WHERE vault_id = ?1 AND target_resolved_path = ?2 AND source_path != ?2),
+              (SELECT COUNT(*) FROM links    WHERE vault_id = ?1 AND source_path = ?2),
+              (SELECT COUNT(*) FROM tags     WHERE vault_id = ?1 AND note_path = ?2),
+              (SELECT COUNT(*) FROM headings WHERE vault_id = ?1 AND note_path = ?2),
+              (SELECT COUNT(*) FROM tasks    WHERE vault_id = ?1 AND note_path = ?2),
+              (SELECT aliases_json FROM notes WHERE vault_id = ?1 AND rel_path = ?2)",
+            params![vault_id, rel_path],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
+        )?;
+        let aliases = aliases_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+            .map_or(0, |v| v.len());
+        Ok(NoteOmittedCounts {
+            backlinks: backlinks.max(0) as usize,
+            outgoing_links: outgoing_links.max(0) as usize,
+            tags: tags.max(0) as usize,
+            aliases,
+            headings: headings.max(0) as usize,
+            tasks: tasks.max(0) as usize,
         })
     }
 
     /// Loads complete `NoteDetail` from disk + SQLite index (with resolved wikilinks, images, backlinks, outgoing links).
     pub fn load_note_detail(&self, vault: &VaultProfile, note_ref: &str) -> Result<NoteDetail> {
-        let NoteContent { rel_path, title, raw_markdown } = self.load_note_content(vault, note_ref)?;
+        let NoteContent {
+            rel_path,
+            title,
+            raw_markdown,
+            ..
+        } = self.load_note_content(vault, note_ref)?;
         let mut parsed = parse_markdown(&rel_path, &title, &raw_markdown);
 
         let (all_paths, aliases_map) = self.all_paths_and_aliases(&vault.id)?;
@@ -1066,7 +1202,7 @@ impl Storage {
             .get_note_summary(&vault.id, &rel_path)?
             .ok_or_else(|| anyhow!("Note missing from index: {rel_path}"))?;
         let backlinks = self.get_backlinks(&vault.id, &rel_path)?;
-        let outgoing_links = self.get_outgoing_links(&vault.id, &rel_path)?;
+        let outgoing_links = self.get_outgoing_links(vault, &rel_path)?;
 
         Ok(NoteDetail {
             summary,
@@ -1079,7 +1215,10 @@ impl Storage {
     }
 
     pub fn get_note_summary(&self, vault_id: &str, rel_path: &str) -> Result<Option<NoteSummary>> {
-        let conn = self.conn.lock().map_err(|_| anyhow!("Storage lock poisoned"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("Storage lock poisoned"))?;
         let row = conn
             .query_row(
                 "SELECT rel_path, title, folder, frontmatter_json, aliases_json, word_count,
@@ -1164,13 +1303,42 @@ impl Storage {
         query: &str,
         limit: usize,
     ) -> Result<Vec<SearchHit>> {
-        let q = query.trim();
         let limit = limit.clamp(1, 200);
+        self.search_notes_fetch(vault_id, query, limit)
+    }
+
+    /// Bounded full-text search reporting the applied limit (1..=200) and whether more matches exist.
+    pub fn search_notes_page(
+        &self,
+        vault_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<SearchPage> {
+        let applied = limit.clamp(1, 200);
+        let mut hits = self.search_notes_fetch(vault_id, query, applied + 1)?;
+        let has_more = hits.len() > applied;
+        if has_more {
+            hits.truncate(applied);
+        }
+        Ok(SearchPage {
+            limit: applied,
+            hits,
+            has_more,
+        })
+    }
+
+    fn search_notes_fetch(
+        &self,
+        vault_id: &str,
+        query: &str,
+        fetch: usize,
+    ) -> Result<Vec<SearchHit>> {
+        let q = query.trim();
         if q.is_empty() {
             let notes = self.list_notes(vault_id, None)?;
             return Ok(notes
                 .into_iter()
-                .take(limit)
+                .take(fetch)
                 .map(|n| SearchHit {
                     rel_path: n.rel_path,
                     title: n.title,
@@ -1183,7 +1351,10 @@ impl Storage {
                 .collect());
         }
 
-        let conn = self.conn.lock().map_err(|_| anyhow!("Storage lock poisoned"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("Storage lock poisoned"))?;
         let tags_map = load_tags_map(&conn, vault_id)?;
 
         // Use LIKE fallback when query has <3 chars with Hangul/CJK or very short token
@@ -1191,7 +1362,7 @@ impl Storage {
         if !use_like_first {
             let fts_query = build_fts5_query(q);
             if !fts_query.is_empty() {
-                let fts_res = run_fts5_search(&conn, vault_id, &fts_query, limit, &tags_map);
+                let fts_res = run_fts5_search(&conn, vault_id, &fts_query, fetch, &tags_map);
                 if let Ok(hits) = fts_res {
                     if !hits.is_empty() {
                         return Ok(hits);
@@ -1201,12 +1372,19 @@ impl Storage {
         }
 
         // Fallback: case-insensitive LIKE over title, rel_path, aliases, tags, body_plain
-        run_like_search(&conn, vault_id, q, limit, &tags_map)
+        run_like_search(&conn, vault_id, q, fetch, &tags_map)
     }
 
     /// Returns all incoming Linked Mentions (backlinks) to `target_rel_path` with context snippets.
-    pub fn get_backlinks(&self, vault_id: &str, target_rel_path: &str) -> Result<Vec<BacklinkEntry>> {
-        let conn = self.conn.lock().map_err(|_| anyhow!("Storage lock poisoned"))?;
+    pub fn get_backlinks(
+        &self,
+        vault_id: &str,
+        target_rel_path: &str,
+    ) -> Result<Vec<BacklinkEntry>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("Storage lock poisoned"))?;
         let target_title = title_from_rel_path(target_rel_path);
         let mut stmt = conn.prepare(
             "SELECT l.source_path, n.title, l.target_raw, l.heading, l.is_embed
@@ -1216,9 +1394,8 @@ impl Storage {
              ORDER BY LOWER(n.title) ASC, l.id ASC",
         )?;
         // Keep the metadata cursor open while fetching bodies so both reads share its snapshot.
-        let mut body_stmt = conn.prepare(
-            "SELECT body_plain FROM notes WHERE vault_id = ?1 AND rel_path = ?2",
-        )?;
+        let mut body_stmt =
+            conn.prepare("SELECT body_plain FROM notes WHERE vault_id = ?1 AND rel_path = ?2")?;
         let rows = stmt.query_map(params![vault_id, target_rel_path], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -1252,44 +1429,155 @@ impl Storage {
         Ok(out)
     }
 
-    /// Returns all outgoing wikilinks from `source_rel_path` (including unresolved/broken links).
+    /// Returns all outgoing wikilinks from `source_rel_path` (including attachments, ambiguous, and missing links).
     pub fn get_outgoing_links(
         &self,
-        vault_id: &str,
+        vault: &VaultProfile,
         source_rel_path: &str,
     ) -> Result<Vec<OutgoingLinkEntry>> {
-        let conn = self.conn.lock().map_err(|_| anyhow!("Storage lock poisoned"))?;
-        let mut stmt = conn.prepare(
-            "SELECT l.target_raw, l.target_resolved_path, n.title, l.alias, l.heading, l.is_embed
-             FROM links l
-             LEFT JOIN notes n ON n.vault_id = l.vault_id AND n.rel_path = l.target_resolved_path
-             WHERE l.vault_id = ?1 AND l.source_path = ?2
-             ORDER BY l.id ASC",
-        )?;
-        let rows = stmt.query_map(params![vault_id, source_rel_path], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, Option<String>>(1)?,
-                r.get::<_, Option<String>>(2)?,
-                r.get::<_, Option<String>>(3)?,
-                r.get::<_, Option<String>>(4)?,
-                r.get::<_, i64>(5)? != 0,
-            ))
-        })?;
+        struct OutgoingLinkRow {
+            target_raw: String,
+            resolved_path: Option<String>,
+            resolved_title: Option<String>,
+            alias: Option<String>,
+            heading: Option<String>,
+            is_embed: bool,
+            link_kind: String,
+        }
 
-        let mut out = Vec::new();
-        for r in rows {
-            let (target_raw, resolved_path, resolved_title, alias, heading, is_embed) = r?;
-            let resolved = resolved_path.is_some();
+        let rows: Vec<OutgoingLinkRow> = {
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|_| anyhow!("Storage lock poisoned"))?;
+            let mut stmt = conn.prepare(
+                "SELECT l.target_raw, l.target_resolved_path, n.title, l.alias, l.heading, l.is_embed, l.link_kind
+                 FROM links l
+                 LEFT JOIN notes n ON n.vault_id = l.vault_id AND n.rel_path = l.target_resolved_path
+                 WHERE l.vault_id = ?1 AND l.source_path = ?2
+                 ORDER BY l.id ASC",
+            )?;
+            let mapped = stmt.query_map(params![vault.id, source_rel_path], |r| {
+                Ok(OutgoingLinkRow {
+                    target_raw: r.get(0)?,
+                    resolved_path: r.get(1)?,
+                    resolved_title: r.get(2)?,
+                    alias: r.get(3)?,
+                    heading: r.get(4)?,
+                    is_embed: r.get::<_, i64>(5)? != 0,
+                    link_kind: r.get(6)?,
+                })
+            })?;
+            let mut collected = Vec::new();
+            for r in mapped {
+                collected.push(r?);
+            }
+            collected
+        };
+
+        let has_unresolved = rows.iter().any(|row| row.resolved_path.is_none());
+        let all_notes = if has_unresolved {
+            Some(self.all_paths_and_aliases(&vault.id)?)
+        } else {
+            None
+        };
+
+        let mut out = Vec::with_capacity(rows.len());
+        for OutgoingLinkRow {
+            target_raw,
+            resolved_path,
+            resolved_title,
+            alias,
+            heading,
+            is_embed,
+            link_kind,
+        } in rows
+        {
             let target_title = resolved_title.unwrap_or_else(|| target_raw.clone());
+            if let Some(rp) = resolved_path {
+                out.push(OutgoingLinkEntry {
+                    target_raw,
+                    target_resolved_path: Some(rp),
+                    target_title,
+                    alias,
+                    heading,
+                    is_embed,
+                    resolved: true,
+                    status: LinkStatus::Resolved,
+                    candidates: Vec::new(),
+                });
+                continue;
+            }
+
+            if link_kind == "wikilink" && crate::vault::parser::is_image_target(&target_raw) {
+                if let Some((abs, _)) =
+                    resolve_attachment_staged(&vault.path, source_rel_path, &target_raw)
+                {
+                    if let Ok(rel) = abs.strip_prefix(&vault.path) {
+                        out.push(OutgoingLinkEntry {
+                            target_raw,
+                            target_resolved_path: Some(normalize_rel_path(rel)),
+                            target_title,
+                            alias,
+                            heading,
+                            is_embed,
+                            resolved: true,
+                            status: LinkStatus::Attachment,
+                            candidates: Vec::new(),
+                        });
+                        continue;
+                    }
+                }
+                out.push(OutgoingLinkEntry {
+                    target_raw,
+                    target_resolved_path: None,
+                    target_title,
+                    alias,
+                    heading,
+                    is_embed,
+                    resolved: false,
+                    status: LinkStatus::Missing,
+                    candidates: Vec::new(),
+                });
+                continue;
+            }
+
+            if link_kind == "wikilink" {
+                if let Some((ref all_paths, ref aliases_map)) = all_notes {
+                    let mut cands = wikilink_candidates_from_source(
+                        &target_raw,
+                        source_rel_path,
+                        all_paths,
+                        aliases_map,
+                    );
+                    if cands.len() >= 2 {
+                        cands.truncate(10);
+                        out.push(OutgoingLinkEntry {
+                            target_raw,
+                            target_resolved_path: None,
+                            target_title,
+                            alias,
+                            heading,
+                            is_embed,
+                            resolved: false,
+                            status: LinkStatus::Ambiguous,
+                            candidates: cands,
+                        });
+                        continue;
+                    }
+                }
+            }
+
             out.push(OutgoingLinkEntry {
                 target_raw,
-                target_resolved_path: resolved_path,
+                target_resolved_path: None,
                 target_title,
                 alias,
                 heading,
                 is_embed,
-                resolved,
+                resolved: false,
+                status: LinkStatus::Missing,
+                candidates: Vec::new(),
             });
         }
         Ok(out)
@@ -1302,9 +1590,12 @@ impl Storage {
         center_rel_path: Option<&str>,
         depth: usize,
     ) -> Result<GraphData> {
-        let conn = self.conn.lock().map_err(|_| anyhow!("Storage lock poisoned"))?;
+        let depth = depth.clamp(1, 5);
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("Storage lock poisoned"))?;
         let tags_map = load_tags_map(&conn, vault_id)?;
-        let (in_deg, out_deg) = load_degree_maps(&conn, vault_id)?;
 
         // Load all notes metadata
         let mut note_meta: HashMap<String, (String, String)> = HashMap::new();
@@ -1329,7 +1620,8 @@ impl Storage {
         {
             let mut stmt = conn.prepare(
                 "SELECT source_path, target_raw, target_resolved_path, is_embed
-                 FROM links WHERE vault_id = ?1",
+                 FROM links WHERE vault_id = ?1
+                 ORDER BY id ASC",
             )?;
             let rows = stmt.query_map(params![vault_id], |r| {
                 Ok((
@@ -1355,6 +1647,16 @@ impl Storage {
             }
         }
 
+        let mut in_deg: HashMap<String, usize> = HashMap::new();
+        let mut out_deg: HashMap<String, usize> = HashMap::new();
+        let mut counted: HashSet<(&str, &str)> = HashSet::new();
+        for (src, dst, _, _) in &all_edges {
+            if counted.insert((src.as_str(), dst.as_str())) {
+                *out_deg.entry(src.clone()).or_default() += 1;
+                *in_deg.entry(dst.clone()).or_default() += 1;
+            }
+        }
+
         // Build undirected adjacency for BFS neighborhood discovery
         let mut adj: HashMap<String, Vec<String>> = HashMap::new();
         for (src, dst, _, _) in &all_edges {
@@ -1364,7 +1666,7 @@ impl Storage {
 
         let mut node_depths: HashMap<String, usize> = HashMap::new();
         if let Some(center) = center_rel_path {
-            let max_depth = depth.clamp(1, 5);
+            let max_depth = depth;
             let mut q = VecDeque::new();
             node_depths.insert(center.to_string(), 0);
             q.push_back((center.to_string(), 0usize));
@@ -1414,7 +1716,7 @@ impl Storage {
                     folder: String::new(),
                     resolved: false,
                     depth: *d,
-                    in_degree: 1,
+                    in_degree: *in_deg.get(id).unwrap_or(&0),
                     out_degree: 0,
                     tags: Vec::new(),
                 });
@@ -1424,23 +1726,27 @@ impl Storage {
         nodes.sort_by(|a, b| {
             a.depth
                 .cmp(&b.depth)
+                .then_with(|| (b.in_degree + b.out_degree).cmp(&(a.in_degree + a.out_degree)))
                 .then_with(|| {
-                    (b.in_degree + b.out_degree).cmp(&(a.in_degree + a.out_degree))
+                    a.title
+                        .to_ascii_lowercase()
+                        .cmp(&b.title.to_ascii_lowercase())
                 })
-                .then_with(|| a.title.to_ascii_lowercase().cmp(&b.title.to_ascii_lowercase()))
+                .then_with(|| a.id.cmp(&b.id))
         });
 
         let mut edge_set = HashSet::new();
         let mut edges = Vec::new();
         for (src, dst, is_embed, _) in all_edges {
-            if node_depths.contains_key(&src) && node_depths.contains_key(&dst) {
-                if edge_set.insert((src.clone(), dst.clone())) {
-                    edges.push(GraphEdge {
-                        source: src,
-                        target: dst,
-                        is_embed,
-                    });
-                }
+            if node_depths.contains_key(&src)
+                && node_depths.contains_key(&dst)
+                && edge_set.insert((src.clone(), dst.clone()))
+            {
+                edges.push(GraphEdge {
+                    source: src,
+                    target: dst,
+                    is_embed,
+                });
             }
         }
 
@@ -1463,7 +1769,10 @@ impl Storage {
 
     /// Lists all tags across the vault sorted by descending note count.
     pub fn list_tags(&self, vault_id: &str) -> Result<Vec<TagCount>> {
-        let conn = self.conn.lock().map_err(|_| anyhow!("Storage lock poisoned"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("Storage lock poisoned"))?;
         let mut stmt = conn.prepare(
             "SELECT tag, COUNT(DISTINCT note_path) AS cnt
              FROM tags
@@ -1505,13 +1814,16 @@ impl Storage {
         filter: TaskFilter,
         note_rel_path: Option<&str>,
     ) -> Result<Vec<TaskEntry>> {
-        let conn = self.conn.lock().map_err(|_| anyhow!("Storage lock poisoned"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("Storage lock poisoned"))?;
         let mut stmt = conn.prepare(
             "SELECT t.note_path, n.title, t.line_no, t.text, t.checked
              FROM tasks t
              JOIN notes n ON n.vault_id = t.vault_id AND n.rel_path = t.note_path
              WHERE t.vault_id = ?1
-             ORDER BY t.checked ASC, LOWER(n.title) ASC, t.line_no ASC",
+             ORDER BY t.checked ASC, LOWER(n.title) ASC, t.note_path ASC, t.line_no ASC",
         )?;
         let rows = stmt.query_map(params![vault_id], |r| {
             Ok(TaskEntry {
@@ -1541,9 +1853,40 @@ impl Storage {
         Ok(out)
     }
 
+    /// Lists tasks using deterministic keyset pagination.
+    pub fn list_tasks_page(
+        &self,
+        vault_id: &str,
+        filter: TaskFilter,
+        note_rel_path: Option<&str>,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<ListPage<TaskEntry>> {
+        let after = cursor.map(parse_task_cursor).transpose()?;
+        let all = self.list_tasks(vault_id, filter, note_rel_path)?;
+        let keyed: Vec<((bool, String, String, usize), TaskEntry)> = all
+            .into_iter()
+            .map(|t| {
+                let key = (
+                    t.checked,
+                    t.note_title.to_ascii_lowercase(),
+                    t.note_path.clone(),
+                    t.line_no,
+                );
+                (key, t)
+            })
+            .collect();
+        Ok(page_after(keyed, after, limit, |t| {
+            format!("{}:{}:{}", usize::from(t.checked), t.line_no, t.note_path)
+        }))
+    }
+
     /// Returns headings outline for a specific note.
     pub fn get_headings(&self, vault_id: &str, rel_path: &str) -> Result<Vec<HeadingEntry>> {
-        let conn = self.conn.lock().map_err(|_| anyhow!("Storage lock poisoned"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("Storage lock poisoned"))?;
         let mut stmt = conn.prepare(
             "SELECT note_path, level, text, line_no
              FROM headings
@@ -1567,7 +1910,10 @@ impl Storage {
 
     /// Toggles bookmark flag on a note, returning the new bookmarked state.
     pub fn toggle_bookmark(&self, vault_id: &str, rel_path: &str) -> Result<bool> {
-        let conn = self.conn.lock().map_err(|_| anyhow!("Storage lock poisoned"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("Storage lock poisoned"))?;
         let current: i64 = conn
             .query_row(
                 "SELECT is_bookmarked FROM notes WHERE vault_id = ?1 AND rel_path = ?2",
@@ -1584,7 +1930,10 @@ impl Storage {
     }
 
     pub fn set_bookmark(&self, vault_id: &str, rel_path: &str, bookmarked: bool) -> Result<()> {
-        let conn = self.conn.lock().map_err(|_| anyhow!("Storage lock poisoned"))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("Storage lock poisoned"))?;
         conn.execute(
             "UPDATE notes SET is_bookmarked = ?1 WHERE vault_id = ?2 AND rel_path = ?3",
             params![i64::from(bookmarked), vault_id, rel_path],
@@ -1593,11 +1942,76 @@ impl Storage {
     }
 }
 
+fn page_after<T, K: Ord>(
+    mut sorted: Vec<(K, T)>,
+    after: Option<K>,
+    limit: Option<usize>,
+    cursor_of: impl Fn(&T) -> String,
+) -> ListPage<T> {
+    sorted.sort_by(|(ka, _), (kb, _)| ka.cmp(kb));
+    let total = sorted.len();
+    let filtered = sorted.into_iter().filter_map(|(k, item)| match &after {
+        Some(bound) if k <= *bound => None,
+        _ => Some(item),
+    });
+    let (items, has_more) = match limit {
+        Some(lim) => {
+            let mut taken: Vec<T> = filtered.take(lim.saturating_add(1)).collect();
+            let has_more = taken.len() > lim;
+            if has_more {
+                taken.truncate(lim);
+            }
+            (taken, has_more)
+        }
+        None => (filtered.collect(), false),
+    };
+    let next_cursor = if has_more {
+        items.last().map(cursor_of)
+    } else {
+        None
+    };
+    ListPage {
+        items,
+        total,
+        has_more,
+        next_cursor,
+    }
+}
+
+fn parse_note_cursor(raw: &str) -> Result<(String, String, String)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("Invalid cursor: '{raw}'");
+    }
+    let folder = folder_from_rel_path(trimmed).to_ascii_lowercase();
+    let title = title_from_rel_path(trimmed).to_ascii_lowercase();
+    Ok((folder, title, trimmed.to_string()))
+}
+
+fn parse_task_cursor(raw: &str) -> Result<(bool, String, String, usize)> {
+    let mut parts = raw.splitn(3, ':');
+    let checked_str = parts.next().unwrap_or("");
+    let line_str = parts.next().unwrap_or("");
+    let note_path = parts.next().unwrap_or("");
+    let checked = match checked_str {
+        "0" => false,
+        "1" => true,
+        _ => bail!("Invalid cursor: '{raw}'"),
+    };
+    let line_no: usize = line_str
+        .parse()
+        .map_err(|_| anyhow!("Invalid cursor: '{raw}'"))?;
+    if note_path.trim().is_empty() {
+        bail!("Invalid cursor: '{raw}'");
+    }
+    let note_title = title_from_rel_path(note_path).to_ascii_lowercase();
+    Ok((checked, note_title, note_path.to_string(), line_no))
+}
+
 fn load_tags_map(conn: &Connection, vault_id: &str) -> Result<HashMap<String, Vec<String>>> {
     let mut map: HashMap<String, Vec<String>> = HashMap::new();
-    let mut stmt = conn.prepare(
-        "SELECT note_path, tag FROM tags WHERE vault_id = ?1 ORDER BY tag ASC",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT note_path, tag FROM tags WHERE vault_id = ?1 ORDER BY tag ASC")?;
     let rows = stmt.query_map(params![vault_id], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
     })?;
@@ -1696,7 +2110,7 @@ fn run_fts5_search(
          FROM notes_fts f
          JOIN notes n ON n.vault_id = f.vault_id AND n.rel_path = f.rel_path
          WHERE f.vault_id = ?1 AND notes_fts MATCH ?2
-         ORDER BY bm25(notes_fts, 0.0, 0.0, 6.0, 2.0, 4.0, 3.0, 1.0) ASC
+         ORDER BY bm25(notes_fts, 0.0, 0.0, 6.0, 2.0, 4.0, 3.0, 1.0) ASC, f.rel_path ASC
          LIMIT ?3",
     )?;
     let rows = stmt.query_map(params![vault_id, fts_query, limit as i64], |r| {
@@ -1750,7 +2164,8 @@ fn run_like_search(
            )
          ORDER BY
            CASE WHEN LOWER(n.title) LIKE ?2 THEN 0 ELSE 1 END,
-           n.mtime_ms DESC
+           n.mtime_ms DESC,
+           n.rel_path ASC
          LIMIT ?3",
     )?;
     let rows = stmt.query_map(params![vault_id, pattern, limit as i64], |r| {
@@ -1814,15 +2229,10 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
 }
 
 fn decode_utf8_lossy(bytes: Vec<u8>) -> String {
-    String::from_utf8(bytes)
-        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+    String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
-fn delete_note_in_tx(
-    tx: &rusqlite::Transaction<'_>,
-    vault_id: &str,
-    rel_path: &str,
-) -> Result<()> {
+fn delete_note_in_tx(tx: &rusqlite::Transaction<'_>, vault_id: &str, rel_path: &str) -> Result<()> {
     tx.execute(
         "DELETE FROM notes WHERE vault_id = ?1 AND rel_path = ?2",
         params![vault_id, rel_path],
@@ -1920,7 +2330,8 @@ fn resolve_affected_links_in_tx(
     let mut all_paths: Vec<String> = Vec::new();
     let mut aliases_by_path: HashMap<String, Vec<String>> = HashMap::new();
     {
-        let mut stmt = tx.prepare("SELECT rel_path, aliases_json FROM notes WHERE vault_id = ?1")?;
+        let mut stmt =
+            tx.prepare("SELECT rel_path, aliases_json FROM notes WHERE vault_id = ?1")?;
         let rows = stmt.query_map(params![vault_id], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })?;
@@ -2182,7 +2593,7 @@ fn upsert_note_in_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vault::{fs::file_mtime_and_size, vault_from_dir};
+    use crate::vault::vault_from_dir;
 
     #[test]
     fn backlinks_keep_first_link_order_and_context_for_matching_titles() {
@@ -2347,7 +2758,11 @@ mod tests {
             "---\ntags: [storage]\n---\n\n# Storage Engine\n\nBack-referenced by [[RFC-1]]. Contains 회의 notes.\n",
         )
         .unwrap();
-        fs::write(root.join("Orphan.md"), "# Lone Note\n\nNothing links here.\n").unwrap();
+        fs::write(
+            root.join("Orphan.md"),
+            "# Lone Note\n\nNothing links here.\n",
+        )
+        .unwrap();
 
         let vault = vault_from_dir(root, Some("TestVault"));
         let storage = Storage::open_in_memory().unwrap();
@@ -2397,7 +2812,9 @@ mod tests {
         storage.sync_vault(&vault).unwrap();
 
         // Bookmark the note before editing
-        assert!(storage.toggle_bookmark(&vault.id, "Projects/RFC.md").unwrap());
+        assert!(storage
+            .toggle_bookmark(&vault.id, "Projects/RFC.md")
+            .unwrap());
 
         // Write updated content to disk and call upsert_single_note (NO sync_vault!)
         let new_md = "# Fresh Heading\n\nUniqueSearchToken links to [[Target]] with #instanttag\n\n- [ ] Instant task\n";
@@ -2413,13 +2830,18 @@ mod tests {
             .get_note_summary(&vault.id, "Projects/RFC.md")
             .unwrap()
             .unwrap();
-        assert!(summary.is_bookmarked, "upsert_single_note must preserve is_bookmarked");
+        assert!(
+            summary.is_bookmarked,
+            "upsert_single_note must preserve is_bookmarked"
+        );
         assert!(summary.tags.iter().any(|t| t == "instanttag"));
         assert_eq!(summary.mtime_ms, mtime_ms);
         assert_eq!(summary.size_bytes, size_bytes);
 
         // Verify FTS5, headings, tags, tasks, and resolved links all updated
-        let hits = storage.search_notes(&vault.id, "UniqueSearchToken", 10).unwrap();
+        let hits = storage
+            .search_notes(&vault.id, "UniqueSearchToken", 10)
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].rel_path, "Projects/RFC.md");
 
@@ -2433,10 +2855,15 @@ mod tests {
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].text, "Instant task");
 
-        let outgoing = storage.get_outgoing_links(&vault.id, "Projects/RFC.md").unwrap();
+        let outgoing = storage
+            .get_outgoing_links(&vault, "Projects/RFC.md")
+            .unwrap();
         assert_eq!(outgoing.len(), 1);
         assert!(outgoing[0].resolved);
-        assert_eq!(outgoing[0].target_resolved_path.as_deref(), Some("Target.md"));
+        assert_eq!(
+            outgoing[0].target_resolved_path.as_deref(),
+            Some("Target.md")
+        );
 
         // Verify subsequent sync_vault sees 0 changed files (suppressing redundant watcher scans!)
         let stats = storage.sync_vault(&vault).unwrap();

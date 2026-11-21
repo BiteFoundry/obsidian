@@ -132,12 +132,14 @@ impl NoteFormOverlay {
 
     pub fn draw(&self, frame: &mut Frame, area: Rect, ui: &UiState, hitmap: &mut HitMap) {
         let theme = &ui.theme;
-        let rect = centered_rect(area, area.width.saturating_sub(10).min(72).max(40), 12);
+        let rect = centered_rect(area, area.width.saturating_sub(10).clamp(40, 72), 12);
         frame.render_widget(Clear, rect);
         hitmap.add(rect, HitTarget::OverlayBody);
 
         let header = match &self.mode {
-            NoteFormMode::NewNote => " New Note · Tab Switch Field · Enter Create · Esc Cancel ".to_string(),
+            NoteFormMode::NewNote => {
+                " New Note · Tab Switch Field · Enter Create · Esc Cancel ".to_string()
+            }
             NoteFormMode::QuickAppend { target_title } => {
                 format!(" Quick Append → {target_title} · Enter Save · Esc Cancel ")
             }
@@ -169,7 +171,9 @@ impl NoteFormOverlay {
                         Span::styled(
                             format!(" {:<8} ", label),
                             if active {
-                                Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)
+                                Style::default()
+                                    .fg(theme.accent)
+                                    .add_modifier(Modifier::BOLD)
                             } else {
                                 theme.muted_style()
                             },
@@ -178,7 +182,11 @@ impl NoteFormOverlay {
                             Span::styled((*placeholder).to_string(), theme.subtle_style())
                         } else {
                             Span::styled(
-                                if active { format!("{val}▏") } else { (*val).clone() },
+                                if active {
+                                    format!("{val}▏")
+                                } else {
+                                    (*val).clone()
+                                },
                                 Style::default().fg(theme.fg_primary),
                             )
                         },
@@ -198,10 +206,18 @@ impl NoteFormOverlay {
                     " Tip: type a line, `- [ ] task`, `> [!tip] callout`, or `[[Wikilink]]`",
                     theme.muted_style(),
                 ));
-                frame.render_widget(Paragraph::new(hint), Rect::new(inner.x, inner.y + 1, inner.width, 1));
+                frame.render_widget(
+                    Paragraph::new(hint),
+                    Rect::new(inner.x, inner.y + 1, inner.width, 1),
+                );
 
                 let input = Line::from(vec![
-                    Span::styled(" > ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        " > ",
+                        Style::default()
+                            .fg(theme.accent)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                     Span::styled(
                         format!("{}▏", self.text),
                         Style::default().fg(theme.fg_primary),

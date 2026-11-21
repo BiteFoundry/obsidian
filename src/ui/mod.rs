@@ -79,13 +79,7 @@ pub fn draw(frame: &mut Frame, app: &AppState, ui: &mut UiState) -> HitMap {
     hitmap
 }
 
-fn draw_top_bar(
-    frame: &mut Frame,
-    area: Rect,
-    app: &AppState,
-    ui: &UiState,
-    hitmap: &mut HitMap,
-) {
+fn draw_top_bar(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap: &mut HitMap) {
     let theme = &ui.theme;
     frame.render_widget(
         Block::default().style(Style::default().bg(theme.bg_header)),
@@ -126,7 +120,11 @@ fn draw_top_bar(
 
     // Right-aligned action pills
     let pills: [(&str, bool, ButtonId); 5] = [
-        ("Graph G", ui.canvas_mode == CanvasMode::Graph, ButtonId::ToggleGraph),
+        (
+            "Graph G",
+            ui.canvas_mode == CanvasMode::Graph,
+            ButtonId::ToggleGraph,
+        ),
         ("Daily D", false, ButtonId::OpenDaily),
         ("Backlinks B", ui.show_inspector, ButtonId::ToggleInspector),
         ("Cfg ,", false, ButtonId::Settings),
@@ -273,7 +271,10 @@ fn draw_status_bar(
             ToastKind::Info => theme.accent_soft,
         };
         let line = Line::from(vec![
-            Span::styled(" ● ", Style::default().fg(color).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " ● ",
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(toast.message.clone(), Style::default().fg(color)),
         ]);
         frame.render_widget(
@@ -292,7 +293,8 @@ fn draw_status_bar(
         } else {
             area.x + area.width
         };
-        let hint = " Esc Done · Ctrl+S Save · Ctrl+Z/Y Undo/Redo · Ctrl+V Paste · Ctrl+E External $EDITOR";
+        let hint =
+            " Esc Done · Ctrl+S Save · Ctrl+Z/Y Undo/Redo · Ctrl+V Paste · Ctrl+E External $EDITOR";
         frame.render_widget(
             Paragraph::new(Span::styled(
                 truncate_width(hint, left_limit.saturating_sub(area.x) as usize),
@@ -312,11 +314,7 @@ fn draw_status_bar(
         return;
     }
 
-    let stats_right = format!(
-        " ↻ {} notes · {} tags ",
-        app.notes.len(),
-        app.tags.len()
-    );
+    let stats_right = format!(" ↻ {} notes · {} tags ", app.notes.len(), app.tags.len());
     let stats_w = stats_right.width() as u16;
     let left_limit = if area.width > stats_w + 10 {
         area.x + area.width.saturating_sub(stats_w)
@@ -391,8 +389,7 @@ pub fn truncate_width(s: &str, max_width: usize) -> String {
     }
     let mut out = String::new();
     let mut cur = 0usize;
-    let mut chars = s.chars().peekable();
-    while let Some(ch) = chars.next() {
+    for ch in s.chars() {
         let w = ch.width().unwrap_or(0);
         if cur + w > max_width {
             if max_width >= 1 && !out.is_empty() {

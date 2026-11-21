@@ -50,10 +50,7 @@ impl LinkExtractorOverlay {
         for ol in &detail.outgoing_links {
             let key = format!("wiki:{}", ol.target_raw.to_ascii_lowercase());
             if seen.insert(key) {
-                let label = ol
-                    .alias
-                    .clone()
-                    .unwrap_or_else(|| ol.target_title.clone());
+                let label = ol.alias.clone().unwrap_or_else(|| ol.target_title.clone());
                 links.push(ExtractedLink {
                     label,
                     target: ol
@@ -68,18 +65,18 @@ impl LinkExtractorOverlay {
         }
 
         for ml in &detail.parsed.md_links {
-            if ml.url.starts_with("http://") || ml.url.starts_with("https://") {
-                if seen.insert(ml.url.clone()) {
-                    links.push(ExtractedLink {
-                        label: if ml.label.trim().is_empty() {
-                            ml.url.clone()
-                        } else {
-                            ml.label.clone()
-                        },
-                        target: ml.url.clone(),
-                        kind: ExtractedLinkKind::ExternalUrl,
-                    });
-                }
+            if (ml.url.starts_with("http://") || ml.url.starts_with("https://"))
+                && seen.insert(ml.url.clone())
+            {
+                links.push(ExtractedLink {
+                    label: if ml.label.trim().is_empty() {
+                        ml.url.clone()
+                    } else {
+                        ml.label.clone()
+                    },
+                    target: ml.url.clone(),
+                    kind: ExtractedLinkKind::ExternalUrl,
+                });
             }
         }
 
@@ -124,9 +121,9 @@ impl LinkExtractorOverlay {
                     ExtractedLinkKind::Wikilink {
                         resolved_path: Some(rp),
                     } => OverlayOutcome::CloseAndDispatch(Action::OpenNote(rp.clone())),
-                    ExtractedLinkKind::Wikilink { resolved_path: None } => {
-                        OverlayOutcome::CloseAndDispatch(Action::OpenNote(link.target.clone()))
-                    }
+                    ExtractedLinkKind::Wikilink {
+                        resolved_path: None,
+                    } => OverlayOutcome::CloseAndDispatch(Action::OpenNote(link.target.clone())),
                     ExtractedLinkKind::ExternalUrl => {
                         OverlayOutcome::CloseAndDispatch(Action::OpenUrl(link.target.clone()))
                     }
@@ -152,8 +149,8 @@ impl LinkExtractorOverlay {
 
     pub fn draw(&self, frame: &mut Frame, area: Rect, ui: &UiState, hitmap: &mut HitMap) {
         let theme = &ui.theme;
-        let max_w = area.width.saturating_sub(6).min(92).max(40);
-        let max_h = area.height.saturating_sub(4).min(20).max(9);
+        let max_w = area.width.saturating_sub(6).clamp(40, 92);
+        let max_h = area.height.saturating_sub(4).clamp(9, 20);
         let rect = centered_rect(area, max_w, max_h);
         frame.render_widget(Clear, rect);
         hitmap.add(rect, HitTarget::OverlayBody);
@@ -193,7 +190,13 @@ impl LinkExtractorOverlay {
         let selected = self.selected.min(self.links.len() - 1);
         let offset = selection_offset(selected, visible_rows, self.links.len());
 
-        for (i, link) in self.links.iter().skip(offset).take(visible_rows).enumerate() {
+        for (i, link) in self
+            .links
+            .iter()
+            .skip(offset)
+            .take(visible_rows)
+            .enumerate()
+        {
             let idx = offset + i;
             let row_y = inner.y + i as u16;
             let row_rect = Rect::new(inner.x, row_y, inner.width, 1);
@@ -214,7 +217,9 @@ impl LinkExtractorOverlay {
             let line = Line::from(vec![
                 Span::styled(
                     if is_sel { " ▸ " } else { "   " },
-                    Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(format!(" {badge} "), badge_style),
                 Span::raw(" "),
@@ -222,14 +227,15 @@ impl LinkExtractorOverlay {
                     truncate_width(&link.label, 28),
                     Style::default()
                         .fg(theme.fg_primary)
-                        .add_modifier(if is_sel { Modifier::BOLD } else { Modifier::empty() }),
+                        .add_modifier(if is_sel {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
                 ),
                 Span::styled("  →  ", theme.muted_style()),
                 Span::styled(
-                    truncate_width(
-                        &link.target,
-                        (inner.width as usize).saturating_sub(44),
-                    ),
+                    truncate_width(&link.target, (inner.width as usize).saturating_sub(44)),
                     theme.muted_style(),
                 ),
             ]);

@@ -6,6 +6,7 @@
 //! - `Tokyo Night`
 //! - `Nord`
 //! - `Warm Paper`
+//!
 //! Plus `ANSI 256`, `ANSI 16`, and `NO_COLOR`.
 
 use ratatui::style::{Color, Modifier, Style};
@@ -460,7 +461,9 @@ impl Theme {
         if self.no_color {
             Style::default().add_modifier(Modifier::BOLD)
         } else if self.ansi16_only {
-            Style::default().fg(self.tag_fg).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(self.tag_fg)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(self.tag_fg).bg(self.tag_bg)
         }

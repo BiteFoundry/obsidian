@@ -29,4 +29,6 @@ When `--token` is provided, include `Authorization: Bearer <token>` on all `/api
 | `POST` | `/api/v1/tasks/toggle` | Surgically toggle `- [ ]` <-> `- [x]` at 1-based line (`{ note, line, vault? }`) |
 | `POST` | `/api/v1/reindex` | Trigger immediate incremental filesystem scan & SQLite index refresh |
 
+HTTP response shapes are unchanged: list endpoints return full arrays and note reads return full `NoteDetail` objects. Shared domain updates are reflected in field values: outgoing links include `status` (and `candidates` when ambiguous), graph responses clamp `depth` to `1..5` and report distinct-source `in_degree` and distinct-target `out_degree` (excluding image embeds and self-links), and ambiguous note references return `404` with the `Ambiguous note reference ...` error message.
+
 See **[openapi.yaml](openapi.yaml)** for the full OpenAPI 3.1 specification.

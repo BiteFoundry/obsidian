@@ -345,6 +345,18 @@ pub struct NoteContent {
     pub rel_path: String,
     pub title: String,
     pub raw_markdown: String,
+    pub mtime_ms: i64,
+}
+
+/// Exact counts of what the compact note object leaves out, read from the index.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoteOmittedCounts {
+    pub backlinks: usize,
+    pub outgoing_links: usize,
+    pub tags: usize,
+    pub aliases: usize,
+    pub headings: usize,
+    pub tasks: usize,
 }
 
 /// Result of moving a note through the CLI or MCP.
@@ -385,6 +397,16 @@ pub struct BacklinkEntry {
     pub is_embed: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LinkStatus {
+    Resolved,
+    Attachment,
+    Ambiguous,
+    #[default]
+    Missing,
+}
+
 /// Outgoing wikilink from the active note.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutgoingLinkEntry {
@@ -395,6 +417,10 @@ pub struct OutgoingLinkEntry {
     pub heading: Option<String>,
     pub is_embed: bool,
     pub resolved: bool,
+    #[serde(default)]
+    pub status: LinkStatus,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<String>,
 }
 
 /// Tag aggregate count across a vault.
@@ -444,6 +470,23 @@ pub struct SearchHit {
     pub tags: Vec<String>,
     pub word_count: usize,
     pub mtime_ms: i64,
+}
+
+/// Keyset-paginated slice of a vault list query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListPage<T> {
+    pub items: Vec<T>,
+    pub total: usize,
+    pub has_more: bool,
+    pub next_cursor: Option<String>,
+}
+
+/// Bounded search result reporting the applied limit (1..=200) and truncation status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchPage {
+    pub limit: usize,
+    pub hits: Vec<SearchHit>,
+    pub has_more: bool,
 }
 
 /// Vault incremental index scan report.
@@ -554,18 +597,8 @@ pub struct UpdateCheckResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CoreEvent {
-    VaultIndexed {
-        stats: IndexStats,
-    },
-    NoteChanged {
-        rel_path: String,
-    },
-    SyncStatus {
-        busy: bool,
-        summary: String,
-    },
-    Toast {
-        level: String,
-        message: String,
-    },
+    VaultIndexed { stats: IndexStats },
+    NoteChanged { rel_path: String },
+    SyncStatus { busy: bool, summary: String },
+    Toast { level: String, message: String },
 }

@@ -173,12 +173,8 @@ pub fn parse_markdown(rel_path: &str, note_title: &str, raw: &str) -> ParsedNote
         }
 
         // Standalone embed line: `![[target]]` or `![alt](path)`
-        if let Some(block) = parse_standalone_embed(
-            trimmed,
-            line_no,
-            &mut wikilinks,
-            &mut md_links,
-        ) {
+        if let Some(block) = parse_standalone_embed(trimmed, line_no, &mut wikilinks, &mut md_links)
+        {
             blocks.push(block);
             i += 1;
             continue;
@@ -193,13 +189,8 @@ pub fn parse_markdown(rel_path: &str, note_title: &str, raw: &str) -> ParsedNote
                 if let Some(rest) = next_trim.strip_prefix('>') {
                     let inner = rest.strip_prefix(' ').unwrap_or(rest);
                     let ln = body_start_idx + i + 1;
-                    let spans = parse_inline_spans(
-                        inner,
-                        ln,
-                        &mut wikilinks,
-                        &mut md_links,
-                        &mut tag_set,
-                    );
+                    let spans =
+                        parse_inline_spans(inner, ln, &mut wikilinks, &mut md_links, &mut tag_set);
                     let plain = spans_to_plain(&spans);
                     if !plain.is_empty() {
                         plain_parts.push(plain);
@@ -231,13 +222,8 @@ pub fn parse_markdown(rel_path: &str, note_title: &str, raw: &str) -> ParsedNote
                 if let Some(rest) = next_trim.strip_prefix('>') {
                     let inner = rest.strip_prefix(' ').unwrap_or(rest);
                     let ln = body_start_idx + i + 1;
-                    let spans = parse_inline_spans(
-                        inner,
-                        ln,
-                        &mut wikilinks,
-                        &mut md_links,
-                        &mut tag_set,
-                    );
+                    let spans =
+                        parse_inline_spans(inner, ln, &mut wikilinks, &mut md_links, &mut tag_set);
                     let plain = spans_to_plain(&spans);
                     if !plain.is_empty() {
                         plain_parts.push(plain);
@@ -262,13 +248,8 @@ pub fn parse_markdown(rel_path: &str, note_title: &str, raw: &str) -> ParsedNote
         {
             let headers = split_table_row(trimmed);
             for cell in &headers {
-                let _ = parse_inline_spans(
-                    cell,
-                    line_no,
-                    &mut wikilinks,
-                    &mut md_links,
-                    &mut tag_set,
-                );
+                let _ =
+                    parse_inline_spans(cell, line_no, &mut wikilinks, &mut md_links, &mut tag_set);
             }
             plain_parts.push(headers.join(" "));
             i += 2;
@@ -281,13 +262,8 @@ pub fn parse_markdown(rel_path: &str, note_title: &str, raw: &str) -> ParsedNote
                 let ln = body_start_idx + i + 1;
                 let row = split_table_row(r_trim);
                 for cell in &row {
-                    let _ = parse_inline_spans(
-                        cell,
-                        ln,
-                        &mut wikilinks,
-                        &mut md_links,
-                        &mut tag_set,
-                    );
+                    let _ =
+                        parse_inline_spans(cell, ln, &mut wikilinks, &mut md_links, &mut tag_set);
                 }
                 plain_parts.push(row.join(" "));
                 rows.push(row);
@@ -434,7 +410,11 @@ pub fn parse_frontmatter(lines: &[&str]) -> (BTreeMap<String, Value>, usize) {
     if !lines.first().is_some_and(|line| opening_delimiter(line)) {
         return (BTreeMap::new(), 0);
     }
-    let Some(end) = lines.iter().skip(1).position(|line| closing_delimiter(line)) else {
+    let Some(end) = lines
+        .iter()
+        .skip(1)
+        .position(|line| closing_delimiter(line))
+    else {
         return (BTreeMap::new(), 0);
     };
     let yaml = lines[1..=end].join("\n") + "\n";
@@ -575,7 +555,9 @@ fn parse_numbered_line(line: &str) -> Option<(usize, String, &str)> {
         return None;
     }
     let after = &trimmed[digits_len..];
-    let rest = after.strip_prefix(". ").or_else(|| after.strip_prefix(") "))?;
+    let rest = after
+        .strip_prefix(". ")
+        .or_else(|| after.strip_prefix(") "))?;
     Some((indent, trimmed[..digits_len].to_string(), rest))
 }
 
@@ -858,7 +840,10 @@ fn parse_standalone_embed(
     wikilinks: &mut Vec<WikilinkRef>,
     md_links: &mut Vec<MarkdownLinkRef>,
 ) -> Option<NoteBlock> {
-    if let Some(inner) = trimmed.strip_prefix("![[").and_then(|s| s.strip_suffix("]]")) {
+    if let Some(inner) = trimmed
+        .strip_prefix("![[")
+        .and_then(|s| s.strip_suffix("]]"))
+    {
         if inner.contains("[[") || inner.contains("]]") {
             return None;
         }
@@ -1062,10 +1047,10 @@ pub fn parse_inline_spans(
         }
 
         // Bold: `**...**`
-        if rest.starts_with("**") {
-            if let Some(end) = rest[2..].find("**") {
+        if let Some(after) = rest.strip_prefix("**") {
+            if let Some(end) = after.find("**") {
                 if end > 0 {
-                    let inner = &rest[2..2 + end];
+                    let inner = &after[..end];
                     let inner_spans =
                         parse_inline_spans(inner, line_no, wikilinks, md_links, tag_set);
                     flush_text(&mut text_buf, &mut spans);
@@ -1079,10 +1064,10 @@ pub fn parse_inline_spans(
         }
 
         // Highlight: `==...==`
-        if rest.starts_with("==") {
-            if let Some(end) = rest[2..].find("==") {
+        if let Some(after) = rest.strip_prefix("==") {
+            if let Some(end) = after.find("==") {
                 if end > 0 {
-                    let inner = &rest[2..2 + end];
+                    let inner = &after[..end];
                     let inner_spans =
                         parse_inline_spans(inner, line_no, wikilinks, md_links, tag_set);
                     flush_text(&mut text_buf, &mut spans);
@@ -1096,10 +1081,10 @@ pub fn parse_inline_spans(
         }
 
         // Strikethrough: `~~...~~`
-        if rest.starts_with("~~") {
-            if let Some(end) = rest[2..].find("~~") {
+        if let Some(after) = rest.strip_prefix("~~") {
+            if let Some(end) = after.find("~~") {
                 if end > 0 {
-                    let inner = &rest[2..2 + end];
+                    let inner = &after[..end];
                     let inner_spans =
                         parse_inline_spans(inner, line_no, wikilinks, md_links, tag_set);
                     flush_text(&mut text_buf, &mut spans);
@@ -1130,22 +1115,20 @@ pub fn parse_inline_spans(
         }
 
         // Inline tag `#tag` or `#nested/tag` (must be at start or preceded by whitespace/opening punct)
-        if rest.starts_with('#') {
+        if let Some(after_hash) = rest.strip_prefix('#') {
             let prev_char = input[..i].chars().next_back();
             let valid_boundary = prev_char
                 .map(|c| c.is_whitespace() || matches!(c, '(' | '[' | ',' | ';' | ':'))
                 .unwrap_or(true);
             if valid_boundary {
-                let tag_len = rest[1..]
+                let tag_len = after_hash
                     .char_indices()
-                    .take_while(|(_, c)| {
-                        c.is_alphanumeric() || matches!(c, '_' | '-' | '/')
-                    })
+                    .take_while(|(_, c)| c.is_alphanumeric() || matches!(c, '_' | '-' | '/'))
                     .last()
                     .map(|(idx, c)| idx + c.len_utf8())
                     .unwrap_or(0);
                 if tag_len > 0 {
-                    let raw_tag = &rest[1..1 + tag_len];
+                    let raw_tag = &after_hash[..tag_len];
                     if let Some(clean_tag) = normalize_tag(raw_tag) {
                         flush_text(&mut text_buf, &mut spans);
                         tag_set.insert(clean_tag.clone());
@@ -1244,7 +1227,10 @@ Inline code `#ignore-tag` and `[[ignore-link]]` stay literal.
 "#;
 
         let parsed = parse_markdown("Projects/Q4 Architecture RFC.md", "Q4 Architecture RFC", md);
-        assert_eq!(parsed.frontmatter.get("status").and_then(|v| v.as_str()), Some("active"));
+        assert_eq!(
+            parsed.frontmatter.get("status").and_then(|v| v.as_str()),
+            Some("active")
+        );
         assert_eq!(parsed.aliases, vec!["RFC-042", "Q4 Architecture"]);
         assert!(parsed.tags.contains(&"architecture".to_string()));
         assert!(parsed.tags.contains(&"project/q4".to_string()));
@@ -1278,7 +1264,10 @@ Inline code `#ignore-tag` and `[[ignore-link]]` stay literal.
         updates.insert("status".into(), Value::String("published".into()));
         updates.insert(
             "tags".into(),
-            Value::Array(vec![Value::String("core".into()), Value::String("rfc".into())]),
+            Value::Array(vec![
+                Value::String("core".into()),
+                Value::String("rfc".into()),
+            ]),
         );
         let updated = upsert_frontmatter_in_markdown(orig, &updates).unwrap();
         assert!(updated.contains("status: published"));

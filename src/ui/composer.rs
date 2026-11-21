@@ -335,9 +335,16 @@ impl ComposerState {
             let index = self.text[..start].matches('\n').count();
             let removed = endings
                 .values
-                .splice(index..index + removed_count, std::iter::repeat_n(endings.default, inserted_count))
+                .splice(
+                    index..index + removed_count,
+                    std::iter::repeat_n(endings.default, inserted_count),
+                )
                 .collect();
-            Some(LineEndingEdit { index, removed, inserted_count })
+            Some(LineEndingEdit {
+                index,
+                removed,
+                inserted_count,
+            })
         });
         self.text.replace_range(range, inserted);
         self.cursor = cursor_after;
@@ -523,7 +530,10 @@ impl ComposerState {
         let redo_cursor = self.cursor;
         self.text.replace_range(delta.start..end, &delta.removed);
         if let (Some(endings), Some(edit)) = (&mut self.line_endings, &delta.endings) {
-            endings.values.splice(edit.index..edit.index + edit.inserted_count, edit.removed.iter().copied());
+            endings.values.splice(
+                edit.index..edit.index + edit.inserted_count,
+                edit.removed.iter().copied(),
+            );
         }
         self.restore_cursor(delta.cursor);
         delta.cursor = redo_cursor;
@@ -543,7 +553,10 @@ impl ComposerState {
         let undo_cursor = self.cursor;
         self.text.replace_range(delta.start..end, &delta.inserted);
         if let (Some(endings), Some(edit)) = (&mut self.line_endings, &delta.endings) {
-            endings.values.splice(edit.index..edit.index + edit.removed.len(), std::iter::repeat_n(endings.default, edit.inserted_count));
+            endings.values.splice(
+                edit.index..edit.index + edit.removed.len(),
+                std::iter::repeat_n(endings.default, edit.inserted_count),
+            );
         }
         self.restore_cursor(delta.cursor);
         delta.cursor = undo_cursor;
@@ -675,8 +688,12 @@ pub fn save_clipboard_rgba_to_temp_png(
 ) -> Result<(std::path::PathBuf, Vec<u8>), String> {
     let png_bytes = encode_rgba_to_png(width, height, rgba)?;
     let path = temp_dir.join(format!("obsidian-pasted-{unix_ms}.png"));
-    std::fs::write(&path, &png_bytes)
-        .map_err(|err| format!("Failed to save clipboard image to {}: {err}", path.display()))?;
+    std::fs::write(&path, &png_bytes).map_err(|err| {
+        format!(
+            "Failed to save clipboard image to {}: {err}",
+            path.display()
+        )
+    })?;
     Ok((path, png_bytes))
 }
 
@@ -951,7 +968,9 @@ pub(crate) fn run_editor_command(editor: &str, path: &std::path::Path) -> std::i
         .ok_or_else(|| std::io::Error::other("Editor command is empty"))?;
     let status = Command::new(program).args(args).arg(path).status()?;
     if !status.success() {
-        return Err(std::io::Error::other(format!("Editor exited with status {status}")));
+        return Err(std::io::Error::other(format!(
+            "Editor exited with status {status}"
+        )));
     }
     Ok(())
 }
@@ -998,8 +1017,8 @@ fn parse_editor_command(raw: &str) -> std::io::Result<Vec<String>> {
 
 /// Copies plain UTF-8 text to the system clipboard.
 pub fn copy_to_clipboard(text: &str) -> anyhow::Result<()> {
-    let mut clipboard = arboard::Clipboard::new()
-        .map_err(|err| anyhow::anyhow!("Clipboard unavailable: {err}"))?;
+    let mut clipboard =
+        arboard::Clipboard::new().map_err(|err| anyhow::anyhow!("Clipboard unavailable: {err}"))?;
     clipboard
         .set_text(text.to_string())
         .map_err(|err| anyhow::anyhow!("Failed to copy to clipboard: {err}"))?;
@@ -1025,7 +1044,12 @@ mod tests {
         let command = r#""C:\Program Files\Editor\editor.exe" --wait 'argument with spaces' """#;
         assert_eq!(
             parse_editor_command(command).unwrap(),
-            [r"C:\Program Files\Editor\editor.exe", "--wait", "argument with spaces", ""],
+            [
+                r"C:\Program Files\Editor\editor.exe",
+                "--wait",
+                "argument with spaces",
+                ""
+            ],
         );
         assert!(parse_editor_command(r#"editor "unfinished"#).is_err());
     }
@@ -1171,7 +1195,10 @@ mod tests {
         composer.delete_word_backward();
         assert_eq!(composer.text(), "alpha beta gamma\nline two\nline ");
         assert!(composer.undo());
-        assert_eq!((composer.text(), composer.cursor()), (after_paste, cursor_after_paste));
+        assert_eq!(
+            (composer.text(), composer.cursor()),
+            (after_paste, cursor_after_paste)
+        );
         assert!(composer.redo());
 
         composer.backspace();
@@ -1187,24 +1214,39 @@ mod tests {
             composer.move_right(true);
         }
         assert!(composer.delete_selection());
-        assert_eq!((composer.text(), composer.cursor()), ("alpha  gamma\nline two\nline ", 6));
+        assert_eq!(
+            (composer.text(), composer.cursor()),
+            ("alpha  gamma\nline two\nline ", 6)
+        );
         assert!(composer.undo());
-        assert_eq!((composer.text(), composer.cursor()), ("alpha beta gamma\nline two\nline ", 10));
+        assert_eq!(
+            (composer.text(), composer.cursor()),
+            ("alpha beta gamma\nline two\nline ", 10)
+        );
 
         for _ in 0..4 {
             composer.move_left(true);
         }
         composer.insert_str("BETA");
-        assert_eq!((composer.text(), composer.cursor()), ("alpha BETA gamma\nline two\nline ", 10));
+        assert_eq!(
+            (composer.text(), composer.cursor()),
+            ("alpha BETA gamma\nline two\nline ", 10)
+        );
         assert!(composer.undo());
-        assert_eq!((composer.text(), composer.cursor()), ("alpha beta gamma\nline two\nline ", 6));
+        assert_eq!(
+            (composer.text(), composer.cursor()),
+            ("alpha beta gamma\nline two\nline ", 6)
+        );
         assert!(composer.redo());
 
         // clear() removes entire text in one step and still records a step for image-only clears.
         composer.clear();
         assert_eq!((composer.text(), composer.cursor()), ("", 0));
         assert!(composer.undo());
-        assert_eq!((composer.text(), composer.cursor()), ("alpha BETA gamma\nline two\nline ", 10));
+        assert_eq!(
+            (composer.text(), composer.cursor()),
+            ("alpha BETA gamma\nline two\nline ", 10)
+        );
         assert!(composer.redo());
 
         let png = encode_rgba_to_png(1, 1, vec![255; 4]).unwrap();
@@ -1226,13 +1268,22 @@ mod tests {
         composer.insert_str("한🚀\n✨");
         let after_replace = "가한🚀\n✨yz";
         let expected_cursor = "가한🚀\n✨".len();
-        assert_eq!((composer.text(), composer.cursor()), (after_replace, expected_cursor));
+        assert_eq!(
+            (composer.text(), composer.cursor()),
+            (after_replace, expected_cursor)
+        );
         assert!(composer.text().is_char_boundary(composer.cursor()));
 
         assert!(composer.undo());
-        assert_eq!((composer.text(), composer.cursor()), ("가나다🙂xyz", "가".len()));
+        assert_eq!(
+            (composer.text(), composer.cursor()),
+            ("가나다🙂xyz", "가".len())
+        );
         assert!(composer.redo());
-        assert_eq!((composer.text(), composer.cursor()), (after_replace, expected_cursor));
+        assert_eq!(
+            (composer.text(), composer.cursor()),
+            (after_replace, expected_cursor)
+        );
 
         // Forward selection over emoji + newline + single-char UTF-8 replacement
         composer.set_cursor("가한".len());
@@ -1241,9 +1292,15 @@ mod tests {
         }
         let cursor_before_char = composer.cursor();
         composer.insert_char('é');
-        assert_eq!((composer.text(), composer.cursor()), ("가한éyz", "가한é".len()));
+        assert_eq!(
+            (composer.text(), composer.cursor()),
+            ("가한éyz", "가한é".len())
+        );
         assert!(composer.undo());
-        assert_eq!((composer.text(), composer.cursor()), (after_replace, cursor_before_char));
+        assert_eq!(
+            (composer.text(), composer.cursor()),
+            (after_replace, cursor_before_char)
+        );
     }
 
     #[test]
@@ -1278,7 +1335,10 @@ mod tests {
             assert_eq!(composer.cursor(), step);
         }
         assert!(!composer.redo());
-        assert_eq!((composer.text(), composer.cursor()), (after_200.as_str(), MAX_UNDO));
+        assert_eq!(
+            (composer.text(), composer.cursor()),
+            (after_200.as_str(), MAX_UNDO)
+        );
 
         let extra = 25;
         for _ in 0..extra {
@@ -1290,7 +1350,10 @@ mod tests {
             undone += 1;
         }
         assert_eq!(undone, MAX_UNDO);
-        assert_eq!((composer.text().len(), composer.cursor()), (base_len + extra, extra));
+        assert_eq!(
+            (composer.text().len(), composer.cursor()),
+            (base_len + extra, extra)
+        );
         assert!(composer.text().ends_with(&base));
     }
 }

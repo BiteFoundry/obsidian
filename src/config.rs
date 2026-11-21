@@ -330,8 +330,7 @@ impl AppConfig {
     pub fn register_vault(&mut self, profile: VaultProfile, make_active: bool) -> Result<()> {
         let norm_new = normalize_path_key(&profile.path);
         if let Some(conflict) = self.vaults.iter().find(|v| {
-            v.name.eq_ignore_ascii_case(&profile.name)
-                && normalize_path_key(&v.path) != norm_new
+            v.name.eq_ignore_ascii_case(&profile.name) && normalize_path_key(&v.path) != norm_new
         }) {
             bail!(
                 "Vault name '{}' is already registered for '{}'. Use a different `--name` or remove the existing vault first.",
@@ -679,9 +678,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
 
-        let mut cfg = AppConfig::default();
-        cfg.page_width = PageWidthMode::Full;
-        cfg.theme = ThemePreset::Catppuccin;
+        let mut cfg = AppConfig {
+            page_width: PageWidthMode::Full,
+            theme: ThemePreset::Catppuccin,
+            ..AppConfig::default()
+        };
         cfg.upsert_vault(
             VaultProfile {
                 id: "v-acme".into(),
@@ -703,10 +704,7 @@ mod tests {
         assert_eq!(loaded.vaults.len(), 1);
         assert_eq!(loaded.page_width, PageWidthMode::Full);
         assert_eq!(loaded.theme, ThemePreset::Catppuccin);
-        assert_eq!(
-            loaded.find_vault("Acme Second Brain").unwrap().id,
-            "v-acme"
-        );
+        assert_eq!(loaded.find_vault("Acme Second Brain").unwrap().id, "v-acme");
     }
 
     #[test]

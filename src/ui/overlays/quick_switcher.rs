@@ -62,13 +62,7 @@ impl QuickSwitcherOverlay {
                 .notes
                 .iter()
                 .filter_map(|n| {
-                    let score = fuzzy_score(
-                        &needle,
-                        &n.title,
-                        &n.rel_path,
-                        &n.tags,
-                        &n.aliases,
-                    )?;
+                    let score = fuzzy_score(&needle, &n.title, &n.rel_path, &n.tags, &n.aliases)?;
                     Some((
                         score,
                         SwitcherItem::Note {
@@ -81,7 +75,7 @@ impl QuickSwitcherOverlay {
                     ))
                 })
                 .collect();
-            scored.sort_by(|a, b| b.0.cmp(&a.0));
+            scored.sort_by_key(|a| std::cmp::Reverse(a.0));
             out.extend(scored.into_iter().take(40).map(|(_, item)| item));
 
             for h in &app.html_files {
@@ -104,23 +98,48 @@ impl QuickSwitcherOverlay {
             ("Interactive HTML Preview", "H", Action::OpenHtmlPreview),
             ("Create New Note", "n", Action::OpenNewNoteModal),
             ("Edit Active Note in Terminal", "e", Action::OpenNoteEditor),
-            ("Edit Active Note in External $EDITOR", "Ctrl+E", Action::RequestExternalEditor),
+            (
+                "Edit Active Note in External $EDITOR",
+                "Ctrl+E",
+                Action::RequestExternalEditor,
+            ),
             ("Quick Append to Active Note", "a", Action::OpenQuickAppend),
-            ("Toggle Right Inspector (Backlinks)", "B", Action::ToggleInspector),
+            (
+                "Toggle Right Inspector (Backlinks)",
+                "B",
+                Action::ToggleInspector,
+            ),
             ("Toggle Left Sidebar", "[", Action::ToggleSidebar),
-            ("Switch Vault", "Ctrl+S", Action::OpenOverlay(OverlayKind::VaultSwitcher)),
-            ("Settings & Themes (5 Palettes)", "Ctrl+,", Action::OpenOverlay(OverlayKind::Settings)),
-            ("Extract Links from Active Note", "u", Action::OpenLinkExtractor),
-            ("Attach Local File (zoxide)", "Ctrl+F", Action::OpenFilePicker),
+            (
+                "Switch Vault",
+                "Ctrl+S",
+                Action::OpenOverlay(OverlayKind::VaultSwitcher),
+            ),
+            (
+                "Settings & Themes (5 Palettes)",
+                "Ctrl+,",
+                Action::OpenOverlay(OverlayKind::Settings),
+            ),
+            (
+                "Extract Links from Active Note",
+                "u",
+                Action::OpenLinkExtractor,
+            ),
+            (
+                "Attach Local File (zoxide)",
+                "Ctrl+F",
+                Action::OpenFilePicker,
+            ),
             ("Reindex Vault Now", "r", Action::RefreshAll),
-            ("Keyboard Shortcuts Help", "?", Action::OpenOverlay(OverlayKind::Help)),
+            (
+                "Keyboard Shortcuts Help",
+                "?",
+                Action::OpenOverlay(OverlayKind::Help),
+            ),
         ];
 
         for (label, shortcut, action) in commands {
-            if command_only
-                || needle.is_empty()
-                || label.to_ascii_lowercase().contains(&needle)
-            {
+            if command_only || needle.is_empty() || label.to_ascii_lowercase().contains(&needle) {
                 out.push(SwitcherItem::Command {
                     label: label.to_string(),
                     shortcut: shortcut.to_string(),
@@ -199,8 +218,8 @@ impl QuickSwitcherOverlay {
         hitmap: &mut HitMap,
     ) {
         let theme = &ui.theme;
-        let max_w = area.width.saturating_sub(8).min(82).max(40);
-        let max_h = area.height.saturating_sub(6).min(20).max(10);
+        let max_w = area.width.saturating_sub(8).clamp(40, 82);
+        let max_h = area.height.saturating_sub(6).clamp(10, 20);
         let rect = centered_rect(area, max_w, max_h);
         frame.render_widget(Clear, rect);
         hitmap.add(rect, HitTarget::OverlayBody);
@@ -255,7 +274,10 @@ impl QuickSwitcherOverlay {
         let list_h = inner.height.saturating_sub(2) as usize;
         if list.is_empty() {
             frame.render_widget(
-                Paragraph::new(Span::styled("  No matching notes or commands.", theme.muted_style())),
+                Paragraph::new(Span::styled(
+                    "  No matching notes or commands.",
+                    theme.muted_style(),
+                )),
                 Rect::new(inner.x, inner.y + 2, inner.width, 1),
             );
             return;
@@ -286,14 +308,20 @@ impl QuickSwitcherOverlay {
                     let mut spans = vec![
                         Span::styled(
                             if is_sel { " ▸ " } else { "   " },
-                            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+                            Style::default()
+                                .fg(theme.accent)
+                                .add_modifier(Modifier::BOLD),
                         ),
                         Span::styled("▪ ", Style::default().fg(theme.accent_soft)),
                         Span::styled(
                             truncate_width(title, 34),
                             Style::default()
                                 .fg(theme.fg_primary)
-                                .add_modifier(if is_sel { Modifier::BOLD } else { Modifier::empty() }),
+                                .add_modifier(if is_sel {
+                                    Modifier::BOLD
+                                } else {
+                                    Modifier::empty()
+                                }),
                         ),
                     ];
                     if !folder.is_empty() {
@@ -303,7 +331,10 @@ impl QuickSwitcherOverlay {
                         ));
                     }
                     if let Some(first_tag) = tags.first() {
-                        spans.push(Span::styled(format!("  #{first_tag}"), theme.tag_pill_style()));
+                        spans.push(Span::styled(
+                            format!("  #{first_tag}"),
+                            theme.tag_pill_style(),
+                        ));
                     }
                     if *backlinks > 0 {
                         spans.push(Span::styled(format!("  ←{backlinks}"), theme.muted_style()));
@@ -314,14 +345,20 @@ impl QuickSwitcherOverlay {
                     let mut spans = vec![
                         Span::styled(
                             if is_sel { " ▸ " } else { "   " },
-                            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+                            Style::default()
+                                .fg(theme.accent)
+                                .add_modifier(Modifier::BOLD),
                         ),
                         Span::styled("◈ ", Style::default().fg(theme.info)),
                         Span::styled(
                             truncate_width(title, 34),
                             Style::default()
                                 .fg(theme.fg_primary)
-                                .add_modifier(if is_sel { Modifier::BOLD } else { Modifier::empty() }),
+                                .add_modifier(if is_sel {
+                                    Modifier::BOLD
+                                } else {
+                                    Modifier::empty()
+                                }),
                         ),
                         Span::styled("  [HTML]", Style::default().fg(theme.info)),
                     ];
@@ -338,7 +375,9 @@ impl QuickSwitcherOverlay {
                 } => Line::from(vec![
                     Span::styled(
                         if is_sel { " ▸ " } else { "   " },
-                        Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(theme.accent)
+                            .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled("⚡ ", Style::default().fg(theme.warning)),
                     Span::styled(
@@ -376,7 +415,10 @@ fn fuzzy_score(
     if tl.contains(needle) {
         return Some(600);
     }
-    if aliases.iter().any(|a| a.to_ascii_lowercase().contains(needle)) {
+    if aliases
+        .iter()
+        .any(|a| a.to_ascii_lowercase().contains(needle))
+    {
         return Some(500);
     }
     if tags.iter().any(|t| {

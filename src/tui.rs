@@ -30,9 +30,7 @@ use tokio::sync::mpsc;
 
 use crate::{
     config::{AppConfig, ImageProtocolPreference, VaultProfile},
-    img_preview::{
-        self, ActivePixelGraphic, TerminalGraphicsCaps, TerminalImageProtocol,
-    },
+    img_preview::{self, ActivePixelGraphic, TerminalGraphicsCaps, TerminalImageProtocol},
     models::CoreEvent,
     storage::Storage,
     sync,
@@ -280,7 +278,11 @@ struct TerminalGuard {
 impl TerminalGuard {
     fn enter(
         image_protocol: ImageProtocolPreference,
-    ) -> Result<(Self, Terminal<CrosstermBackend<Stdout>>, TerminalGraphicsCaps)> {
+    ) -> Result<(
+        Self,
+        Terminal<CrosstermBackend<Stdout>>,
+        TerminalGraphicsCaps,
+    )> {
         #[cfg(windows)]
         let orig_conin_mode = win_console::snapshot_console_mode();
 
@@ -594,11 +596,7 @@ fn draw_frame(
     draw_res
 }
 
-pub async fn run_tui(
-    cfg: AppConfig,
-    vault: VaultProfile,
-    storage: Storage,
-) -> Result<()> {
+pub async fn run_tui(cfg: AppConfig, vault: VaultProfile, storage: Storage) -> Result<()> {
     // Initial synchronous scan so first frame is immediately populated
     let initial_stats = storage.sync_vault(&vault)?;
     let (events_tx, mut events_rx) = mpsc::unbounded_channel::<CoreEvent>();
@@ -840,7 +838,8 @@ mod tests {
                 line_no: 1,
             }],
         };
-        let img_ov = Overlay::ImagePreview(ImagePreviewOverlay::from_note(&detail, Some(0)).unwrap());
+        let img_ov =
+            Overlay::ImagePreview(ImagePreviewOverlay::from_note(&detail, Some(0)).unwrap());
         let help_ov = Overlay::Help { scroll: 0 };
 
         assert!(pixel_graphics_allowed_for_overlays(

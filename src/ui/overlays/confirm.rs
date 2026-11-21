@@ -46,9 +46,7 @@ impl ConfirmOverlay {
             | Action::Input('n')
             | Action::Input('N')
             | Action::OpenNewNoteModal => OverlayOutcome::Close,
-            Action::Input('y')
-            | Action::Input('Y')
-            | Action::CopySelectionOrMarkdown => {
+            Action::Input('y') | Action::Input('Y') | Action::CopySelectionOrMarkdown => {
                 OverlayOutcome::CloseAndDispatch(self.on_confirm.clone())
             }
             Action::Tab | Action::CursorLeft | Action::CursorRight => {
@@ -69,7 +67,7 @@ impl ConfirmOverlay {
 
     pub fn draw(&self, frame: &mut Frame, area: Rect, ui: &UiState, hitmap: &mut HitMap) {
         let theme = &ui.theme;
-        let rect = centered_rect(area, area.width.saturating_sub(12).min(58).max(34), 8);
+        let rect = centered_rect(area, area.width.saturating_sub(12).clamp(34, 58), 8);
         frame.render_widget(Clear, rect);
         hitmap.add(rect, HitTarget::OverlayBody);
 
@@ -121,7 +119,10 @@ impl ConfirmOverlay {
             Paragraph::new(Span::styled(ok_text, ok_style)),
             Rect::new(x0, btn_y, ok_w, 1),
         );
-        hitmap.add(Rect::new(x0, btn_y, ok_w, 1), HitTarget::Button(ButtonId::ConfirmOk));
+        hitmap.add(
+            Rect::new(x0, btn_y, ok_w, 1),
+            HitTarget::Button(ButtonId::ConfirmOk),
+        );
 
         let x1 = x0 + ok_w + 2;
         frame.render_widget(

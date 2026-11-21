@@ -154,12 +154,11 @@ pub async fn check_or_apply_update_at(
         );
     };
 
-    let asset_bytes =
-        download_asset_bytes(&client, asset, &ua, token.as_deref(), api_base).await?;
+    let asset_bytes = download_asset_bytes(&client, asset, &ua, token.as_deref(), api_base).await?;
     let sums_bytes =
         download_asset_bytes(&client, sums_asset, &ua, token.as_deref(), api_base).await?;
-    let sums_text = String::from_utf8(sums_bytes)
-        .context("SHA256SUMS.txt is not valid UTF-8 text")?;
+    let sums_text =
+        String::from_utf8(sums_bytes).context("SHA256SUMS.txt is not valid UTF-8 text")?;
     verify_sha256_sums(&sums_text, &asset.name, &asset_bytes)?;
 
     let extracted_bytes = extract_binary_from_asset(&asset.name, &asset_bytes)?;
@@ -178,11 +177,7 @@ pub async fn check_or_apply_update_at(
 }
 
 async fn discover_github_token(api_base_url: &str) -> Option<String> {
-    for var in [
-        "OBSIDIAN_GITHUB_TOKEN",
-        "GH_TOKEN",
-        "GITHUB_TOKEN",
-    ] {
+    for var in ["OBSIDIAN_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"] {
         if let Ok(val) = std::env::var(var) {
             let trimmed = val.trim();
             if !trimmed.is_empty() {
@@ -328,7 +323,10 @@ async fn download_asset_bytes(
                 .with_context(|| format!("Failed to download asset body: {}", asset.name));
         }
         let status = resp.status();
-        bail!("Failed to download asset '{}' via API (HTTP {status})", asset.name);
+        bail!(
+            "Failed to download asset '{}' via API (HTTP {status})",
+            asset.name
+        );
     }
 
     bail!("Asset '{}' has no download URL", asset.name);
@@ -336,11 +334,7 @@ async fn download_asset_bytes(
 
 pub(crate) fn parse_semver(version: &str) -> Result<(u64, u64, u64)> {
     let stripped = strip_tag_v(version.trim());
-    let core = stripped
-        .split(['-', '+'])
-        .next()
-        .unwrap_or(stripped)
-        .trim();
+    let core = stripped.split(['-', '+']).next().unwrap_or(stripped).trim();
     let mut parts = core.split('.');
     let major: u64 = parts
         .next()
@@ -424,7 +418,10 @@ fn select_platform_asset_for<'a>(
         }
     }
     for candidate in &candidates {
-        if let Some(found) = assets.iter().find(|a| a.name.eq_ignore_ascii_case(candidate)) {
+        if let Some(found) = assets
+            .iter()
+            .find(|a| a.name.eq_ignore_ascii_case(candidate))
+        {
             return Some(found);
         }
     }
@@ -451,10 +448,7 @@ pub(crate) fn verify_sha256_sums(
         };
         let clean_name = file_part.trim_start_matches(['*', '.', '/']);
         if clean_name == asset_name
-            || Path::new(clean_name)
-                .file_name()
-                .and_then(|n| n.to_str())
-                == Some(asset_name)
+            || Path::new(clean_name).file_name().and_then(|n| n.to_str()) == Some(asset_name)
         {
             expected_hex = Some(hash.to_ascii_lowercase());
             break;
@@ -467,9 +461,7 @@ pub(crate) fn verify_sha256_sums(
 
     let actual = hex::encode(Sha256::digest(asset_bytes));
     if !actual.eq_ignore_ascii_case(&expected) {
-        bail!(
-            "SHA-256 verification failed ({asset_name}): expected {expected}, actual {actual}"
-        );
+        bail!("SHA-256 verification failed ({asset_name}): expected {expected}, actual {actual}");
     }
     Ok(())
 }
@@ -480,10 +472,15 @@ fn extract_binary_from_asset(asset_name: &str, asset_bytes: &[u8]) -> Result<Vec
         return Ok(asset_bytes.to_vec());
     }
 
-    let tmp = tempfile::tempdir().context("Failed to create temporary directory for update extraction")?;
+    let tmp = tempfile::tempdir()
+        .context("Failed to create temporary directory for update extraction")?;
     let archive_path = tmp.path().join(asset_name);
-    std::fs::write(&archive_path, asset_bytes)
-        .with_context(|| format!("Failed to save temporary archive: {}", archive_path.display()))?;
+    std::fs::write(&archive_path, asset_bytes).with_context(|| {
+        format!(
+            "Failed to save temporary archive: {}",
+            archive_path.display()
+        )
+    })?;
 
     let extract_dir = tmp.path().join("extracted");
     std::fs::create_dir_all(&extract_dir)?;
@@ -563,15 +560,23 @@ pub(crate) fn replace_executable_at(target_exe: &Path, new_bytes: &[u8]) -> Resu
         })?;
     }
 
-    std::fs::write(&new_path, new_bytes)
-        .with_context(|| format!("Failed to write temporary new binary: {}", new_path.display()))?;
+    std::fs::write(&new_path, new_bytes).with_context(|| {
+        format!(
+            "Failed to write temporary new binary: {}",
+            new_path.display()
+        )
+    })?;
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o755);
-        std::fs::set_permissions(&new_path, perms)
-            .with_context(|| format!("Failed to set executable permissions: {}", new_path.display()))?;
+        std::fs::set_permissions(&new_path, perms).with_context(|| {
+            format!(
+                "Failed to set executable permissions: {}",
+                new_path.display()
+            )
+        })?;
     }
 
     if old_path.symlink_metadata().is_ok() {
@@ -652,7 +657,8 @@ mod tests {
         let sums = format!("{digest}  bitefoundry-obsidian.exe\n0000000000000000000000000000000000000000000000000000000000000000  other.tar.gz\n");
         verify_sha256_sums(&sums, "bitefoundry-obsidian.exe", payload).unwrap();
 
-        let err = verify_sha256_sums(&sums, "bitefoundry-obsidian.exe", b"tampered-bytes").unwrap_err();
+        let err =
+            verify_sha256_sums(&sums, "bitefoundry-obsidian.exe", b"tampered-bytes").unwrap_err();
         assert!(err.to_string().contains("SHA-256 verification failed"));
 
         let missing = verify_sha256_sums(&sums, "missing.zip", payload).unwrap_err();

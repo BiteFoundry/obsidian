@@ -26,29 +26,31 @@ Existing 0.1.x settings use `"command": "obsidian"` or `"command": "obs"`. Set `
 | # | Tool | Arguments | Purpose |
 | :-: | :--- | :--- | :--- |
 | 1 | `list_vaults` | *(none)* | List auto-discovered & registered Obsidian vaults with note counts |
-| 2 | `search_notes` | `query`, `limit?`, `vault?` | SQLite FTS5 search with `<3`-char Korean/CJK `LIKE` fallback |
-| 3 | `read_note` | `note`, `compact?`, `vault?` | Read raw Markdown, frontmatter, tags, headings, tasks, backlinks & outgoing links |
-| 4 | `list_notes` | `folder?`, `vault?` | List notes in the vault, optionally filtered by folder prefix |
+| 2 | `search_notes` | `query`, `limit?`, `vault?` | SQLite FTS5 search with `<3`-char Korean/CJK `LIKE` fallback (`limit` default 20, clamped `1..200`; response includes `limit`, `returned`, `has_more`, `next_cursor`) |
+| 3 | `read_note` | `note`, `compact?`, `vault?` | Compact by default (`rel_path`, `title`, `raw_markdown`, `mtime_ms`, `omitted`, `hint`); pass `compact: false` for frontmatter, tags, headings, tasks, backlinks & outgoing links |
+| 4 | `list_notes` | `folder?`, `limit?`, `cursor?`, `vault?` | Paginated note list (`limit` `1..500`, default 50; returns `count`, `returned`, `total`, `has_more`, `next_cursor`, `notes`) |
 | 5 | `create_note` | `title`, `folder?`, `content?`, `tags?`, `vault?` | Create a new `.md` note atomically with YAML frontmatter |
 | 6 | `append_note` | `note`, `text`, `vault?` | Append Markdown text, tasks, or callouts atomically |
 | 7 | `update_frontmatter` | `note`, `properties`, `vault?` | Set or delete (`null`) top-level YAML properties |
 | 8 | `delete_note` | `note`, `confirm` (`true`), `vault?` | Safely move a note into `<vault>/.trash/` (requires `confirm: true`) |
-| 9 | `daily_note` | `date?`, `append?`, `vault?` | Open or create today's Daily Note and optionally append text |
+| 9 | `daily_note` | `date?`, `append?`, `vault?` | Open or create today's Daily Note and optionally append text; returns `created`, `raw_markdown`, `rel_path`, `omitted`, `hint` (call `read_note` with `compact: false` for metadata; each call with `append` appends again) |
 | 10 | `get_backlinks` | `note`, `vault?` | Return incoming linked mentions (backlinks) with snippet context |
-| 11 | `get_outgoing_links` | `note`, `vault?` | Return outgoing wikilinks and embeds (resolved & unresolved) |
-| 12 | `get_local_graph` | `note?`, `depth?`, `vault?` | Return local BFS neighborhood (or global vault graph when `note` omitted) |
+| 11 | `get_outgoing_links` | `note`, `vault?` | Return outgoing wikilinks and embeds with `status` (`resolved`, `attachment`, `ambiguous`, `missing`) and `candidates` |
+| 12 | `get_local_graph` | `note?`, `depth?`, `vault?` | Return local BFS neighborhood (`depth` clamped `1..5`, applied `depth` returned; `in_degree` = distinct referring notes, `out_degree` = distinct targets excluding image embeds/self-links; omitting `note` returns the full vault graph) |
 | 13 | `list_tags` | `vault?` | List all inline and frontmatter `#tags` with note counts |
 | 14 | `find_by_tag` | `tag`, `vault?` | Find all notes matching a tag (including nested subtags) |
-| 15 | `list_tasks` | `status?`, `note?`, `vault?` | List Markdown checklist tasks (`all`, `open`, or `done`) |
+| 15 | `list_tasks` | `status?`, `note?`, `limit?`, `cursor?`, `vault?` | Paginated checklist tasks (`all`, `open`, `done`; `limit` `1..500`, default 50; returns `count`, `returned`, `total`, `has_more`, `next_cursor`, `tasks`) |
 | 16 | `toggle_task` | `note`, `line`, `expected_text?`, `expected_checked?`, `expected_mtime_ms?`, `vault?` | Toggle a Markdown checkbox at an exact 1-based line number, with optional conflict checks |
 | 17 | `find_orphans` | `vault?` | Find orphan notes with 0 backlinks and 0 outgoing links |
 | 18 | `reindex_vault` | `vault?` | Trigger immediate incremental scan & SQLite FTS5/graph reindex |
-| 19 | `move_note` | `src`, `dst`, `vault?` | Move or rename a note within its vault and update incoming wikilinks that need a new target |
+| 19 | `move_note` | `src`, `dst`, `vault?` | Move or rename a note within its vault, update incoming wikilinks/Markdown links, and rewrite relative Markdown links, images, and attachments inside the moved note so they keep pointing to the same files |
 | 20 | `replace_note_text` | `note`, `find`, `replace`, `vault?` | Replace a literal string that occurs exactly once in the Markdown body |
 
 ## Read and edit notes
 
-Call `read_note` with `{"note":"Projects/Review.md","compact":true}` to get `rel_path`, `title`, and `raw_markdown`. Omit `compact` for metadata and links.
+`read_note` returns a compact object by default (`rel_path`, `title`, `raw_markdown`, `mtime_ms`, `omitted`, and `hint`). Pass `{"note":"Projects/Review.md","compact":false}` for frontmatter, tags, headings, tasks, backlinks, and outgoing links (also including `mtime_ms`). You can pass the returned `mtime_ms` directly as `expected_mtime_ms` to `toggle_task` (for example `{"note":"Projects/Review.md","line":6,"expected_mtime_ms":1795261200000}`) to guard against concurrent edits.
+
+Pass a vault-relative path for `note` (or `src`) whenever possible. If a title or alias matches multiple notes, tools return `Ambiguous note reference ...` and neither read nor modify any file. `get_outgoing_links` classifies every entry with `status`: `resolved` (note), `attachment` (existing image/attachment on disk), `ambiguous` (multiple matching notes, listed in `candidates`), or `missing`.
 
 - For arbitrary Markdown edits, use `bitefoundry-obsidian notes edit <NOTE>`, TUI `e` for inline editing, or TUI `Ctrl+E` for an external editor.
 - Use MCP `append_note` to add Markdown with its indentation and trailing spaces intact. For a checklist item, run `bitefoundry-obsidian notes append "Release Review" "- [ ] Verify the release"`.
@@ -73,4 +75,4 @@ Call `move_note` with these arguments, or run `bitefoundry-obsidian notes move "
 
 `src` accepts a vault-relative path, note title, or frontmatter alias. `dst` gives the new path and filename within the selected vault. The command adds `.md` when omitted, creates missing parent directories, and rejects an existing destination.
 
-Both surfaces report `moved`, `from`, `to`, `updated_links_in_notes`, and `bookmark_preserved`. The link count is the number of files rewritten. Moves resolve a short wikilink from its source folder, then from a unique match in the vault. An ambiguous short wikilink stays as written. Matching wikilinks keep heading and block fragments, display text, and the embed marker. Wikilinks in inline and fenced code stay literal. To adjust Markdown-style `[label](path)` destinations, edit their source notes. [Obsidian internal link formats](https://obsidian.md/help/links)
+Both surfaces report `moved`, `from`, `to`, `updated_links_in_notes`, and `bookmark_preserved`. The link count is the number of files rewritten. Moves resolve a short wikilink from its source folder, then from a unique match in the vault. An ambiguous short wikilink stays as written. Matching wikilinks keep heading and block fragments, display text, and the embed marker. Moves also rewrite inbound Markdown links in other notes and relative Markdown destinations (notes, images, and attachments) inside the moved note so they continue pointing to the same files. Destinations rooted with `/` and vault-root-relative destinations stay as written as long as they still resolve to the same file. External URLs, links inside inline or fenced code, reference-style link definitions, and HTML tags are left untouched, and attachment files themselves are not moved. [Obsidian internal link formats](https://obsidian.md/help/links)
