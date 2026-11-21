@@ -2,12 +2,14 @@
 
 # `@bitefoundry/obsidian`
 
-**Obsidian-native terminal workspace, interactive knowledge graph & AI agent toolkit — Zero-Auth Local Vaults, Backlinks, Braille Graph View, CLI · TUI · HTTP API · MCP.**
+**Search local Obsidian vaults, manage Markdown notes and tasks, and inspect backlinks from the terminal.**
 
 [![npm version](https://img.shields.io/npm/v/%40bitefoundry%2Fobsidian?style=flat-square&color=7C3AED)](https://www.npmjs.com/package/@bitefoundry/obsidian)
 [![platforms](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-24292F?style=flat-square)](docs/NPM.md)
 [![Rust & Ratatui](https://img.shields.io/badge/built%20with-Rust%20%2B%20Ratatui-DEA584?style=flat-square&logo=rust)](https://github.com/BiteFoundry/obsidian/blob/master/Cargo.toml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-00875A?style=flat-square)](package.json)
+[![License: MIT](https://img.shields.io/badge/license-MIT-00875A?style=flat-square)](LICENSE)
+
+[BiteFoundry](https://bitefoundry.dev/#app-obsidian) · [Latest release notes](https://github.com/BiteFoundry/obsidian/releases/latest)
 
 <br />
 
@@ -41,6 +43,12 @@ bitefoundry-obsidian
 bitefoundry-obsidian init ~/Documents/SecondBrain
 bitefoundry-obsidian vaults list
 ```
+
+```sh
+bitefoundry-obsidian notes read "Roadmap" --json
+```
+
+Read a local note with its modification time and omission counts. Use a vault-relative path if several notes share its name. For full detail, add `--full` in the CLI or pass `compact: false` to `read_note` in MCP.
 
 ---
 
