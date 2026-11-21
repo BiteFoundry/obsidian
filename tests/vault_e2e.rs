@@ -523,6 +523,98 @@ fn mcp_move_note_rewrites_link_targets_and_preserves_other_bytes() {
 }
 
 #[test]
+fn cli_and_mcp_move_respect_source_folder_and_leave_ambiguous_links_verbatim() {
+    for use_mcp in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("vault");
+        for folder in ["A", "B"] {
+            fs::create_dir_all(root.join(folder)).unwrap();
+            fs::write(root.join(folder).join("Shared.md"), "# Shared\n").unwrap();
+        }
+        fs::write(root.join("A/Shared.md"), "See [[./Ref#Top]]\n").unwrap();
+        fs::write(
+            root.join("A/Ref.md"),
+            "# Top\r\n[[Shared#Heading|표시]] ![[./Shared#^block|Embed]]\n",
+        )
+        .unwrap();
+        fs::write(root.join("B/Ref.md"), "[[Shared]] [[B/Shared]]\n").unwrap();
+        fs::write(root.join("Root.md"), "[[Shared]] [[A/Shared]]\n").unwrap();
+
+        let result = if use_mcp {
+            let vault = vault_from_dir(&root, Some("fixture"));
+            let mut cfg = AppConfig::default();
+            cfg.upsert_vault(vault.clone(), true);
+            let mcp = McpServer::new(cfg, vault, Storage::open_in_memory().unwrap());
+            mcp.dispatch_tool(
+                "move_note",
+                &json!({"src": "A/Shared.md", "dst": "New/A-Moved.md"}),
+            )
+            .unwrap()
+        } else {
+            let output = isolated_cli(tmp.path(), &root)
+                .args(["--json", "notes", "move", "A/Shared.md", "New/A-Moved.md"])
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            serde_json::from_slice(&output.stdout).unwrap()
+        };
+
+        assert_eq!(result["updated_links_in_notes"], 3);
+        assert_eq!(
+            fs::read(root.join("A/Ref.md")).unwrap(),
+            "# Top\r\n[[A-Moved#Heading|표시]] ![[A-Moved#^block|Embed]]\n".as_bytes()
+        );
+        assert_eq!(fs::read(root.join("B/Ref.md")).unwrap(), b"[[Shared]] [[B/Shared]]\n");
+        assert_eq!(fs::read(root.join("Root.md")).unwrap(), b"[[Shared]] [[A-Moved]]\n");
+        assert_eq!(fs::read(root.join("New/A-Moved.md")).unwrap(), b"See [[A/Ref#Top]]\n");
+    }
+}
+
+fn isolated_cli(test_root: &std::path::Path, vault: &std::path::Path) -> std::process::Command {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_obsidian"));
+    command
+        .env("OBSIDIAN_CONFIG_DIR", test_root.join("config"))
+        .env("OBSIDIAN_DATA_DIR", test_root.join("data"))
+        .arg("--vault")
+        .arg(vault);
+    command
+}
+
+#[test]
+fn cli_append_accepts_dash_prefixed_text_and_still_has_help() {
+    let tmp = tempfile::tempdir().unwrap();
+    let vault = tmp.path().join("vault");
+    fs::create_dir(&vault).unwrap();
+    for name in ["Bare", "Separator", "Help"] {
+        fs::write(vault.join(format!("{name}.md")), "# 제목\n원래 본문\n").unwrap();
+    }
+
+    for args in [
+        vec!["notes", "append", "Bare", "- [ ] 할 일"],
+        vec!["notes", "append", "Separator", "--", "- [ ] 할 일"],
+    ] {
+        let output = isolated_cli(tmp.path(), &vault).args(args).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    }
+    for name in ["Bare", "Separator"] {
+        assert_eq!(
+            fs::read(vault.join(format!("{name}.md"))).unwrap(),
+            "# 제목\n원래 본문\n- [ ] 할 일\n".as_bytes()
+        );
+    }
+    let output = isolated_cli(tmp.path(), &vault)
+        .args(["notes", "append", "--help"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("<NOTE> <TEXT>"));
+    assert_eq!(
+        fs::read(vault.join("Help.md")).unwrap(),
+        "# 제목\n원래 본문\n".as_bytes()
+    );
+}
+
+#[test]
 fn test_ratatui_test_backend_3pane_and_braille_graph_view() {
     let tmp = tempfile::tempdir().unwrap();
     let vault = init_starter_vault(&tmp.path().join("TuiVault")).unwrap();

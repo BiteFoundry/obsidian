@@ -197,7 +197,11 @@ pub enum NotesCmd {
         tags: Option<String>,
     },
     /// Append text/task/callout to an existing note.
-    Append { note: String, text: String },
+    Append {
+        note: String,
+        #[arg(allow_hyphen_values = true)]
+        text: String,
+    },
     /// Open a note in `$VISUAL` or `$EDITOR` and reindex after a successful exit.
     Edit { note: String },
     /// Move/rename a note within the vault.

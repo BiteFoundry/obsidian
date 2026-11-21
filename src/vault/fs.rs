@@ -400,12 +400,7 @@ pub fn resolve_wikilink_target(
     all_rel_paths: &[String],
     aliases_by_path: &HashMap<String, Vec<String>>,
 ) -> Option<String> {
-    let raw = target_raw
-        .split('#')
-        .next()
-        .unwrap_or(target_raw)
-        .trim()
-        .replace('\\', "/");
+    let raw = wikilink_note_target(target_raw);
     let raw = raw.trim_start_matches('/');
     if raw.is_empty() || is_image_target(raw) {
         return None;
@@ -459,6 +454,80 @@ pub fn resolve_wikilink_target(
     }
 
     None
+}
+
+fn wikilink_note_target(raw: &str) -> String {
+    raw.split('#').next().unwrap_or(raw).trim().replace('\\', "/")
+}
+
+/// Resolves a link for a file edit only when its target can be determined from the source note.
+fn resolve_move_wikilink_target(
+    target_raw: &str,
+    source_rel: &str,
+    paths: &[String],
+    aliases: &HashMap<String, Vec<String>>,
+) -> Option<String> {
+    fn unique<'a>(mut matches: impl Iterator<Item = &'a String>) -> Option<String> {
+        let first = matches.next()?;
+        matches.next().is_none().then(|| first.clone())
+    }
+
+    let raw = wikilink_note_target(target_raw);
+    if raw.is_empty() || is_image_target(&raw) {
+        return None;
+    }
+    let target = raw.to_ascii_lowercase();
+    let target = if target.ends_with(".md") {
+        target
+    } else {
+        format!("{target}.md")
+    };
+    let exact = |path: &str| unique(paths.iter().filter(|p| p.eq_ignore_ascii_case(path)));
+    let source_folder = source_rel.rsplit_once('/').map_or("", |(folder, _)| folder);
+
+    if let Some(rooted) = target.strip_prefix('/') {
+        return exact(rooted);
+    }
+    if target.starts_with("./") || target.starts_with("../") {
+        let mut components: Vec<_> = source_folder.split('/').filter(|s| !s.is_empty()).collect();
+        for component in target.split('/') {
+            match component {
+                "." | "" => {}
+                ".." => {
+                    components.pop()?;
+                }
+                _ => components.push(component),
+            }
+        }
+        return exact(&components.join("/"));
+    }
+    if target.contains('/') {
+        return exact(&target).or_else(|| {
+            let suffix = format!("/{target}");
+            unique(paths.iter().filter(|p| p.to_ascii_lowercase().ends_with(&suffix)))
+        });
+    }
+
+    let local = if source_folder.is_empty() {
+        target.clone()
+    } else {
+        format!("{source_folder}/{target}")
+    };
+    if let Some(path) = exact(&local) {
+        return Some(path);
+    }
+
+    let mut by_filename = paths.iter().filter(|p| {
+        p.rsplit('/').next().is_some_and(|filename| filename.eq_ignore_ascii_case(&target))
+    }).peekable();
+    if by_filename.peek().is_some() {
+        return unique(by_filename);
+    }
+
+    let stem = target.strip_suffix(".md").unwrap_or(&target);
+    unique(aliases.iter().filter_map(|(path, names)| {
+        names.iter().any(|name| name.trim().eq_ignore_ascii_case(stem)).then_some(path)
+    }))
 }
 
 /// Resolves an embedded image/attachment target relative to the note folder, vault root, or common attachment dirs.
@@ -892,7 +961,7 @@ pub fn rewrite_wikilinks_for_move(
     let mut all_paths_after: Vec<String> = all_paths_before_move
         .iter()
         .map(|p| {
-            if p.eq_ignore_ascii_case(old_rel) {
+            if p == old_rel {
                 new_rel.to_string()
             } else {
                 p.clone()
@@ -901,35 +970,19 @@ pub fn rewrite_wikilinks_for_move(
         .collect();
     if !all_paths_after
         .iter()
-        .any(|p| p.eq_ignore_ascii_case(new_rel))
+        .any(|p| p == new_rel)
     {
         all_paths_after.push(new_rel.to_string());
     }
 
     let mut aliases_after = HashMap::new();
     for (p, al) in aliases_by_path {
-        if p.eq_ignore_ascii_case(old_rel) {
+        if p == old_rel {
             aliases_after.insert(new_rel.to_string(), al.clone());
         } else {
             aliases_after.insert(p.clone(), al.clone());
         }
     }
-
-    // Choose Obsidian shortest unambiguous link target (stem if unique, else rel path without .md)
-    let new_stem = title_from_rel_path(new_rel);
-    let stem_count = all_paths_after
-        .iter()
-        .filter(|p| title_from_rel_path(p).eq_ignore_ascii_case(&new_stem))
-        .count();
-    let replacement_target = if stem_count == 1 {
-        new_stem
-    } else {
-        new_rel
-            .strip_suffix(".md")
-            .or_else(|| new_rel.strip_suffix(".MD"))
-            .unwrap_or(new_rel)
-            .to_string()
-    };
 
     let entries = scan_vault_markdown_files(vault_root)?;
     let mut updated_notes = 0usize;
@@ -940,16 +993,29 @@ pub fn rewrite_wikilinks_for_move(
         if !raw.contains("[[") {
             continue;
         }
-        let Some(rewritten) = rewrite_markdown_wikilinks(
-            &raw,
-            old_rel,
-            new_rel,
-            &replacement_target,
-            all_paths_before_move,
-            &all_paths_after,
-            aliases_by_path,
-            &aliases_after,
-        ) else {
+        let source_after = entry.rel_path.as_str();
+        let source_before = if source_after == new_rel { old_rel } else { source_after };
+        let replacement = |target_raw: &str| {
+            let before = resolve_move_wikilink_target(
+                target_raw, source_before, all_paths_before_move, aliases_by_path,
+            )?;
+            let expected = if before == old_rel { new_rel } else { &before };
+            let resolve_after = |target: &str| {
+                resolve_move_wikilink_target(target, source_after, &all_paths_after, &aliases_after)
+            };
+            if resolve_after(target_raw).as_deref() == Some(expected) {
+                return None;
+            }
+
+            let stem = title_from_rel_path(expected);
+            if resolve_after(&stem).as_deref() == Some(expected) {
+                return Some(stem);
+            }
+            let path = expected.strip_suffix(".md").or_else(|| expected.strip_suffix(".MD")).unwrap_or(expected);
+            let explicit = if path.contains('/') { path.to_owned() } else { format!("/{path}") };
+            (resolve_after(&explicit).as_deref() == Some(expected)).then_some(explicit)
+        };
+        let Some(rewritten) = rewrite_markdown_wikilinks(&raw, &replacement) else {
             continue;
         };
         write_atomic(&entry.abs_path, rewritten.as_bytes())?;
@@ -958,16 +1024,9 @@ pub fn rewrite_wikilinks_for_move(
     Ok(updated_notes)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn rewrite_markdown_wikilinks(
     raw: &str,
-    old_rel: &str,
-    new_rel: &str,
-    replacement_target: &str,
-    all_paths_before: &[String],
-    all_paths_after: &[String],
-    aliases_before: &HashMap<String, Vec<String>>,
-    aliases_after: &HashMap<String, Vec<String>>,
+    replacement: &impl Fn(&str) -> Option<String>,
 ) -> Option<String> {
     let mut out = String::with_capacity(raw.len());
     let mut changed = false;
@@ -998,16 +1057,7 @@ fn rewrite_markdown_wikilinks(
             continue;
         }
 
-        let (new_line, line_changed) = rewrite_line_wikilinks(
-            line,
-            old_rel,
-            new_rel,
-            replacement_target,
-            all_paths_before,
-            all_paths_after,
-            aliases_before,
-            aliases_after,
-        );
+        let (new_line, line_changed) = rewrite_line_wikilinks(line, replacement);
         changed |= line_changed;
         out.push_str(&new_line);
         out.push_str(ending);
@@ -1016,16 +1066,9 @@ fn rewrite_markdown_wikilinks(
     changed.then_some(out)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn rewrite_line_wikilinks(
     line: &str,
-    old_rel: &str,
-    new_rel: &str,
-    replacement_target: &str,
-    all_paths_before: &[String],
-    all_paths_after: &[String],
-    aliases_before: &HashMap<String, Vec<String>>,
-    aliases_after: &HashMap<String, Vec<String>>,
+    replacement: &impl Fn(&str) -> Option<String>,
 ) -> (String, bool) {
     let bytes = line.as_bytes();
     let len = bytes.len();
@@ -1066,20 +1109,9 @@ fn rewrite_line_wikilinks(
                     None => (target_and_heading, None),
                 };
 
-                let resolved_before =
-                    resolve_wikilink_target(target_raw, all_paths_before, aliases_before);
-                let resolved_after =
-                    resolve_wikilink_target(target_raw, all_paths_after, aliases_after);
-
-                if resolved_before
-                    .as_deref()
-                    .is_some_and(|p| p.eq_ignore_ascii_case(old_rel))
-                    && !resolved_after
-                        .as_deref()
-                        .is_some_and(|p| p.eq_ignore_ascii_case(new_rel))
-                {
+                if let Some(target) = replacement(target_raw) {
                     out.push_str("[[");
-                    out.push_str(replacement_target);
+                    out.push_str(&target);
                     if let Some(h) = heading_opt {
                         out.push('#');
                         out.push_str(h);
