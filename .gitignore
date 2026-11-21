@@ -6,8 +6,7 @@
 node_modules/
 npm-debug.log*
 *.tgz
-npm/*/bin/obsidian
-npm/*/bin/obsidian.exe
+npm/*/bin/
 
 # local release staging
 /dist-release/

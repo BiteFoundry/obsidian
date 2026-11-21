@@ -21,14 +21,14 @@ use crate::{
     config::{ensure_parent, VaultProfile},
     models::{
         BacklinkEntry, GraphData, GraphEdge, GraphNode, HeadingEntry, IndexStats, NoteDetail,
-        NoteContent, NoteMove, NoteSummary, OutgoingLinkEntry, ParsedNote, SearchHit, TagCount,
+        NoteContent, NoteMove, NoteSummary, NoteTextReplacement, OutgoingLinkEntry, ParsedNote, SearchHit, TagCount,
         TaskEntry, TaskFilter,
     },
     vault::{
         fs::{
             canonical_rel_path_in_vault, content_sha256_hex, file_mtime_ns_and_size,
             folder_from_rel_path, has_symlink_component_in_vault, hydrate_parsed_note_links, move_note,
-            resolve_note_identifier, resolve_wikilink_target, rewrite_wikilinks_for_move, safe_vault_path,
+            replace_note_text, resolve_note_identifier, resolve_wikilink_target, rewrite_wikilinks_for_move, safe_vault_path,
             scan_vault_markdown_files, title_from_rel_path,
         },
         parser::parse_markdown,
@@ -935,6 +935,23 @@ impl Storage {
     pub fn resolve_note_path(&self, vault_id: &str, note_ref: &str) -> Result<String> {
         let (all_paths, aliases_map) = self.all_paths_and_aliases(vault_id)?;
         resolve_note_identifier(note_ref, &all_paths, &aliases_map)
+    }
+
+    pub fn replace_note_text(
+        &self,
+        vault: &VaultProfile,
+        note: &str,
+        find: &str,
+        replace: &str,
+    ) -> Result<NoteTextReplacement> {
+        let rel_path = self.resolve_note_path(&vault.id, note)?;
+        let abs_path = safe_vault_path(&vault.path, &rel_path)?;
+        let matches = replace_note_text(&abs_path, find, replace)?;
+        let replaced = matches == 1;
+        if replaced {
+            self.sync_vault(vault)?;
+        }
+        Ok(NoteTextReplacement { replaced, matches, rel_path })
     }
 
     /// Move a note in an indexed vault and refresh its backlinks and bookmark.

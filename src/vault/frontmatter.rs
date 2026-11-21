@@ -36,16 +36,7 @@ pub fn upsert_frontmatter_in_markdown(
     }
 
     let opening_end = line_end(raw, 0);
-    let closing_start = if opening_delimiter(&raw[..opening_end]) {
-        let mut offset = opening_end;
-        raw[opening_end..].split_inclusive('\n').find_map(|line| {
-            let start = offset;
-            offset += line.len();
-            closing_delimiter(line).then_some(start)
-        })
-    } else {
-        None
-    };
+    let closing_start = frontmatter_closing_start(raw, opening_end);
     let eol = if raw[..opening_end].ends_with("\r\n")
         || (closing_start.is_none() && raw.contains("\r\n"))
     {
@@ -89,6 +80,24 @@ pub fn upsert_frontmatter_in_markdown(
         .strip_prefix('\u{feff}')
         .map_or(("", raw), |body| ("\u{feff}", body));
     Ok(format!("{bom}---{eol}{yaml}---{eol}{body}"))
+}
+
+pub(crate) fn markdown_body_offset(raw: &str) -> usize {
+    let bom_end = raw.len() - raw.trim_start_matches('\u{feff}').len();
+    frontmatter_closing_start(raw, line_end(raw, 0))
+        .map_or(bom_end, |start| line_end(raw, start))
+}
+
+fn frontmatter_closing_start(raw: &str, opening_end: usize) -> Option<usize> {
+    if !opening_delimiter(&raw[..opening_end]) {
+        return None;
+    }
+    let mut offset = opening_end;
+    raw[opening_end..].split_inclusive('\n').find_map(|line| {
+        let start = offset;
+        offset += line.len();
+        closing_delimiter(line).then_some(start)
+    })
 }
 
 fn edit_property(

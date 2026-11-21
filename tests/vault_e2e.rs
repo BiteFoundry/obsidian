@@ -340,7 +340,7 @@ async fn test_http_api_8792_endpoints() {
 
 #[test]
 fn test_mcp_catalog_and_core_tools_json_rpc() {
-    assert_eq!(tool_definitions().len(), 19);
+    assert_eq!(tool_definitions().len(), 20);
 
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("McpVault");
@@ -362,7 +362,7 @@ fn test_mcp_catalog_and_core_tools_json_rpc() {
     let list = mcp
         .handle_rpc(&json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }))
         .unwrap();
-    assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 19);
+    assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 20);
 
     // Exercise existing tools. Moving notes has a separate byte-level fixture.
     assert!(mcp.dispatch_tool("list_vaults", &json!({})).is_ok());
@@ -571,7 +571,7 @@ fn cli_and_mcp_move_respect_source_folder_and_leave_ambiguous_links_verbatim() {
 }
 
 fn isolated_cli(test_root: &std::path::Path, vault: &std::path::Path) -> std::process::Command {
-    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_obsidian"));
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_bitefoundry-obsidian"));
     command
         .env("OBSIDIAN_CONFIG_DIR", test_root.join("config"))
         .env("OBSIDIAN_DATA_DIR", test_root.join("data"))
@@ -612,6 +612,72 @@ fn cli_append_accepts_dash_prefixed_text_and_still_has_help() {
         fs::read(vault.join("Help.md")).unwrap(),
         "# 제목\n원래 본문\n".as_bytes()
     );
+}
+
+#[test]
+fn cli_and_mcp_replace_only_a_unique_literal_body_match() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("vault");
+    fs::create_dir(&root).unwrap();
+    let markdown = "\u{feff}---\r\nstatus: 'draft line'\n# untouched\r\n...\r\n# Title\n\r\n  draft line\r\n끝\r\n\nrepeat repeat aaaa\nTrailing spaces  ";
+    let find = "  draft line\r\n끝";
+    let replacement = "  published line\r\n끝!  ";
+    let expected = markdown.replace(find, replacement);
+    for note in ["CLI.md", "MCP.md"] {
+        fs::write(root.join(note), markdown).unwrap();
+    }
+
+    let vault = vault_from_dir(&root, Some("fixture"));
+    let mut cfg = AppConfig::default();
+    cfg.upsert_vault(vault.clone(), true);
+    let mcp = McpServer::new(cfg, vault, Storage::open_in_memory().unwrap());
+    let schema = tool_definitions()
+        .into_iter()
+        .find(|tool| tool["name"] == "replace_note_text")
+        .unwrap();
+    assert_eq!(schema["inputSchema"]["required"], json!(["note", "find", "replace"]));
+    let replace = |note: &str, find: &str, replacement: &str| -> serde_json::Value {
+        let rpc = mcp
+            .handle_rpc(&json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {
+                    "name": "replace_note_text",
+                    "arguments": {"note": note, "find": find, "replace": replacement}
+                }
+            }))
+            .unwrap();
+        let result = &rpc["result"];
+        assert_eq!(result["isError"], false, "{rpc}");
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap()
+    };
+    let cli_replace = |find: &str, replacement: &str| -> serde_json::Value {
+        let output = isolated_cli(tmp.path(), &root)
+            .args(["--json", "notes", "replace", "CLI.md", "--find", find, "--replace", replacement])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+
+    for (needle, expected_count) in [("# untouched", 0), ("repeat", 2), ("aaa", 2)] {
+        let cli = cli_replace(needle, "new text");
+        let rpc = replace("MCP.md", needle, "new text");
+        assert_eq!(cli, json!({"rel_path":"CLI.md","matches":expected_count,"replaced":false}));
+        assert_eq!(rpc, json!({"rel_path":"MCP.md","matches":expected_count,"replaced":false}));
+        for note in ["CLI.md", "MCP.md"] {
+            assert_eq!(fs::read(root.join(note)).unwrap(), markdown.as_bytes());
+        }
+    }
+    assert_eq!(cli_replace(find, replacement), json!({"rel_path":"CLI.md","matches":1,"replaced":true}));
+    assert_eq!(replace("MCP.md", find, replacement), json!({"rel_path":"MCP.md","matches":1,"replaced":true}));
+    assert_eq!(fs::read(root.join("CLI.md")).unwrap(), expected.as_bytes());
+    assert_eq!(fs::read(root.join("MCP.md")).unwrap(), expected.as_bytes());
+    assert_eq!(mcp.dispatch_tool("search_notes", &json!({"query":"published"})).unwrap()["count"], 2);
+
+    assert_eq!(cli_replace("Trailing spaces  ", "")["replaced"], true);
+    assert_eq!(replace("MCP.md", "Trailing spaces  ", "")["replaced"], true);
+    assert!(fs::read(root.join("CLI.md")).unwrap().ends_with(b"aaaa\n"));
+    assert_eq!(fs::read(root.join("CLI.md")).unwrap(), fs::read(root.join("MCP.md")).unwrap());
 }
 
 #[test]

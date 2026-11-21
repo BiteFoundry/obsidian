@@ -222,7 +222,7 @@ pub struct AppConfig {
     pub active_vault: String,
     /// Manually registered vaults (auto-discovered vaults from `obsidian.json` are merged at runtime).
     pub vaults: Vec<VaultProfile>,
-    /// GitHub `owner/repo` used by `obsidian update`.
+    /// GitHub `owner/repo` used by `bitefoundry-obsidian update`.
     pub github_repo: String,
     /// Enable desktop toast/bell notifications in TUI.
     pub notify: bool,

@@ -864,6 +864,37 @@ pub fn append_to_note(abs_path: &Path, text: &str) -> Result<()> {
     write_atomic(abs_path, updated.as_bytes())
 }
 
+/// Replace a literal string when it occurs exactly once in the Markdown body.
+pub(crate) fn replace_note_text(abs_path: &Path, find: &str, replace: &str) -> Result<usize> {
+    let first_char_len = find
+        .chars()
+        .next()
+        .context("Search text must contain at least one character")?
+        .len_utf8();
+    let raw = fs::read_to_string(abs_path)
+        .with_context(|| format!("Failed to read note: {}", abs_path.display()))?;
+    let body_start = super::frontmatter::markdown_body_offset(&raw);
+    let body = &raw[body_start..];
+    let Some(first_match) = body.find(find) else {
+        return Ok(0);
+    };
+    let matches = std::iter::successors(Some(first_match), |&index| {
+        let next = index + first_char_len;
+        body[next..].find(find).map(|offset| next + offset)
+    })
+    .count();
+    if matches == 1 && find != replace {
+        let start = body_start + first_match;
+        let mut updated = raw.clone();
+        updated.replace_range(start..start + find.len(), replace);
+        if fs::read(abs_path)? != raw.as_bytes() {
+            bail!("Note changed while replacing text: {}", abs_path.display());
+        }
+        write_atomic(abs_path, updated.as_bytes())?;
+    }
+    Ok(matches)
+}
+
 /// Updates YAML frontmatter keys in a note file atomically.
 pub fn update_note_frontmatter(
     abs_path: &Path,

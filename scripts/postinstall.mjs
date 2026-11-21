@@ -1,20 +1,16 @@
 #!/usr/bin/env node
 // Zero-Node-Process npm native binary linker.
 //
-// On Unix (linux/darwin): replaces installed `bin/obsidian.js` and `bin/obs.js` with
-// hardlinks/symlinks directly to `@bitefoundry/obsidian-<platform>-<arch>/bin/obsidian` so npm's
-// bin symlink execve's the native Rust binary directly (0ms Node startup, 0MB Node RSS).
-//
-// On Windows (win32): creates NTFS hardlinks (fallback copy) `bin/obsidian.exe` & `bin/obs.exe`
-// and rewrites npm's `.bin/{obsidian,obs}[.cmd|.ps1]` shims when present to invoke
-// the native executable directly without spawning `node.exe`.
+// On Unix, npm's symlink follows the native binary linked over the JS launcher.
+// On Windows, npm's shims invoke a hardlink or copy of the native executable.
 
 import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
-const BIN_NAMES = ['obsidian', 'obs'];
+const BIN_NAME = 'bitefoundry-obsidian';
+const LEGACY_BIN_NAMES = ['obsidian', 'obs'];
 const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 function linkOrCopyFile(source, destination) {
@@ -70,7 +66,7 @@ function replaceJsWithNativeLinkUnix(binaryPath, destinationJs) {
   }
 }
 
-function collectWindowsShimDirs(pkgRoot, env = process.env) {
+function collectShimDirs(pkgRoot, platform, env) {
   const dirs = [];
   const parentScope = path.dirname(pkgRoot);
   const nodeModulesDir = path.dirname(parentScope);
@@ -79,7 +75,12 @@ function collectWindowsShimDirs(pkgRoot, env = process.env) {
     path.basename(nodeModulesDir) === 'node_modules'
   ) {
     dirs.push(path.join(nodeModulesDir, '.bin'));
-    dirs.push(path.dirname(nodeModulesDir));
+    const parent = path.dirname(nodeModulesDir);
+    if (platform === 'win32') {
+      dirs.push(parent);
+    } else if (path.basename(parent) === 'lib') {
+      dirs.push(path.join(path.dirname(parent), 'bin'));
+    }
   }
 
   if (env.npm_config_global === 'true' && env.npm_config_prefix) {
@@ -93,82 +94,75 @@ function collectWindowsShimDirs(pkgRoot, env = process.env) {
 
 function shimReferencesLauncher(content, name) {
   const normalized = content.replace(/\\/g, '/').toLowerCase();
-  return (
-    normalized.includes('@bitefoundry/obsidian') &&
-    normalized.includes(`bin/${name}.js`)
-  );
+  return normalized.includes(`@bitefoundry/obsidian/bin/${name}.js`);
+}
+
+function windowsNativeShims(shimDir, pkgRoot, name) {
+  const exePath = path.join(pkgRoot, 'bin', `${name}.exe`);
+  const relWin = path.relative(shimDir, exePath).replace(/\//g, '\\');
+  const relPosix = path.relative(shimDir, exePath).replace(/\\/g, '/');
+  return [
+    [path.join(shimDir, `${name}.cmd`), `@ECHO off\r\n"%~dp0${relWin}" %*\r\n`],
+    [path.join(shimDir, `${name}.ps1`), [
+      '#!/usr/bin/env pwsh',
+      '$basedir=Split-Path $MyInvocation.MyCommand.Definition -Parent',
+      `$exePath = Join-Path $basedir '${relWin.replace(/'/g, "''")}'`,
+      'if ($MyInvocation.ExpectingInput) {',
+      '  $input | & $exePath @args',
+      '} else {',
+      '  & $exePath @args',
+      '}',
+      'exit $LASTEXITCODE',
+      '',
+    ].join('\n')],
+    [path.join(shimDir, name), [
+      '#!/bin/sh',
+      'basedir=$(dirname "$(echo "$0" | sed -e \'s,\\\\,/,g\')")',
+      `exec "$basedir/${relPosix}" "$@"`,
+      '',
+    ].join('\n')],
+  ];
 }
 
 function rewriteWindowsShims(shimDir, pkgRoot) {
-  if (!fs.existsSync(shimDir)) return 0;
   let rewritten = 0;
-
-  for (const name of BIN_NAMES) {
-    const exePath = path.join(pkgRoot, 'bin', `${name}.exe`);
-    if (!fs.existsSync(exePath)) continue;
-
-    const relWin = path.relative(shimDir, exePath).replace(/\//g, '\\');
-    const relPosix = path.relative(shimDir, exePath).replace(/\\/g, '/');
-
-    const cmdPath = path.join(shimDir, `${name}.cmd`);
+  for (const [shim, body] of windowsNativeShims(shimDir, pkgRoot, BIN_NAME)) {
     try {
-      if (fs.existsSync(cmdPath)) {
-        const content = fs.readFileSync(cmdPath, 'utf8');
-        if (shimReferencesLauncher(content, name)) {
-          fs.writeFileSync(cmdPath, `@ECHO off\r\n"%~dp0${relWin}" %*\r\n`, 'utf8');
-          rewritten += 1;
-        }
+      if (fs.lstatSync(shim).isFile() && shimReferencesLauncher(fs.readFileSync(shim, 'utf8'), BIN_NAME)) {
+        fs.writeFileSync(shim, body, 'utf8');
+        rewritten += 1;
       }
     } catch {
-      // Fall back cleanly.
-    }
-
-    const ps1Path = path.join(shimDir, `${name}.ps1`);
-    try {
-      if (fs.existsSync(ps1Path)) {
-        const content = fs.readFileSync(ps1Path, 'utf8');
-        if (shimReferencesLauncher(content, name)) {
-          const ps1Body = [
-            '#!/usr/bin/env pwsh',
-            '$basedir=Split-Path $MyInvocation.MyCommand.Definition -Parent',
-            `$exePath = Join-Path $basedir '${relWin.replace(/'/g, "''")}'`,
-            'if ($MyInvocation.ExpectingInput) {',
-            '  $input | & $exePath @args',
-            '} else {',
-            '  & $exePath @args',
-            '}',
-            'exit $LASTEXITCODE',
-            '',
-          ].join('\n');
-          fs.writeFileSync(ps1Path, ps1Body, 'utf8');
-          rewritten += 1;
-        }
-      }
-    } catch {
-      // Fall back cleanly.
-    }
-
-    const shPath = path.join(shimDir, name);
-    try {
-      if (fs.existsSync(shPath)) {
-        const content = fs.readFileSync(shPath, 'utf8');
-        if (shimReferencesLauncher(content, name)) {
-          const shBody = [
-            '#!/bin/sh',
-            'basedir=$(dirname "$(echo "$0" | sed -e \'s,\\\\,/,g\')")',
-            `exec "$basedir/${relPosix}" "$@"`,
-            '',
-          ].join('\n');
-          fs.writeFileSync(shPath, shBody, 'utf8');
-          rewritten += 1;
-        }
-      }
-    } catch {
-      // Fall back cleanly.
+      // Keep npm's launcher if it cannot be rewritten.
     }
   }
-
   return rewritten;
+}
+
+function removeLegacyShims(shimDir, pkgRoot, platform) {
+  for (const name of LEGACY_BIN_NAMES) {
+    if (platform === 'win32') {
+      for (const [shim, body] of windowsNativeShims(shimDir, pkgRoot, name)) {
+        try {
+          if (fs.lstatSync(shim).isFile() && fs.readFileSync(shim, 'utf8') === body) {
+            fs.unlinkSync(shim);
+          }
+        } catch {
+          // An absent or read-only shim needs no change.
+        }
+      }
+    } else {
+      const shim = path.join(shimDir, name);
+      const oldLauncher = path.join(pkgRoot, 'bin', `${name}.js`);
+      try {
+        if (path.resolve(shimDir, fs.readlinkSync(shim)) === oldLauncher) {
+          fs.unlinkSync(shim);
+        }
+      } catch {
+        // readlinkSync only succeeds for symlinks.
+      }
+    }
+  }
 }
 
 export function runPostinstall(options = {}) {
@@ -186,7 +180,11 @@ export function runPostinstall(options = {}) {
 
   const platformKey = `${platform}-${arch}`;
   const packageName = `@bitefoundry/obsidian-${platformKey}`;
-  const binaryName = platform === 'win32' ? 'obsidian.exe' : 'obsidian';
+  const binaryName = platform === 'win32' ? `${BIN_NAME}.exe` : BIN_NAME;
+  const shimDirs = collectShimDirs(pkgRoot, platform, env);
+  for (const shimDir of shimDirs) {
+    removeLegacyShims(shimDir, pkgRoot, platform);
+  }
 
   let packageDir = null;
   try {
@@ -207,26 +205,13 @@ export function runPostinstall(options = {}) {
   }
 
   if (platform === 'win32') {
-    let linked = 0;
-    for (const name of BIN_NAMES) {
-      const destExe = path.join(binDir, `${name}.exe`);
-      try {
-        linkOrCopyFile(binaryPath, destExe);
-        linked += 1;
-      } catch {
-        // Leave fallback JS launcher untouched.
-      }
+    try {
+      linkOrCopyFile(binaryPath, path.join(binDir, binaryName));
+    } catch {
+      return { skipped: false, platform, linked: 0, shimsRewritten: 0 };
     }
-
-    let shimsRewritten = 0;
-    for (const shimDir of collectWindowsShimDirs(pkgRoot, env)) {
-      try {
-        shimsRewritten += rewriteWindowsShims(shimDir, pkgRoot);
-      } catch {
-        // Never fail npm install on read-only or custom shims.
-      }
-    }
-    return { skipped: false, platform, linked, shimsRewritten };
+    const shimsRewritten = shimDirs.reduce((count, dir) => count + rewriteWindowsShims(dir, pkgRoot), 0);
+    return { skipped: false, platform, linked: 1, shimsRewritten };
   }
 
   try {
@@ -235,18 +220,12 @@ export function runPostinstall(options = {}) {
     // Ignore on read-only stores.
   }
 
-  let linked = 0;
-  for (const name of BIN_NAMES) {
-    const destJs = path.join(binDir, `${name}.js`);
-    try {
-      replaceJsWithNativeLinkUnix(binaryPath, destJs);
-      linked += 1;
-    } catch {
-      // Leave fallback JS launcher intact.
-    }
+  try {
+    replaceJsWithNativeLinkUnix(binaryPath, path.join(binDir, `${BIN_NAME}.js`));
+  } catch {
+    return { skipped: false, platform, linked: 0 };
   }
-
-  return { skipped: false, platform, linked };
+  return { skipped: false, platform, linked: 1 };
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

@@ -1,4 +1,4 @@
-//! Stdio JSON-RPC 2.0 Model Context Protocol (MCP) server (`obsidian mcp`, 19 typed tools).
+//! Stdio JSON-RPC 2.0 Model Context Protocol (MCP) server (`bitefoundry-obsidian mcp`, 20 typed tools).
 //!
 //! Tools:
 //! 1.  `list_vaults`
@@ -20,6 +20,7 @@
 //! 17. `find_orphans`
 //! 18. `reindex_vault`
 //! 19. `move_note`
+//! 20. `replace_note_text`
 
 use std::{
     collections::BTreeMap,
@@ -268,6 +269,19 @@ impl McpServer {
                 append_to_note(&abs, text)?;
                 let _ = self.storage.sync_vault(&vault);
                 Ok(json!({ "appended": true, "rel_path": rel_path }))
+            }
+            "replace_note_text" => {
+                let vault = self.resolve_vault(args)?;
+                let note = req_str(args, "note")?;
+                let find = args
+                    .get("find")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("Missing required string argument 'find'"))?;
+                let replace = args
+                    .get("replace")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("Missing required string argument 'replace'"))?;
+                Ok(serde_json::to_value(self.storage.replace_note_text(&vault, note, find, replace)?)?)
             }
             "update_frontmatter" => {
                 let vault = self.resolve_vault(args)?;
@@ -522,6 +536,20 @@ pub fn tool_definitions() -> Vec<Value> {
                     "vault": { "type": "string", "description": "Optional vault name, ID, or path." }
                 },
                 "required": ["note", "text"]
+            }),
+        ),
+        tool(
+            "replace_note_text",
+            "Replace a literal string only when it occurs exactly once in the Markdown body. Return the match count and whether the replacement ran.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "note": { "type": "string", "description": "Relative path, note title, or alias." },
+                    "find": { "type": "string", "minLength": 1, "description": "Exact text to find, including spacing and line endings." },
+                    "replace": { "type": "string", "description": "Replacement text. Use an empty string to delete the match." },
+                    "vault": { "type": "string", "description": "Optional vault name, ID, or path." }
+                },
+                "required": ["note", "find", "replace"]
             }),
         ),
         tool(

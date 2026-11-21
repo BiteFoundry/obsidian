@@ -1,4 +1,4 @@
-//! Lightweight single-instance background vault watcher & IPC daemon (`obsidian daemon`).
+//! Lightweight single-instance background vault watcher & IPC daemon (`bitefoundry-obsidian daemon`).
 //!
 //! Uses `obsidian-cli` loopback/IPC metadata (`obsidian-daemon.json` + `obsidian-daemon.lock`),
 //! keeps SQLite WAL + FTS5 index fresh in the background, and lets TUI/CLI attach or nudge re-indexing.
@@ -152,7 +152,7 @@ pub async fn start_daemon(vault_override: Option<&str>) -> Result<DaemonStatus> 
         tokio::time::sleep(STARTUP_POLL_INTERVAL).await;
     }
 
-    bail!("Timed out waiting for obsidian daemon to start")
+    bail!("Timed out waiting for bitefoundry-obsidian daemon to start")
 }
 
 /// Stops the running background daemon gracefully.
@@ -201,7 +201,7 @@ async fn query_status_at(paths: &DaemonPaths) -> Result<DaemonStatus> {
     }
 }
 
-/// Runs the foreground daemon event loop (invoked by `obsidian daemon run`).
+/// Runs the foreground daemon event loop (invoked by `bitefoundry-obsidian daemon run`).
 pub async fn run_daemon_foreground(
     cfg: AppConfig,
     vault_override: Option<String>,

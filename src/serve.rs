@@ -1,4 +1,4 @@
-//! Local HTTP JSON API server (`obsidian serve`, default `:8792`).
+//! Local HTTP JSON API server (`bitefoundry-obsidian serve`, default `:8792`).
 //!
 //! Endpoints:
 //! - `GET  /health`

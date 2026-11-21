@@ -355,6 +355,14 @@ pub struct NoteMove {
     pub bookmark_preserved: bool,
 }
 
+/// Result of a literal Markdown body replacement.
+#[derive(Debug, Serialize)]
+pub struct NoteTextReplacement {
+    pub replaced: bool,
+    pub matches: usize,
+    pub rel_path: String,
+}
+
 /// Resolved local image embedded in a note (`![[img.png]]` or `![alt](img.png)`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NoteImageRef {
@@ -527,7 +535,7 @@ pub struct InlineImageUpload {
     pub file_name: Option<String>,
 }
 
-/// Result of `obsidian update`.
+/// Result of `bitefoundry-obsidian update`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateCheckResult {
     pub current_version: String,

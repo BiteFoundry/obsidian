@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 
 const PLATFORM_KEY = `${process.platform}-${process.arch}`;
 const PACKAGE_NAME = `@bitefoundry/obsidian-${PLATFORM_KEY}`;
-const BINARY_NAME = process.platform === 'win32' ? 'obsidian.exe' : 'obsidian';
+const BINARY_NAME = process.platform === 'win32' ? 'bitefoundry-obsidian.exe' : 'bitefoundry-obsidian';
 
 function resolveBinary() {
   if (process.env.OBSIDIAN_BIN_PATH && fs.existsSync(process.env.OBSIDIAN_BIN_PATH)) {

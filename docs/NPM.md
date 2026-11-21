@@ -6,7 +6,7 @@
 
 | Package | OS | Arch | Rust Target |
 | :--- | :--- | :--- | :--- |
-| `@bitefoundry/obsidian` | All | All | Root CLI wrapper (`obsidian`, `obs`) |
+| `@bitefoundry/obsidian` | All | All | Root CLI wrapper (`bitefoundry-obsidian`) |
 | `@bitefoundry/obsidian-win32-x64` | Windows | x64 | `x86_64-pc-windows-msvc` |
 | `@bitefoundry/obsidian-win32-arm64` | Windows | arm64 | `aarch64-pc-windows-msvc` |
 | `@bitefoundry/obsidian-darwin-x64` | macOS (`>= 11.0`) | x64 | `x86_64-apple-darwin` |
@@ -40,8 +40,30 @@ export OBSIDIAN_APP_CONFIG_PATH="$scratch/obsidian.json"
 export OBSIDIAN_AUTO_DAEMON=0
 printf '%s\n' '{"vaults":{}}' > "$OBSIDIAN_APP_CONFIG_PATH"
 vault="$scratch/vault"
-obsidian init "$vault"
-obsidian --vault "$vault" notes create "Release Review"
-obsidian --vault "$vault" notes append "Release Review" -- "- [ ] Ship v0.1.0"
-obsidian --vault "$vault" daily "--append=- [ ] Review PRs"
+bitefoundry-obsidian init "$vault"
+bitefoundry-obsidian --vault "$vault" notes create "Release Review"
+bitefoundry-obsidian --vault "$vault" notes append "Release Review" "- [ ] Verify the release"
+bitefoundry-obsidian --vault "$vault" daily "--append=- [ ] Review PRs"
+```
+
+## Standalone updater transition
+
+Version 0.2.0 includes the original asset names for the updater in 0.1.x. Run `obsidian update` with the old standalone binary to install 0.2.0 at the existing path. Rename the updated executable to `bitefoundry-obsidian` on macOS or Linux, or `bitefoundry-obsidian.exe` on Windows. Use `bitefoundry-obsidian update` for later releases. For npm installs, upgrade with npm.
+
+Change `obsidian notes list` or `obs notes list` in scripts to `bitefoundry-obsidian notes list`. Change `{"command":"obsidian","args":["mcp"]}` or `{"command":"obs","args":["mcp"]}` to `{"command":"bitefoundry-obsidian","args":["mcp"]}` in MCP settings.
+
+## Keep shared commands in an existing npm prefix
+
+If another program supplies `obsidian` or `obs` inside the same global npm prefix used by 0.1.x, install 0.2.0 in a separate prefix. npm can remove the old filenames during an in-place upgrade before the new install script runs.
+
+```powershell
+$obsidianPrefix = Join-Path $env:LOCALAPPDATA 'BiteFoundry\Obsidian'
+npm install --global --prefix "$obsidianPrefix" @bitefoundry/obsidian
+& (Join-Path $obsidianPrefix 'bitefoundry-obsidian.cmd') --version
+```
+
+```bash
+obsidian_prefix="$HOME/.local/bitefoundry-obsidian"
+npm install --global --prefix "$obsidian_prefix" @bitefoundry/obsidian
+"$obsidian_prefix/bin/bitefoundry-obsidian" --version
 ```

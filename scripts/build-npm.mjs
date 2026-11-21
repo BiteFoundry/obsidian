@@ -18,33 +18,33 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const TARGETS = {
   'x86_64-pc-windows-msvc': {
     package: 'obsidian-win32-x64',
-    source: 'obsidian.exe',
-    binary: 'obsidian.exe',
+    source: 'bitefoundry-obsidian.exe',
+    binary: 'bitefoundry-obsidian.exe',
   },
   'aarch64-pc-windows-msvc': {
     package: 'obsidian-win32-arm64',
-    source: 'obsidian.exe',
-    binary: 'obsidian.exe',
+    source: 'bitefoundry-obsidian.exe',
+    binary: 'bitefoundry-obsidian.exe',
   },
   'x86_64-apple-darwin': {
     package: 'obsidian-darwin-x64',
-    source: 'obsidian',
-    binary: 'obsidian',
+    source: 'bitefoundry-obsidian',
+    binary: 'bitefoundry-obsidian',
   },
   'aarch64-apple-darwin': {
     package: 'obsidian-darwin-arm64',
-    source: 'obsidian',
-    binary: 'obsidian',
+    source: 'bitefoundry-obsidian',
+    binary: 'bitefoundry-obsidian',
   },
   'x86_64-unknown-linux-gnu': {
     package: 'obsidian-linux-x64',
-    source: 'obsidian',
-    binary: 'obsidian',
+    source: 'bitefoundry-obsidian',
+    binary: 'bitefoundry-obsidian',
   },
   'aarch64-unknown-linux-gnu': {
     package: 'obsidian-linux-arm64',
-    source: 'obsidian',
-    binary: 'obsidian',
+    source: 'bitefoundry-obsidian',
+    binary: 'bitefoundry-obsidian',
   },
 };
 
@@ -149,7 +149,7 @@ function copyBinary(source, packageDir, binary) {
   const destination = path.join(binDir, binary);
   fs.mkdirSync(binDir, { recursive: true });
   fs.copyFileSync(source, destination);
-  if (binary !== 'obsidian.exe') fs.chmodSync(destination, 0o755);
+  if (binary !== 'bitefoundry-obsidian.exe') fs.chmodSync(destination, 0o755);
   return destination;
 }
 

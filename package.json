@@ -1,19 +1,18 @@
 {
   "name": "@bitefoundry/obsidian",
-  "version": "0.1.5",
+  "version": "0.2.0",
   "description": "Obsidian-native terminal workspace, interactive knowledge graph & AI agent toolkit — Local Vaults, Backlinks, Graph View, CLI, TUI, HTTP API & MCP",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/BiteFoundry/obsidian.git"
   },
   "license": "MIT",
+  "type": "module",
   "bin": {
-    "obsidian": "bin/obsidian.js",
-    "obs": "bin/obs.js"
+    "bitefoundry-obsidian": "bin/bitefoundry-obsidian.js"
   },
   "files": [
-    "bin/obsidian.js",
-    "bin/obs.js",
+    "bin/bitefoundry-obsidian.js",
     "scripts/postinstall.mjs",
     "docs/NPM.md",
     "docs/API.md",
@@ -45,11 +44,11 @@
     "build:npm": "node scripts/build-npm.mjs"
   },
   "optionalDependencies": {
-    "@bitefoundry/obsidian-win32-x64": "0.1.5",
-    "@bitefoundry/obsidian-win32-arm64": "0.1.5",
-    "@bitefoundry/obsidian-darwin-x64": "0.1.5",
-    "@bitefoundry/obsidian-darwin-arm64": "0.1.5",
-    "@bitefoundry/obsidian-linux-x64": "0.1.5",
-    "@bitefoundry/obsidian-linux-arm64": "0.1.5"
+    "@bitefoundry/obsidian-win32-x64": "0.2.0",
+    "@bitefoundry/obsidian-win32-arm64": "0.2.0",
+    "@bitefoundry/obsidian-darwin-x64": "0.2.0",
+    "@bitefoundry/obsidian-darwin-arm64": "0.2.0",
+    "@bitefoundry/obsidian-linux-x64": "0.2.0",
+    "@bitefoundry/obsidian-linux-arm64": "0.2.0"
   }
 }

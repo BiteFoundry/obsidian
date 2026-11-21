@@ -3,9 +3,9 @@
 Start the local HTTP JSON server (default `127.0.0.1:8792`):
 
 ```bash
-obsidian serve --bind 127.0.0.1 --port 8792
+bitefoundry-obsidian serve --bind 127.0.0.1 --port 8792
 # Optional Bearer authentication:
-obsidian serve --port 8792 --token "my-local-secret"
+bitefoundry-obsidian serve --port 8792 --token "my-local-secret"
 ```
 
 When `--token` is provided, include `Authorization: Bearer <token>` on all `/api/v1/*` requests.

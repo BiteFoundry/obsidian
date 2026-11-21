@@ -78,15 +78,15 @@ jobs:
 
       - name: Verify Linux GLIBC <= 2.28 compatibility
         if: matrix.os == 'ubuntu-latest'
-        run: node scripts/verify-glibc.mjs "target/${{ matrix.target }}/release/obsidian" --max 2.28
+        run: node scripts/verify-glibc.mjs "target/${{ matrix.target }}/release/bitefoundry-obsidian" --max 2.28
 
       - name: Smoke test binary on AlmaLinux 8 container
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         shell: bash
         run: |
           set -euo pipefail
-          docker run --rm -v "$PWD/target/x86_64-unknown-linux-gnu/release:/work:ro" almalinux:8 /work/obsidian --version
-          docker run --rm -v "$PWD/target/x86_64-unknown-linux-gnu/release:/work:ro" almalinux:8 /work/obsidian --help >/dev/null
+          docker run --rm -v "$PWD/target/x86_64-unknown-linux-gnu/release:/work:ro" almalinux:8 /work/bitefoundry-obsidian --version
+          docker run --rm -v "$PWD/target/x86_64-unknown-linux-gnu/release:/work:ro" almalinux:8 /work/bitefoundry-obsidian --help >/dev/null
 
       - name: Build release binary
         if: matrix.os != 'ubuntu-latest'
@@ -100,16 +100,35 @@ jobs:
         run: |
           set -euo pipefail
           version=$(node -p "require('./package.json').version")
-          name="obsidian-${version}-${{ matrix.target }}"
-          mkdir -p release-staging
-          if [ "${{ matrix.archive }}" = "zip" ]; then
-            7z a "release-staging/${name}.zip" "target/${{ matrix.target }}/release/obsidian.exe" LICENSE
-            if [ "${{ matrix.target }}" = "x86_64-pc-windows-msvc" ]; then
-              cp LICENSE release-staging/LICENSE
-              cp "target/${{ matrix.target }}/release/obsidian.exe" "release-staging/obsidian.exe"
+          target="${{ matrix.target }}"
+          format="${{ matrix.archive }}"
+          mkdir -p release-input release-staging
+          cp LICENSE release-input/
+          extension=""
+          if [ "$format" = "zip" ]; then
+            extension=".exe"
+          fi
+          binary="bitefoundry-obsidian${extension}"
+          cp "target/${target}/release/${binary}" "release-input/${binary}"
+          archive() {
+            local stem=$1
+            if [ "$format" = "zip" ]; then
+              (cd release-input && 7z a "../release-staging/${stem}-${version}-${target}.zip" "${stem}${extension}" LICENSE)
+            else
+              tar -czf "release-staging/${stem}-${version}-${target}.tar.gz" -C release-input "${stem}${extension}" LICENSE
             fi
-          else
-            tar -czf "release-staging/${name}.tar.gz" LICENSE -C "target/${{ matrix.target }}/release" obsidian
+          }
+          archive bitefoundry-obsidian
+          if [ "$target" = "x86_64-pc-windows-msvc" ]; then
+            cp "release-input/${binary}" LICENSE release-staging/
+          fi
+          # The 0.1 updater selects both the original asset name and original executable name.
+          if [ "$version" = "0.2.0" ]; then
+            cp "release-input/${binary}" "release-input/obsidian${extension}"
+            archive obsidian
+            if [ "$target" = "x86_64-pc-windows-msvc" ]; then
+              cp release-input/obsidian.exe release-staging/
+            fi
           fi
 
       - name: Stage npm artifact directory
@@ -183,15 +202,14 @@ jobs:
             fi
           done
 
-          test -f bin/obsidian.js
-          test -f bin/obs.js
+          test -f bin/bitefoundry-obsidian.js
           test -f scripts/postinstall.mjs
-          test -f dist/obsidian-win32-x64/bin/obsidian.exe
-          test -f dist/obsidian-win32-arm64/bin/obsidian.exe
-          test -f dist/obsidian-darwin-x64/bin/obsidian
-          test -f dist/obsidian-darwin-arm64/bin/obsidian
-          test -f dist/obsidian-linux-x64/bin/obsidian
-          test -f dist/obsidian-linux-arm64/bin/obsidian
+          test -f dist/obsidian-win32-x64/bin/bitefoundry-obsidian.exe
+          test -f dist/obsidian-win32-arm64/bin/bitefoundry-obsidian.exe
+          test -f dist/obsidian-darwin-x64/bin/bitefoundry-obsidian
+          test -f dist/obsidian-darwin-arm64/bin/bitefoundry-obsidian
+          test -f dist/obsidian-linux-x64/bin/bitefoundry-obsidian
+          test -f dist/obsidian-linux-arm64/bin/bitefoundry-obsidian
 
       - name: Publish platform packages
         env:
@@ -235,7 +253,7 @@ jobs:
         run: |
           set -euo pipefail
           {
-            echo 'Prebuilt standalone Obsidian binary (`obsidian` / `obs`) — Terminal UI, Knowledge Graph, CLI, HTTP API, and MCP server.'
+            echo 'Prebuilt `bitefoundry-obsidian` binary with terminal UI, knowledge graph, CLI, HTTP API, and MCP server.'
             if [ -f "release-notes/${GITHUB_REF_NAME}.md" ]; then
               echo ""
               cat "release-notes/${GITHUB_REF_NAME}.md"

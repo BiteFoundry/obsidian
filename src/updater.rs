@@ -1,4 +1,4 @@
-//! One-click GitHub Release self-updater (`obsidian update`) with SHA-256 verification
+//! One-click GitHub Release self-updater (`bitefoundry-obsidian update`) with SHA-256 verification
 //! and safe Windows NTFS running-executable replacement.
 
 use std::{
@@ -80,7 +80,7 @@ pub async fn check_or_apply_update_at(
         .build()
         .context("Failed to create HTTP client")?;
 
-    let ua = format!("obsidian-cli/{current_version}");
+    let ua = format!("bitefoundry-obsidian/{current_version}");
     let api_base = api_base_url.trim_end_matches('/');
     let release_api_url = format!("{api_base}/repos/{repo}/releases/latest");
 
@@ -380,41 +380,41 @@ fn select_platform_asset_for<'a>(
 ) -> Option<&'a GitHubAsset> {
     let candidates: Vec<String> = match (os, arch) {
         ("windows", "x86_64") => vec![
-            "obsidian.exe".to_string(),
-            format!("obsidian-{latest}-x86_64-pc-windows-msvc.zip"),
-            "obsidian-x86_64-pc-windows-msvc.zip".to_string(),
+            "bitefoundry-obsidian.exe".to_string(),
+            format!("bitefoundry-obsidian-{latest}-x86_64-pc-windows-msvc.zip"),
+            "bitefoundry-obsidian-x86_64-pc-windows-msvc.zip".to_string(),
         ],
         ("windows", "aarch64") => vec![
-            format!("obsidian-{latest}-aarch64-pc-windows-msvc.zip"),
-            "obsidian-aarch64-pc-windows-msvc.zip".to_string(),
-            "obsidian.exe".to_string(),
+            format!("bitefoundry-obsidian-{latest}-aarch64-pc-windows-msvc.zip"),
+            "bitefoundry-obsidian-aarch64-pc-windows-msvc.zip".to_string(),
+            "bitefoundry-obsidian.exe".to_string(),
         ],
         ("macos", "x86_64") => vec![
-            format!("obsidian-{latest}-x86_64-apple-darwin.tar.gz"),
-            "obsidian-x86_64-apple-darwin.tar.gz".to_string(),
-            "obsidian".to_string(),
+            format!("bitefoundry-obsidian-{latest}-x86_64-apple-darwin.tar.gz"),
+            "bitefoundry-obsidian-x86_64-apple-darwin.tar.gz".to_string(),
+            "bitefoundry-obsidian".to_string(),
         ],
         ("macos", "aarch64") => vec![
-            format!("obsidian-{latest}-aarch64-apple-darwin.tar.gz"),
-            "obsidian-aarch64-apple-darwin.tar.gz".to_string(),
-            "obsidian".to_string(),
+            format!("bitefoundry-obsidian-{latest}-aarch64-apple-darwin.tar.gz"),
+            "bitefoundry-obsidian-aarch64-apple-darwin.tar.gz".to_string(),
+            "bitefoundry-obsidian".to_string(),
         ],
         ("linux", "x86_64") => vec![
-            format!("obsidian-{latest}-x86_64-unknown-linux-gnu.tar.gz"),
-            format!("obsidian-{latest}-x86_64-unknown-linux-musl.tar.gz"),
-            "obsidian-x86_64-unknown-linux-gnu.tar.gz".to_string(),
-            "obsidian".to_string(),
+            format!("bitefoundry-obsidian-{latest}-x86_64-unknown-linux-gnu.tar.gz"),
+            format!("bitefoundry-obsidian-{latest}-x86_64-unknown-linux-musl.tar.gz"),
+            "bitefoundry-obsidian-x86_64-unknown-linux-gnu.tar.gz".to_string(),
+            "bitefoundry-obsidian".to_string(),
         ],
         ("linux", "aarch64") => vec![
-            format!("obsidian-{latest}-aarch64-unknown-linux-gnu.tar.gz"),
-            format!("obsidian-{latest}-aarch64-unknown-linux-musl.tar.gz"),
-            "obsidian-aarch64-unknown-linux-gnu.tar.gz".to_string(),
-            "obsidian".to_string(),
+            format!("bitefoundry-obsidian-{latest}-aarch64-unknown-linux-gnu.tar.gz"),
+            format!("bitefoundry-obsidian-{latest}-aarch64-unknown-linux-musl.tar.gz"),
+            "bitefoundry-obsidian-aarch64-unknown-linux-gnu.tar.gz".to_string(),
+            "bitefoundry-obsidian".to_string(),
         ],
         _ => vec![if os == "windows" {
-            "obsidian.exe".to_string()
+            "bitefoundry-obsidian.exe".to_string()
         } else {
-            "obsidian".to_string()
+            "bitefoundry-obsidian".to_string()
         }],
     };
 
@@ -506,9 +506,9 @@ fn extract_binary_from_asset(asset_name: &str, asset_bytes: &[u8]) -> Result<Vec
     }
 
     let target_bin = if cfg!(windows) {
-        "obsidian.exe"
+        "bitefoundry-obsidian.exe"
     } else {
-        "obsidian"
+        "bitefoundry-obsidian"
     };
     let found = find_file_recursive(&extract_dir, target_bin)?.ok_or_else(|| {
         anyhow::anyhow!("Executable '{target_bin}' not found in extracted archive ({asset_name})")
@@ -649,10 +649,10 @@ mod tests {
     fn test_sha256_verification_success_and_mismatch() {
         let payload = b"obsidian-binary-content-v0.2.0";
         let digest = hex::encode(Sha256::digest(payload));
-        let sums = format!("{digest}  obsidian.exe\n0000000000000000000000000000000000000000000000000000000000000000  other.tar.gz\n");
-        verify_sha256_sums(&sums, "obsidian.exe", payload).unwrap();
+        let sums = format!("{digest}  bitefoundry-obsidian.exe\n0000000000000000000000000000000000000000000000000000000000000000  other.tar.gz\n");
+        verify_sha256_sums(&sums, "bitefoundry-obsidian.exe", payload).unwrap();
 
-        let err = verify_sha256_sums(&sums, "obsidian.exe", b"tampered-bytes").unwrap_err();
+        let err = verify_sha256_sums(&sums, "bitefoundry-obsidian.exe", b"tampered-bytes").unwrap_err();
         assert!(err.to_string().contains("SHA-256 verification failed"));
 
         let missing = verify_sha256_sums(&sums, "missing.zip", payload).unwrap_err();
@@ -663,25 +663,37 @@ mod tests {
     fn test_platform_asset_selection() {
         let assets = vec![
             GitHubAsset {
-                name: "obsidian-0.2.0-x86_64-pc-windows-msvc.zip".into(),
+                name: "obsidian.exe".into(),
                 size: 100,
                 url: String::new(),
                 browser_download_url: String::new(),
             },
             GitHubAsset {
-                name: "obsidian.exe".into(),
+                name: "obsidian-0.2.0-aarch64-apple-darwin.tar.gz".into(),
+                size: 100,
+                url: String::new(),
+                browser_download_url: String::new(),
+            },
+            GitHubAsset {
+                name: "bitefoundry-obsidian-0.2.0-x86_64-pc-windows-msvc.zip".into(),
+                size: 100,
+                url: String::new(),
+                browser_download_url: String::new(),
+            },
+            GitHubAsset {
+                name: "bitefoundry-obsidian.exe".into(),
                 size: 200,
                 url: String::new(),
                 browser_download_url: String::new(),
             },
             GitHubAsset {
-                name: "obsidian-0.2.0-aarch64-apple-darwin.tar.gz".into(),
+                name: "bitefoundry-obsidian-0.2.0-aarch64-apple-darwin.tar.gz".into(),
                 size: 300,
                 url: String::new(),
                 browser_download_url: String::new(),
             },
             GitHubAsset {
-                name: "obsidian-0.2.0-x86_64-unknown-linux-gnu.tar.gz".into(),
+                name: "bitefoundry-obsidian-0.2.0-x86_64-unknown-linux-gnu.tar.gz".into(),
                 size: 400,
                 url: String::new(),
                 browser_download_url: String::new(),
@@ -691,19 +703,19 @@ mod tests {
             select_platform_asset_for(&assets, "0.2.0", "windows", "x86_64")
                 .unwrap()
                 .name,
-            "obsidian.exe"
+            "bitefoundry-obsidian.exe"
         );
         assert_eq!(
             select_platform_asset_for(&assets, "0.2.0", "macos", "aarch64")
                 .unwrap()
                 .name,
-            "obsidian-0.2.0-aarch64-apple-darwin.tar.gz"
+            "bitefoundry-obsidian-0.2.0-aarch64-apple-darwin.tar.gz"
         );
         assert_eq!(
             select_platform_asset_for(&assets, "0.2.0", "linux", "x86_64")
                 .unwrap()
                 .name,
-            "obsidian-0.2.0-x86_64-unknown-linux-gnu.tar.gz"
+            "bitefoundry-obsidian-0.2.0-x86_64-unknown-linux-gnu.tar.gz"
         );
     }
 
@@ -779,9 +791,9 @@ mod tests {
 
         let new_binary = b"NEW-OBSIDIAN-BINARY-V9.9.9".to_vec();
         let asset_name = if cfg!(windows) {
-            "obsidian.exe"
+            "bitefoundry-obsidian.exe"
         } else {
-            "obsidian"
+            "bitefoundry-obsidian"
         }
         .to_string();
         let digest = hex::encode(Sha256::digest(&new_binary));
@@ -869,9 +881,9 @@ mod tests {
         let base_url = format!("http://{addr}");
 
         let asset_name = if cfg!(windows) {
-            "obsidian.exe"
+            "bitefoundry-obsidian.exe"
         } else {
-            "obsidian"
+            "bitefoundry-obsidian"
         }
         .to_string();
         let state = MockReleaseState {
@@ -961,9 +973,9 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let base_url = format!("http://{addr}");
         let asset_name = if cfg!(windows) {
-            "obsidian.exe"
+            "bitefoundry-obsidian.exe"
         } else {
-            "obsidian"
+            "bitefoundry-obsidian"
         }
         .to_string();
         let asset_name_clone = asset_name.clone();

@@ -1,4 +1,4 @@
-//! Clap CLI definition & command executor for `obsidian` (`obs`).
+//! Clap CLI definition & command executor for `bitefoundry-obsidian`.
 
 use std::path::PathBuf;
 
@@ -27,7 +27,7 @@ use crate::{
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "obsidian",
+    name = "bitefoundry-obsidian",
     version,
     about = "Obsidian-native terminal workspace, interactive knowledge graph & AI agent toolkit (CLI · TUI · HTTP · MCP)"
 )]
@@ -65,7 +65,7 @@ pub enum Commands {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
-    /// Read, list, create, append, edit, move, or safely trash notes.
+    /// Read, list, create, append, replace, edit, move, or safely trash notes.
     Notes {
         #[command(subcommand)]
         action: NotesCmd,
@@ -143,7 +143,7 @@ pub enum Commands {
         #[arg(long)]
         token: Option<String>,
     },
-    /// Start the stdio JSON-RPC 2.0 MCP server (19 typed tools).
+    /// Start the stdio JSON-RPC 2.0 MCP server (20 typed tools).
     Mcp,
     /// Inspect environment, auto-discovered Obsidian vaults, SQLite index, and terminal capabilities.
     Doctor,
@@ -201,6 +201,17 @@ pub enum NotesCmd {
         note: String,
         #[arg(allow_hyphen_values = true)]
         text: String,
+    },
+    /// Replace a literal string when it occurs exactly once in the Markdown body.
+    Replace {
+        /// Note relative path, title, or alias.
+        note: String,
+        /// Exact text to find, including spacing and line endings.
+        #[arg(long, allow_hyphen_values = true)]
+        find: String,
+        /// Replacement text. Pass an empty value to delete the match.
+        #[arg(long, allow_hyphen_values = true)]
+        replace: String,
     },
     /// Open a note in `$VISUAL` or `$EDITOR` and reindex after a successful exit.
     Edit { note: String },
@@ -467,6 +478,20 @@ pub async fn run(cli: Cli) -> Result<()> {
                     }
                     Ok(())
                 }
+                NotesCmd::Replace { note, find, replace } => {
+                    let result = storage.replace_note_text(&vault, &note, &find, &replace)?;
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&result)?);
+                    } else if result.replaced {
+                        println!("Replaced one match in {}", result.rel_path);
+                    } else {
+                        println!(
+                            "Found {} matches in {}. A replacement requires one match.",
+                            result.matches, result.rel_path
+                        );
+                    }
+                    Ok(())
+                }
                 NotesCmd::Edit { note } => {
                     let rel_path = storage.resolve_note_path(&vault.id, &note)?;
                     let abs = safe_vault_path(&vault.path, &rel_path)?;
@@ -709,7 +734,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     println!("{}", serde_json::to_string_pretty(&st)?);
                 } else {
                     println!(
-                        "obsidian daemon running (pid={}, vault={})",
+                        "bitefoundry-obsidian daemon running (pid={}, vault={})",
                         st.pid.unwrap_or(0),
                         st.vault_name.as_deref().unwrap_or("default")
                     );
@@ -721,9 +746,9 @@ pub async fn run(cli: Cli) -> Result<()> {
                 if cli.json {
                     println!("{}", serde_json::to_string_pretty(&json!({ "stopped": stopped }))?);
                 } else if stopped {
-                    println!("obsidian daemon stopped.");
+                    println!("bitefoundry-obsidian daemon stopped.");
                 } else {
-                    println!("obsidian daemon was not running.");
+                    println!("bitefoundry-obsidian daemon was not running.");
                 }
                 Ok(())
             }
@@ -740,7 +765,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                         st.uptime_secs.unwrap_or(0)
                     );
                 } else {
-                    println!("obsidian daemon is stopped.");
+                    println!("bitefoundry-obsidian daemon is stopped.");
                 }
                 Ok(())
             }
