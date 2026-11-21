@@ -3158,3 +3158,1600 @@ async fn test_realtime_watcher_html_preview_reload_rapid_saves_backlinks_and_dir
         .unwrap()
         .contains("EXTERNAL_CONCURRENT_EDIT_555"));
 }
+
+#[test]
+fn regression_obsidian_obs_01_hash_filename_resolution() {
+    use obsidian_cli::vault::fs::content_sha256_hex;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("Obs01Vault");
+    fs::create_dir_all(&root).unwrap();
+
+    let meeting_orig = "# Meeting\n\n## Agenda\n\nOriginal meeting body.\n";
+    let meeting_1_orig = "# Meeting #1\n\nFirst numbered meeting body.\n";
+    let referrer_orig = "# Index\n\nSee [[Meeting#Agenda]].\n";
+    fs::write(root.join("Meeting.md"), meeting_orig).unwrap();
+    fs::write(root.join("Meeting #1.md"), meeting_1_orig).unwrap();
+    fs::write(root.join("Index.md"), referrer_orig).unwrap();
+    let meeting_hash_before = content_sha256_hex(&fs::read(root.join("Meeting.md")).unwrap());
+
+    // 1. CLI create/read/append/replace/delete for `#` filenames
+    let create_cs = isolated_cli(tmp.path(), &root)
+        .args(["--json", "notes", "create", "C# Guide"])
+        .output()
+        .unwrap();
+    assert!(
+        create_cs.status.success(),
+        "create C# Guide failed: {}",
+        String::from_utf8_lossy(&create_cs.stderr)
+    );
+    assert!(root.join("C# Guide.md").is_file());
+
+    for ident in ["C# Guide", "C# Guide.md"] {
+        let out = isolated_cli(tmp.path(), &root)
+            .args(["--json", "notes", "read", ident])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "read '{ident}' failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let payload: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(payload["summary"]["rel_path"], "C# Guide.md");
+    }
+
+    // Read Meeting #1.md via CLI -> must open Meeting #1.md, NOT Meeting.md
+    let read_m1 = isolated_cli(tmp.path(), &root)
+        .args(["--json", "notes", "read", "Meeting #1.md"])
+        .output()
+        .unwrap();
+    assert!(
+        read_m1.status.success(),
+        "read Meeting #1.md failed: {}",
+        String::from_utf8_lossy(&read_m1.stderr)
+    );
+    let read_m1_json: Value = serde_json::from_slice(&read_m1.stdout).unwrap();
+    assert_eq!(read_m1_json["summary"]["rel_path"], "Meeting #1.md");
+    assert!(read_m1_json["raw_markdown"]
+        .as_str()
+        .unwrap()
+        .contains("First numbered meeting body."));
+
+    // Append to Meeting #1.md -> only Meeting #1.md changes; Meeting.md hash unchanged
+    let app_m1 = isolated_cli(tmp.path(), &root)
+        .args(["--json", "notes", "append", "Meeting #1.md", "ONLY_FOR_MEETING_1"])
+        .output()
+        .unwrap();
+    assert!(
+        app_m1.status.success(),
+        "append Meeting #1.md failed: {}",
+        String::from_utf8_lossy(&app_m1.stderr)
+    );
+    let app_m1_json: Value = serde_json::from_slice(&app_m1.stdout).unwrap();
+    assert_eq!(app_m1_json["rel_path"], "Meeting #1.md");
+    assert!(fs::read_to_string(root.join("Meeting #1.md"))
+        .unwrap()
+        .contains("ONLY_FOR_MEETING_1"));
+    assert_eq!(
+        content_sha256_hex(&fs::read(root.join("Meeting.md")).unwrap()),
+        meeting_hash_before,
+        "Meeting.md must not be modified when appending to Meeting #1.md"
+    );
+
+    // Control: writing to nonexistent Meeting #2.md must fail with 0 changed files
+    let meeting_1_hash_before_bad =
+        content_sha256_hex(&fs::read(root.join("Meeting #1.md")).unwrap());
+    for args in [
+        vec!["notes", "append", "Meeting #2.md", "SHOULD_NOT_WRITE"],
+        vec!["notes", "replace", "Meeting #2.md", "Original", "Corrupted"],
+        vec!["notes", "delete", "--yes", "Meeting #2.md"],
+        vec!["notes", "move", "Meeting #2.md", "Moved.md"],
+    ] {
+        let bad = isolated_cli(tmp.path(), &root).args(&args).output().unwrap();
+        assert!(
+            !bad.status.success(),
+            "nonexistent Meeting #2.md must fail for {args:?}, stdout={}",
+            String::from_utf8_lossy(&bad.stdout)
+        );
+    }
+    assert!(root.join("Meeting.md").is_file());
+    assert!(root.join("Meeting #1.md").is_file());
+    assert!(!root.join("Meeting #2.md").exists());
+    assert!(!root.join("Moved.md").exists());
+    assert_eq!(
+        content_sha256_hex(&fs::read(root.join("Meeting.md")).unwrap()),
+        meeting_hash_before
+    );
+    assert_eq!(
+        content_sha256_hex(&fs::read(root.join("Meeting #1.md")).unwrap()),
+        meeting_1_hash_before_bad
+    );
+
+    // Delete Meeting #1.md -> moves Meeting #1.md to .trash, preserves Meeting.md
+    let del_m1 = isolated_cli(tmp.path(), &root)
+        .args(["--json", "notes", "delete", "--yes", "Meeting #1.md"])
+        .output()
+        .unwrap();
+    assert!(
+        del_m1.status.success(),
+        "delete Meeting #1.md failed: {}",
+        String::from_utf8_lossy(&del_m1.stderr)
+    );
+    let del_m1_json: Value = serde_json::from_slice(&del_m1.stdout).unwrap();
+    assert_eq!(del_m1_json["rel_path"], "Meeting #1.md");
+    assert!(!root.join("Meeting #1.md").exists());
+    assert!(root.join(".trash/Meeting #1.md").is_file());
+    assert!(root.join("Meeting.md").is_file());
+    assert_eq!(
+        content_sha256_hex(&fs::read(root.join("Meeting.md")).unwrap()),
+        meeting_hash_before
+    );
+
+    // Control: wikilink [[Meeting#Agenda]] resolves to Meeting.md in link context
+    let vault = vault_from_dir(&root, Some("Obs01Vault"));
+    let storage = Storage::open_in_memory().unwrap();
+    storage.sync_vault(&vault).unwrap();
+    let index_links = storage.get_outgoing_links(&vault.id, "Index.md").unwrap();
+    assert!(
+        index_links
+            .iter()
+            .any(|l| l.target_raw == "Meeting" && l.heading.as_deref() == Some("Agenda") && l.resolved && l.target_resolved_path.as_deref() == Some("Meeting.md")),
+        "[[Meeting#Agenda]] must resolve as section link to Meeting.md, got {index_links:?}"
+    );
+    let meeting_bl = storage.get_backlinks(&vault.id, "Meeting.md").unwrap();
+    assert!(meeting_bl.iter().any(|b| b.source_path == "Index.md"));
+}
+
+#[tokio::test]
+async fn regression_obsidian_obs_01_mcp_and_http_hash_filenames() {
+    use obsidian_cli::vault::fs::content_sha256_hex;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("Obs01ApiVault");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("Meeting.md"), "# Meeting\n\nBase.\n").unwrap();
+    fs::write(root.join("Meeting #1.md"), "# Meeting #1\n\nOne.\n").unwrap();
+    fs::write(root.join("C# Guide.md"), "# C# Guide\n\nSharp.\n").unwrap();
+    let meeting_hash_before = content_sha256_hex(&fs::read(root.join("Meeting.md")).unwrap());
+
+    let vault = vault_from_dir(&root, Some("Obs01ApiVault"));
+    let mut cfg = AppConfig::default();
+    cfg.upsert_vault(vault.clone(), true);
+    let storage = Storage::open_in_memory().unwrap();
+    storage.sync_vault(&vault).unwrap();
+
+    // MCP read/append/replace/move + nonexistent Meeting #2.md guard
+    let mcp = McpServer::new(cfg.clone(), vault.clone(), storage.clone());
+    let cs = mcp.dispatch_tool("read_note", &json!({ "note": "C# Guide" })).unwrap();
+    assert_eq!(cs["rel_path"], "C# Guide.md");
+    let cs_ext = mcp.dispatch_tool("read_note", &json!({ "note": "C# Guide.md" })).unwrap();
+    assert_eq!(cs_ext["rel_path"], "C# Guide.md");
+    assert!(mcp
+        .dispatch_tool("append_note", &json!({ "note": "Meeting #2.md", "text": "NOPE" }))
+        .is_err());
+    let app = mcp
+        .dispatch_tool("append_note", &json!({ "note": "Meeting #1.md", "text": "MCP_LINE" }))
+        .unwrap();
+    assert_eq!(app["rel_path"], "Meeting #1.md");
+    let rep = mcp
+        .dispatch_tool(
+            "replace_note_text",
+            &json!({ "note": "Meeting #1.md", "find": "One.", "replace": "Two." }),
+        )
+        .unwrap();
+    assert_eq!(rep["rel_path"], "Meeting #1.md");
+    assert_eq!(rep["replaced"], true);
+    assert_eq!(
+        content_sha256_hex(&fs::read(root.join("Meeting.md")).unwrap()),
+        meeting_hash_before
+    );
+
+    // HTTP read/append for # filename
+    let state = Arc::new(ServeState {
+        cfg,
+        default_vault: vault.clone(),
+        storage,
+        token: None,
+    });
+    let router = build_router(state).layer(CorsLayer::permissive());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    let r = client
+        .get(format!("{base}/api/v1/notes/C%23%20Guide.md"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let r_json: Value = r.json().await.unwrap();
+    assert_eq!(r_json["note"]["summary"]["rel_path"], "C# Guide.md");
+
+    let bad_ap = client
+        .post(format!("{base}/api/v1/notes/append"))
+        .json(&json!({ "note": "Meeting #2.md", "text": "NOPE" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_ap.status(), StatusCode::NOT_FOUND);
+
+    let ok_ap = client
+        .post(format!("{base}/api/v1/notes/append"))
+        .json(&json!({ "note": "Meeting #1.md", "text": "HTTP_LINE" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok_ap.status(), StatusCode::OK);
+    let ok_ap_json: Value = ok_ap.json().await.unwrap();
+    assert_eq!(ok_ap_json["rel_path"], "Meeting #1.md");
+    assert_eq!(
+        content_sha256_hex(&fs::read(root.join("Meeting.md")).unwrap()),
+        meeting_hash_before
+    );
+
+    server.abort();
+}
+
+#[test]
+fn regression_obsidian_obs_13_vault_selection_conflicts_and_daemon() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    use obsidian_cli::vault::fs::content_sha256_hex;
+
+    fn run_cli_bounded(
+        cmd: &mut std::process::Command,
+        scratch: &std::path::Path,
+        label: &str,
+        timeout: Duration,
+    ) -> (std::process::ExitStatus, Vec<u8>, Vec<u8>) {
+        let out_path = scratch.join(format!("{label}.stdout"));
+        let err_path = scratch.join(format!("{label}.stderr"));
+        let out_file = fs::File::create(&out_path).unwrap();
+        let err_file = fs::File::create(&err_path).unwrap();
+        let mut child = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(out_file))
+            .stderr(Stdio::from(err_file))
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + timeout;
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                let stdout = fs::read_to_string(&out_path).unwrap_or_default();
+                let stderr = fs::read_to_string(&err_path).unwrap_or_default();
+                panic!("CLI command '{label}' timed out after {timeout:?}\nstdout={stdout}\nstderr={stderr}");
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        let stdout = fs::read(&out_path).unwrap_or_default();
+        let stderr = fs::read(&err_path).unwrap_or_default();
+        (status, stdout, stderr)
+    }
+
+    struct DaemonStopGuard(std::path::PathBuf);
+    impl Drop for DaemonStopGuard {
+        fn drop(&mut self) {
+            if let Ok(mut child) = isolated_cli_base(&self.0)
+                .env_remove("OBSIDIAN_VAULT")
+                .args(["daemon", "stop"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while Instant::now() < deadline {
+                    if matches!(child.try_wait(), Ok(Some(_))) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let vault_a = tmp.path().join("VaultA");
+    let vault_b = tmp.path().join("VaultB");
+    let vault_c = tmp.path().join("VaultC");
+    fs::create_dir_all(&vault_a).unwrap();
+    fs::create_dir_all(&vault_b).unwrap();
+    fs::create_dir_all(&vault_c).unwrap();
+
+    fs::write(vault_a.join("NoteA.md"), "# NoteA\n\nAlpha body.\n").unwrap();
+    fs::write(vault_b.join("NoteB.md"), "# NoteB\n\nBeta body.\n").unwrap();
+    fs::write(vault_c.join("NoteC.md"), "# NoteC\n\nGamma body.\n").unwrap();
+
+    let hash_a = content_sha256_hex(&fs::read(vault_a.join("NoteA.md")).unwrap());
+    let hash_b = content_sha256_hex(&fs::read(vault_b.join("NoteB.md")).unwrap());
+
+    // Control 1: First run with zero selection args keeps default native discovery (obsidian.json)
+    let discovery_tmp = tempfile::tempdir().unwrap();
+    fs::write(
+        discovery_tmp.path().join("obsidian.json"),
+        json!({
+            "vaults": {
+                "nat1": { "path": vault_a.to_string_lossy(), "ts": 1732000000i64, "open": true }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let first_run = isolated_cli_base(discovery_tmp.path())
+        .env_remove("OBSIDIAN_VAULT")
+        .args(["--json", "notes", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        first_run.status.success(),
+        "default discovery failed: {}",
+        String::from_utf8_lossy(&first_run.stderr)
+    );
+    let first_notes: Value = serde_json::from_slice(&first_run.stdout).unwrap();
+    assert_eq!(first_notes.as_array().unwrap().len(), 1);
+    assert_eq!(first_notes[0]["rel_path"], "NoteA.md");
+
+    // Register VaultA so A exists in config.toml
+    let add_a = isolated_cli_base(tmp.path())
+        .env_remove("OBSIDIAN_VAULT")
+        .args(["--json", "vaults", "add"])
+        .arg(&vault_a)
+        .output()
+        .unwrap();
+    assert!(
+        add_a.status.success(),
+        "add VaultA failed: {}",
+        String::from_utf8_lossy(&add_a.stderr)
+    );
+    let config_path = tmp.path().join("config").join("config.toml");
+    let cfg_hash_before = content_sha256_hex(&fs::read(&config_path).unwrap());
+
+    // 1. `vaults use <unregistered C>` must fail, advise `vaults add`, and leave config & files untouched
+    let use_c = isolated_cli_base(tmp.path())
+        .env_remove("OBSIDIAN_VAULT")
+        .args(["vaults", "use"])
+        .arg(&vault_c)
+        .output()
+        .unwrap();
+    assert!(
+        !use_c.status.success(),
+        "vaults use on unregistered path must fail, stdout={}",
+        String::from_utf8_lossy(&use_c.stdout)
+    );
+    let use_c_err = String::from_utf8_lossy(&use_c.stderr);
+    assert!(
+        use_c_err.contains("vaults add"),
+        "expected vaults add guidance in stderr, got: {use_c_err}"
+    );
+    assert_eq!(
+        content_sha256_hex(&fs::read(&config_path).unwrap()),
+        cfg_hash_before,
+        "config.toml must remain unchanged after rejected vaults use"
+    );
+
+    // 2. Invalid OBSIDIAN_VAULT and invalid --vault must abort append with zero writes
+    let bad_env_append = isolated_cli_base(tmp.path())
+        .env("OBSIDIAN_VAULT", "NonExistentVaultXYZ")
+        .args(["notes", "append", "NoteA", "SHOULD_NOT_APPEND"])
+        .output()
+        .unwrap();
+    assert!(
+        !bad_env_append.status.success(),
+        "invalid OBSIDIAN_VAULT must fail, stdout={}",
+        String::from_utf8_lossy(&bad_env_append.stdout)
+    );
+
+    let bad_flag_append = isolated_cli_base(tmp.path())
+        .env_remove("OBSIDIAN_VAULT")
+        .args([
+            "--vault",
+            "NonExistentVaultXYZ",
+            "notes",
+            "append",
+            "NoteA",
+            "SHOULD_NOT_APPEND",
+        ])
+        .output()
+        .unwrap();
+    assert!(!bad_flag_append.status.success());
+
+    assert_eq!(content_sha256_hex(&fs::read(&config_path).unwrap()), cfg_hash_before);
+    assert_eq!(content_sha256_hex(&fs::read(vault_a.join("NoteA.md")).unwrap()), hash_a);
+    assert_eq!(content_sha256_hex(&fs::read(vault_b.join("NoteB.md")).unwrap()), hash_b);
+
+    // 3. Explicitly add B then use A -> use B; next process opens B
+    let add_b = isolated_cli_base(tmp.path())
+        .env_remove("OBSIDIAN_VAULT")
+        .args(["--json", "vaults", "add"])
+        .arg(&vault_b)
+        .output()
+        .unwrap();
+    assert!(add_b.status.success(), "{}", String::from_utf8_lossy(&add_b.stderr));
+    let add_b_json: Value = serde_json::from_slice(&add_b.stdout).unwrap();
+    let vault_b_id = add_b_json["vault"]["id"].as_str().unwrap().to_string();
+
+    let use_a = isolated_cli_base(tmp.path())
+        .env_remove("OBSIDIAN_VAULT")
+        .args(["vaults", "use", "VaultA"])
+        .output()
+        .unwrap();
+    assert!(use_a.status.success(), "{}", String::from_utf8_lossy(&use_a.stderr));
+
+    let use_b = isolated_cli_base(tmp.path())
+        .env_remove("OBSIDIAN_VAULT")
+        .args(["vaults", "use"])
+        .arg(&vault_b)
+        .output()
+        .unwrap();
+    assert!(use_b.status.success(), "{}", String::from_utf8_lossy(&use_b.stderr));
+
+    let list_b = isolated_cli_base(tmp.path())
+        .env_remove("OBSIDIAN_VAULT")
+        .args(["--json", "notes", "list"])
+        .output()
+        .unwrap();
+    assert!(list_b.status.success(), "{}", String::from_utf8_lossy(&list_b.stderr));
+    let notes_b: Value = serde_json::from_slice(&list_b.stdout).unwrap();
+    assert_eq!(notes_b.as_array().unwrap().len(), 1);
+    assert_eq!(notes_b[0]["rel_path"], "NoteB.md");
+
+    // 4. Same name + different path -> error; same name + same path -> idempotent
+    let dup_name_diff_path = isolated_cli_base(tmp.path())
+        .env_remove("OBSIDIAN_VAULT")
+        .args(["vaults", "add"])
+        .arg(&vault_c)
+        .args(["--name", "VaultA"])
+        .output()
+        .unwrap();
+    assert!(
+        !dup_name_diff_path.status.success(),
+        "registering duplicate name for different path must fail, stdout={}",
+        String::from_utf8_lossy(&dup_name_diff_path.stdout)
+    );
+    let cfg_after_dup = AppConfig::load_from(&config_path).unwrap();
+    assert_eq!(
+        obsidian_cli::config::normalize_path_key(&cfg_after_dup.find_vault("VaultA").unwrap().path),
+        obsidian_cli::config::normalize_path_key(&vault_a),
+        "existing VaultA path must not be overwritten"
+    );
+
+    let dup_name_same_path = isolated_cli_base(tmp.path())
+        .env_remove("OBSIDIAN_VAULT")
+        .args(["vaults", "add"])
+        .arg(&vault_a)
+        .args(["--name", "VaultA"])
+        .output()
+        .unwrap();
+    assert!(
+        dup_name_same_path.status.success(),
+        "idempotent re-add of same name + same path must succeed: {}",
+        String::from_utf8_lossy(&dup_name_same_path.stderr)
+    );
+    let cfg_after_idem = AppConfig::load_from(&config_path).unwrap();
+    assert_eq!(cfg_after_idem.vaults.len(), 2);
+
+    // 5. Removing active vault by ID clears active_vault selection
+    let use_b_again = isolated_cli_base(tmp.path())
+        .env_remove("OBSIDIAN_VAULT")
+        .args(["vaults", "use", "VaultB"])
+        .output()
+        .unwrap();
+    assert!(use_b_again.status.success());
+    let rm_b_by_id = isolated_cli_base(tmp.path())
+        .env_remove("OBSIDIAN_VAULT")
+        .args(["vaults", "remove", &vault_b_id])
+        .output()
+        .unwrap();
+    assert!(rm_b_by_id.status.success());
+    let cfg_after_rm_id = AppConfig::load_from(&config_path).unwrap();
+    assert!(
+        cfg_after_rm_id.active_vault.is_empty(),
+        "removing active vault by ID must clear active_vault, got '{}'",
+        cfg_after_rm_id.active_vault
+    );
+
+    // Re-add B for daemon conflict test
+    let readd_b = isolated_cli_base(tmp.path())
+        .env_remove("OBSIDIAN_VAULT")
+        .args(["vaults", "add"])
+        .arg(&vault_b)
+        .output()
+        .unwrap();
+    assert!(readd_b.status.success());
+
+    // 6. Daemon start for VaultA, idempotent same-vault start, error on different-vault start preserving running daemon
+    let daemon_io = tmp.path().join("daemon_io");
+    fs::create_dir_all(&daemon_io).unwrap();
+    let _guard = DaemonStopGuard(tmp.path().to_path_buf());
+    let (start_a_status, start_a_out, start_a_err) = run_cli_bounded(
+        isolated_cli_base(tmp.path())
+            .env_remove("OBSIDIAN_VAULT")
+            .args(["--json", "--vault", "VaultA", "daemon", "start"]),
+        &daemon_io,
+        "start_a",
+        Duration::from_secs(15),
+    );
+    assert!(
+        start_a_status.success(),
+        "daemon start VaultA failed: {}",
+        String::from_utf8_lossy(&start_a_err)
+    );
+    let st_a: Value = serde_json::from_slice(&start_a_out).unwrap();
+    assert_eq!(st_a["running"], true);
+    assert_eq!(st_a["vault_name"], "VaultA");
+    let pid_a = st_a["pid"].as_u64().unwrap();
+
+    // Control: same vault daemon start returns existing running status
+    let (start_a2_status, start_a2_out, start_a2_err) = run_cli_bounded(
+        isolated_cli_base(tmp.path())
+            .env_remove("OBSIDIAN_VAULT")
+            .args(["--json", "--vault", "VaultA", "daemon", "start"]),
+        &daemon_io,
+        "start_a_again",
+        Duration::from_secs(10),
+    );
+    assert!(
+        start_a2_status.success(),
+        "same-vault daemon start failed: {}",
+        String::from_utf8_lossy(&start_a2_err)
+    );
+    let st_a2: Value = serde_json::from_slice(&start_a2_out).unwrap();
+    assert_eq!(st_a2["pid"].as_u64(), Some(pid_a));
+    assert_eq!(st_a2["vault_name"], "VaultA");
+
+    // Conflict: different vault daemon start must fail naming both VaultA and VaultB and preserve VaultA daemon
+    let (start_b_status, start_b_out, start_b_err_bytes) = run_cli_bounded(
+        isolated_cli_base(tmp.path())
+            .env_remove("OBSIDIAN_VAULT")
+            .args(["--json", "--vault", "VaultB", "daemon", "start"]),
+        &daemon_io,
+        "start_b",
+        Duration::from_secs(10),
+    );
+    assert!(
+        !start_b_status.success(),
+        "daemon start for VaultB while VaultA daemon runs must fail, stdout={}",
+        String::from_utf8_lossy(&start_b_out)
+    );
+    let start_b_err = String::from_utf8_lossy(&start_b_err_bytes);
+    assert!(
+        start_b_err.contains("VaultA") && start_b_err.contains("VaultB"),
+        "daemon conflict error must include both running and requested vault names, got: {start_b_err}"
+    );
+
+    let (status_after_ok, status_after_out, status_after_err) = run_cli_bounded(
+        isolated_cli_base(tmp.path())
+            .env_remove("OBSIDIAN_VAULT")
+            .args(["--json", "daemon", "status"]),
+        &daemon_io,
+        "status_after",
+        Duration::from_secs(10),
+    );
+    assert!(
+        status_after_ok.success(),
+        "daemon status failed: {}",
+        String::from_utf8_lossy(&status_after_err)
+    );
+    let st_after: Value = serde_json::from_slice(&status_after_out).unwrap();
+    assert_eq!(st_after["running"], true);
+    assert_eq!(st_after["pid"].as_u64(), Some(pid_a));
+    assert_eq!(st_after["vault_name"], "VaultA");
+
+    let (stop_ok, _, stop_err) = run_cli_bounded(
+        isolated_cli_base(tmp.path())
+            .env_remove("OBSIDIAN_VAULT")
+            .args(["daemon", "stop"]),
+        &daemon_io,
+        "stop_a",
+        Duration::from_secs(10),
+    );
+    assert!(
+        stop_ok.success(),
+        "daemon stop failed: {}",
+        String::from_utf8_lossy(&stop_err)
+    );
+}
+
+#[test]
+fn regression_obsidian_obs_02_source_relative_wikilink_index_matches_move() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("Obs02Vault");
+    fs::create_dir_all(root.join("Alpha")).unwrap();
+    fs::create_dir_all(root.join("LongBetaFolder")).unwrap();
+    fs::create_dir_all(root.join("Aliased")).unwrap();
+    fs::create_dir_all(root.join("Sub")).unwrap();
+
+    fs::write(root.join("Alpha/Spec.md"), "# Alpha Spec\n").unwrap();
+    fs::write(root.join("LongBetaFolder/Spec.md"), "# Beta Spec\n").unwrap();
+    fs::write(
+        root.join("LongBetaFolder/Guide.md"),
+        "# Guide\n\nSame folder: [[Spec]]\nDot relative: [[./Spec]]\nParent relative: [[../Alpha/Spec]]\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("Aliased/Target.md"),
+        "---\naliases: [UniqueAlias]\n---\n# Target\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("RootAmbiguous.md"),
+        "# Root\n\nAmbiguous bare: [[Spec]]\nFull path: [[LongBetaFolder/Spec]]\nAlias: [[UniqueAlias]]\n",
+    )
+    .unwrap();
+    fs::write(root.join("Sub/UniqueRelTarget.md"), "# UniqueRelTarget\n").unwrap();
+    fs::write(
+        root.join("Sub/UniqueRelSource.md"),
+        "# UniqueRelSource\n\nLink: [[./UniqueRelTarget]]\n",
+    )
+    .unwrap();
+
+    let vault = vault_from_dir(&root, Some("Obs02Vault"));
+    let storage = Storage::open_in_memory().unwrap();
+    storage.sync_vault(&vault).unwrap();
+
+    // 1. Guide.md outgoing links resolve source-relatively: Beta, Beta, Alpha
+    let guide_links = storage
+        .get_outgoing_links(&vault.id, "LongBetaFolder/Guide.md")
+        .unwrap();
+    let resolved_for = |raw: &str| {
+        guide_links
+            .iter()
+            .find(|l| l.target_raw == raw)
+            .and_then(|l| l.target_resolved_path.as_deref())
+    };
+    assert_eq!(
+        resolved_for("Spec"),
+        Some("LongBetaFolder/Spec.md"),
+        "[[Spec]] in LongBetaFolder/Guide.md must resolve to LongBetaFolder/Spec.md, got {guide_links:?}"
+    );
+    assert_eq!(
+        resolved_for("./Spec"),
+        Some("LongBetaFolder/Spec.md"),
+        "[[./Spec]] in LongBetaFolder/Guide.md must resolve to LongBetaFolder/Spec.md, got {guide_links:?}"
+    );
+    assert_eq!(
+        resolved_for("../Alpha/Spec"),
+        Some("Alpha/Spec.md"),
+        "[[../Alpha/Spec]] in LongBetaFolder/Guide.md must resolve to Alpha/Spec.md, got {guide_links:?}"
+    );
+
+    // 2. Control: RootAmbiguous.md leaves ambiguous [[Spec]] unresolved while resolving full path & unique alias
+    let root_links = storage.get_outgoing_links(&vault.id, "RootAmbiguous.md").unwrap();
+    assert_eq!(
+        root_links
+            .iter()
+            .find(|l| l.target_raw == "Spec")
+            .and_then(|l| l.target_resolved_path.as_deref()),
+        None,
+        "ambiguous bare [[Spec]] from root must remain unresolved, got {root_links:?}"
+    );
+    assert_eq!(
+        root_links
+            .iter()
+            .find(|l| l.target_raw == "LongBetaFolder/Spec")
+            .and_then(|l| l.target_resolved_path.as_deref()),
+        Some("LongBetaFolder/Spec.md")
+    );
+    assert_eq!(
+        root_links
+            .iter()
+            .find(|l| l.target_raw == "UniqueAlias")
+            .and_then(|l| l.target_resolved_path.as_deref()),
+        Some("Aliased/Target.md")
+    );
+
+    // 3. Backlinks & Graph agree with outgoing link resolution
+    let beta_bl = storage
+        .get_backlinks(&vault.id, "LongBetaFolder/Spec.md")
+        .unwrap();
+    assert!(beta_bl.iter().any(|b| b.source_path == "LongBetaFolder/Guide.md"));
+    let alpha_bl = storage.get_backlinks(&vault.id, "Alpha/Spec.md").unwrap();
+    assert!(alpha_bl.iter().any(|b| b.source_path == "LongBetaFolder/Guide.md"));
+    assert!(
+        !alpha_bl.iter().any(|b| b.source_path == "RootAmbiguous.md"),
+        "ambiguous bare link in RootAmbiguous.md must not create backlink to Alpha/Spec.md"
+    );
+
+    let graph = storage
+        .get_graph(&vault.id, Some("LongBetaFolder/Guide.md"), 1)
+        .unwrap();
+    assert!(graph
+        .edges
+        .iter()
+        .any(|e| e.source == "LongBetaFolder/Guide.md" && e.target == "LongBetaFolder/Spec.md"));
+    assert!(graph
+        .edges
+        .iter()
+        .any(|e| e.source == "LongBetaFolder/Guide.md" && e.target == "Alpha/Spec.md"));
+
+    // 4. Unique relative link target is excluded from orphans
+    let orphans = storage.find_orphans(&vault.id).unwrap();
+    assert!(
+        !orphans.iter().any(|o| o.rel_path == "Sub/UniqueRelTarget.md"),
+        "Sub/UniqueRelTarget.md linked via [[./UniqueRelTarget]] must not be orphan: {orphans:?}"
+    );
+
+    // 5. Incremental sync (upsert_single_note / sync_paths) passes source_rel
+    fs::write(root.join("Alpha/Ref.md"), "# Ref\n\n[[Spec]]\n").unwrap();
+    storage
+        .sync_paths(&vault, &["Alpha/Ref.md".to_string()], &[])
+        .unwrap();
+    let alpha_ref_links = storage.get_outgoing_links(&vault.id, "Alpha/Ref.md").unwrap();
+    assert_eq!(
+        alpha_ref_links[0].target_resolved_path.as_deref(),
+        Some("Alpha/Spec.md"),
+        "incremental sync_paths must resolve [[Spec]] in Alpha/Ref.md to Alpha/Spec.md"
+    );
+
+    // 6. Move LongBetaFolder/Spec.md -> LongBetaFolder/BetaSpec.md matches indexed targets and leaves ambiguous bare link verbatim
+    let moved = storage
+        .move_note_with_links(&vault, "LongBetaFolder/Spec.md", "LongBetaFolder/BetaSpec.md")
+        .unwrap();
+    assert_eq!(moved.to, "LongBetaFolder/BetaSpec.md");
+
+    let guide_after = fs::read_to_string(root.join("LongBetaFolder/Guide.md")).unwrap();
+    assert!(guide_after.contains("Same folder: [[BetaSpec]]"), "{guide_after}");
+    assert!(guide_after.contains("Dot relative: [[BetaSpec]]"), "{guide_after}");
+    assert!(guide_after.contains("Parent relative: [[../Alpha/Spec]]"), "{guide_after}");
+
+    let root_after = fs::read_to_string(root.join("RootAmbiguous.md")).unwrap();
+    assert!(
+        root_after.contains("Ambiguous bare: [[Spec]]"),
+        "ambiguous bare link must stay verbatim on move: {root_after}"
+    );
+    assert!(
+        root_after.contains("Full path: [[BetaSpec]]"),
+        "unambiguous full path link must update on move: {root_after}"
+    );
+}
+
+#[test]
+fn regression_obsidian_obs_05_formatting_table_inline_code_and_link_boundaries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("Obs05Vault");
+    fs::create_dir_all(&root).unwrap();
+
+    fs::write(root.join("Dest.md"), "# Dest\n\n## Section\n\nBody.\n").unwrap();
+    fs::write(root.join("BoldNote.md"), "# BoldNote\n\n**[[Dest]]** and **#boldtag**\n").unwrap();
+    fs::write(root.join("ItalicNote.md"), "# ItalicNote\n\n*[[Dest]]* and *#italictag*\n").unwrap();
+    fs::write(root.join("HighlightNote.md"), "# HighlightNote\n\n==[[Dest]]== and ==#hltag==\n").unwrap();
+    fs::write(
+        root.join("TableHeaderNote.md"),
+        "# TableHeader\n\n| [[Dest]] #hdrtag | Value |\n| --- | --- |\n| [[Dest\\|TableAlias]] #celltag | ok |\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("InlineTripleTick.md"),
+        "# InlineTripleTick\n\n```inline code```\nAfter tick [[Dest]] #aftertick\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("HeadingSelfLink.md"),
+        "# HeadingSelfLink\n\nSee [[#Section]] and [[#Nested/Heading]].\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("ParenUrlNote.md"),
+        "# ParenUrl\n\nRead [Wiki](https://en.wikipedia.org/wiki/Rust_(programming_language)).\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("UnclosedBracketNote.md"),
+        "# Bracket\n\n[note] see [RealLink](https://example.com/path) and [unclosed see [Second](https://example.com/two)\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("ControlFenceCode.md"),
+        "# Control\n\n```md\n[[Dest]] #fencetag\n```\n\nInline `[[Dest]] #codetag` and ``[[Dest]] #dblcodetag``.\n\nPlain [[Dest|PlainAlias]] #plaintag\n",
+    )
+    .unwrap();
+
+    let vault = vault_from_dir(&root, Some("Obs05Vault"));
+    let storage = Storage::open_in_memory().unwrap();
+    storage.sync_vault(&vault).unwrap();
+
+    // 1. Emphasis / italic / highlight contain wikilinks and tags exactly once
+    for (note, tag) in [
+        ("BoldNote.md", "boldtag"),
+        ("ItalicNote.md", "italictag"),
+        ("HighlightNote.md", "hltag"),
+    ] {
+        let links = storage.get_outgoing_links(&vault.id, note).unwrap();
+        assert_eq!(
+            links.len(),
+            1,
+            "{note} should index [[Dest]] once, got {links:?}"
+        );
+        assert_eq!(links[0].target_resolved_path.as_deref(), Some("Dest.md"));
+        let summary = storage.get_note_summary(&vault.id, note).unwrap().unwrap();
+        assert_eq!(
+            summary.tags,
+            vec![tag.to_string()],
+            "{note} should extract #{tag}, got {:?}",
+            summary.tags
+        );
+    }
+
+    // 2. Table header links & tags + escaped pipe alias in table cell
+    let tbl_links = storage
+        .get_outgoing_links(&vault.id, "TableHeaderNote.md")
+        .unwrap();
+    assert_eq!(
+        tbl_links.len(),
+        2,
+        "TableHeaderNote.md should extract header + cell links once each, got {tbl_links:?}"
+    );
+    assert!(tbl_links
+        .iter()
+        .all(|l| l.target_resolved_path.as_deref() == Some("Dest.md")));
+    assert!(
+        tbl_links
+            .iter()
+            .any(|l| l.target_raw == "Dest" && l.alias.as_deref() == Some("TableAlias")),
+        "escaped pipe [[Dest\\|TableAlias]] must parse target=Dest alias=TableAlias, got {tbl_links:?}"
+    );
+    let tbl_summary = storage
+        .get_note_summary(&vault.id, "TableHeaderNote.md")
+        .unwrap()
+        .unwrap();
+    assert!(tbl_summary.tags.contains(&"hdrtag".to_string()), "{:?}", tbl_summary.tags);
+    assert!(tbl_summary.tags.contains(&"celltag".to_string()), "{:?}", tbl_summary.tags);
+
+    // 3. Same-line closed triple-backtick inline code must NOT swallow subsequent lines
+    let tick_links = storage
+        .get_outgoing_links(&vault.id, "InlineTripleTick.md")
+        .unwrap();
+    assert_eq!(
+        tick_links.len(),
+        1,
+        "line after ```inline code``` must be parsed, got {tick_links:?}"
+    );
+    assert_eq!(tick_links[0].target_resolved_path.as_deref(), Some("Dest.md"));
+    let tick_summary = storage
+        .get_note_summary(&vault.id, "InlineTripleTick.md")
+        .unwrap()
+        .unwrap();
+    assert_eq!(tick_summary.tags, vec!["aftertick".to_string()]);
+
+    // 4. [[#Section]] must NOT create a false `section` tag
+    let head_summary = storage
+        .get_note_summary(&vault.id, "HeadingSelfLink.md")
+        .unwrap()
+        .unwrap();
+    assert!(
+        head_summary.tags.is_empty(),
+        "[[#Section]] must produce 0 tags, got {:?}",
+        head_summary.tags
+    );
+
+    // 5. Balanced parens in Markdown link URL
+    let paren_detail = storage
+        .load_note_detail(&vault, "ParenUrlNote.md")
+        .unwrap();
+    assert_eq!(paren_detail.parsed.md_links.len(), 1);
+    assert_eq!(
+        paren_detail.parsed.md_links[0].url,
+        "https://en.wikipedia.org/wiki/Rust_(programming_language)"
+    );
+
+    // 6. Preceding [note] or unclosed `[` must not swallow independent [RealLink](...)
+    let bracket_detail = storage
+        .load_note_detail(&vault, "UnclosedBracketNote.md")
+        .unwrap();
+    assert_eq!(
+        bracket_detail.parsed.md_links.len(),
+        2,
+        "got {:?}",
+        bracket_detail.parsed.md_links
+    );
+    assert_eq!(bracket_detail.parsed.md_links[0].label, "RealLink");
+    assert_eq!(bracket_detail.parsed.md_links[0].url, "https://example.com/path");
+    assert_eq!(bracket_detail.parsed.md_links[1].label, "Second");
+    assert_eq!(bracket_detail.parsed.md_links[1].url, "https://example.com/two");
+
+    // 7. Control: real code fence & inline code stay excluded; move rewrites same-line tick note & table escaped alias cleanly
+    let ctl_links = storage
+        .get_outgoing_links(&vault.id, "ControlFenceCode.md")
+        .unwrap();
+    assert_eq!(ctl_links.len(), 1, "fence/inline code must be excluded: {ctl_links:?}");
+    assert_eq!(ctl_links[0].alias.as_deref(), Some("PlainAlias"));
+    let ctl_summary = storage
+        .get_note_summary(&vault.id, "ControlFenceCode.md")
+        .unwrap()
+        .unwrap();
+    assert_eq!(ctl_summary.tags, vec!["plaintag".to_string()]);
+
+    // Move Dest.md -> DestMoved.md: InlineTripleTick.md & TableHeaderNote.md & emphasis notes update and reindex identically
+    let moved = storage
+        .move_note_with_links(&vault, "Dest.md", "DestMoved.md")
+        .unwrap();
+    assert_eq!(moved.to, "DestMoved.md");
+    let tick_after = fs::read_to_string(root.join("InlineTripleTick.md")).unwrap();
+    assert!(
+        tick_after.contains("After tick [[DestMoved]]"),
+        "move must also treat ```inline code``` as inline code rather than multiline fence: {tick_after}"
+    );
+    let ctl_after = fs::read_to_string(root.join("ControlFenceCode.md")).unwrap();
+    assert!(ctl_after.contains("```md\n[[Dest]] #fencetag\n```"));
+    assert!(ctl_after.contains("Inline `[[Dest]] #codetag` and ``[[Dest]] #dblcodetag``."));
+    assert!(ctl_after.contains("Plain [[DestMoved|PlainAlias]]"));
+    let bl_after = storage.get_backlinks(&vault.id, "DestMoved.md").unwrap();
+    for src in [
+        "BoldNote.md",
+        "ItalicNote.md",
+        "HighlightNote.md",
+        "TableHeaderNote.md",
+        "InlineTripleTick.md",
+        "ControlFenceCode.md",
+    ] {
+        assert!(
+            bl_after.iter().any(|b| b.source_path == src),
+            "after move, {src} must remain backlink of DestMoved.md: {bl_after:?}"
+        );
+    }
+}
+
+#[test]
+fn regression_obsidian_obs_06_local_markdown_note_links_in_graph() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("Obs06Vault");
+    fs::create_dir_all(root.join("Projects")).unwrap();
+    fs::create_dir_all(root.join("Attachments")).unwrap();
+    fs::create_dir_all(root.join("Sub")).unwrap();
+
+    fs::write(root.join("Attachments/pic.png"), b"\x89PNG\r\n\x1a\n").unwrap();
+    fs::write(
+        root.join("Projects/Plan.md"),
+        "# Plan\n\n## Goals\n\nDeliver local markdown links.\n",
+    )
+    .unwrap();
+    fs::write(root.join("Projects/Space Note.md"), "# Space Note\n").unwrap();
+    fs::write(
+        root.join("R.md"),
+        "# Referrer\n\nSee [The Plan](Projects/Plan.md#Goals \"Plan Title\"), [Spaced](Projects/Space%20Note.md), [Ext](https://example.com/Projects/Plan.md), and ![img](Attachments/pic.png).\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("OrphanOnlyExt.md"),
+        "# External Only\n\n[Site](https://example.com) and ![img](Attachments/pic.png)\n",
+    )
+    .unwrap();
+
+    let vault = vault_from_dir(&root, Some("Obs06Vault"));
+    let db_path = tmp.path().join("obs06.db");
+    let storage = Storage::open(&db_path).unwrap();
+    storage.sync_vault(&vault).unwrap();
+
+    // 1. Outgoing links from R.md reflect only the 2 local markdown note targets (no HTTPS/image edges)
+    let r_links = storage.get_outgoing_links(&vault.id, "R.md").unwrap();
+    assert_eq!(
+        r_links.len(),
+        2,
+        "R.md should have exactly 2 local note links (Plan + Space Note), got {r_links:?}"
+    );
+    assert!(
+        r_links.iter().any(|l| l.target_resolved_path.as_deref() == Some("Projects/Plan.md")
+            && l.heading.as_deref() == Some("Goals")),
+        "expected Projects/Plan.md#Goals link, got {r_links:?}"
+    );
+    assert!(
+        r_links
+            .iter()
+            .any(|l| l.target_resolved_path.as_deref() == Some("Projects/Space Note.md")),
+        "expected Projects/Space Note.md link, got {r_links:?}"
+    );
+
+    // 2. Backlinks, graph, and orphans agree; external HTTPS + image-only note stays orphan
+    let plan_bl = storage.get_backlinks(&vault.id, "Projects/Plan.md").unwrap();
+    assert!(
+        plan_bl.iter().any(|b| b.source_path == "R.md"),
+        "Projects/Plan.md must have R.md as backlink: {plan_bl:?}"
+    );
+    let graph = storage.get_graph(&vault.id, Some("R.md"), 1).unwrap();
+    assert!(graph
+        .edges
+        .iter()
+        .any(|e| e.source == "R.md" && e.target == "Projects/Plan.md"));
+    assert!(graph
+        .edges
+        .iter()
+        .any(|e| e.source == "R.md" && e.target == "Projects/Space Note.md"));
+    assert!(
+        !graph.edges.iter().any(|e| e.target.contains("https://") || e.target.contains("pic.png")),
+        "external URLs and images must not be note graph edges: {:?}",
+        graph.edges
+    );
+
+    let orphans = storage.find_orphans(&vault.id).unwrap();
+    assert!(!orphans.iter().any(|o| o.rel_path == "R.md"), "{orphans:?}");
+    assert!(!orphans.iter().any(|o| o.rel_path == "Projects/Plan.md"), "{orphans:?}");
+    assert!(
+        orphans.iter().any(|o| o.rel_path == "OrphanOnlyExt.md"),
+        "note with only HTTPS link and image must remain orphan: {orphans:?}"
+    );
+
+    // 3. Upgrade from old user_version=1 DB (without markdown link rows) automatically reindexes once
+    drop(storage);
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute("DELETE FROM links WHERE vault_id = ?1", [&vault.id])
+            .unwrap();
+        conn.pragma_update(None, "user_version", 1i64).unwrap();
+    }
+    let upgraded = Storage::open(&db_path).unwrap();
+    let up_stats = upgraded.sync_vault(&vault).unwrap();
+    assert!(up_stats.updated >= 1, "v1 DB must trigger one-time reindex on upgrade");
+    assert!(upgraded
+        .get_backlinks(&vault.id, "Projects/Plan.md")
+        .unwrap()
+        .iter()
+        .any(|b| b.source_path == "R.md"));
+
+    // 4. Incremental sync_paths computes local markdown links identically
+    fs::write(
+        root.join("Sub/IncRef.md"),
+        "# IncRef\n\nRelative [Plan](../Projects/Plan.md#Goals).\n",
+    )
+    .unwrap();
+    upgraded
+        .sync_paths(&vault, &["Sub/IncRef.md".to_string()], &[])
+        .unwrap();
+    assert!(upgraded
+        .get_backlinks(&vault.id, "Projects/Plan.md")
+        .unwrap()
+        .iter()
+        .any(|b| b.source_path == "Sub/IncRef.md"));
+
+    // 5. Move target -> preserves label/title/anchor and only new path remains indexed
+    let moved = upgraded
+        .move_note_with_links(&vault, "Projects/Plan.md", "Archive/New Plan.md")
+        .unwrap();
+    assert_eq!(moved.to, "Archive/New Plan.md");
+    let r_after = fs::read_to_string(root.join("R.md")).unwrap();
+    assert!(
+        r_after.contains("[The Plan](Archive/New%20Plan.md#Goals \"Plan Title\")"),
+        "move must preserve label, anchor, and title: {r_after}"
+    );
+    assert!(upgraded
+        .get_backlinks(&vault.id, "Projects/Plan.md")
+        .unwrap()
+        .is_empty());
+    let new_bl = upgraded.get_backlinks(&vault.id, "Archive/New Plan.md").unwrap();
+    assert!(new_bl.iter().any(|b| b.source_path == "R.md"));
+    assert!(new_bl.iter().any(|b| b.source_path == "Sub/IncRef.md"));
+}
+
+#[test]
+fn regression_obsidian_obs_08_windows_case_only_rename() {
+    use obsidian_cli::vault::fs::content_sha256_hex;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("Obs08Vault");
+    fs::create_dir_all(root.join("notes")).unwrap();
+
+    let plan_bytes = b"# plan\n\nOriginal exact bytes.\r\n";
+    let existing_other_bytes = b"# Existing\n\nDo not clobber.\n";
+    fs::write(root.join("notes/plan.md"), plan_bytes).unwrap();
+    fs::write(root.join("notes/Existing.md"), existing_other_bytes).unwrap();
+    fs::write(
+        root.join("Index.md"),
+        "# Index\n\nSee [[notes/plan]] and [md](notes/plan.md).\n",
+    )
+    .unwrap();
+    let orig_hash = content_sha256_hex(plan_bytes);
+    let other_hash = content_sha256_hex(existing_other_bytes);
+
+    // 1. Case-only rename notes/plan.md -> notes/Plan.md via CLI
+    let mv = isolated_cli(tmp.path(), &root)
+        .args(["--json", "notes", "move", "notes/plan.md", "notes/Plan.md"])
+        .output()
+        .unwrap();
+    assert!(
+        mv.status.success(),
+        "case-only move notes/plan.md -> notes/Plan.md failed: {}",
+        String::from_utf8_lossy(&mv.stderr)
+    );
+    let mv_json: Value = serde_json::from_slice(&mv.stdout).unwrap();
+    assert_eq!(mv_json["from"], "notes/plan.md");
+    assert_eq!(mv_json["to"], "notes/Plan.md");
+
+    // Enumerate actual directory entries on disk to verify exact on-disk casing
+    let mut disk_names: Vec<String> = fs::read_dir(root.join("notes"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    disk_names.sort();
+    assert_eq!(
+        disk_names,
+        vec!["Existing.md".to_string(), "Plan.md".to_string()],
+        "on-disk directory entries must show exact Plan.md casing, got {disk_names:?}"
+    );
+    assert_eq!(
+        content_sha256_hex(&fs::read(root.join("notes/Plan.md")).unwrap()),
+        orig_hash
+    );
+
+    // CLI notes list & SQLite show exactly one note with new casing, and incoming links point to notes/Plan.md
+    let list_out = isolated_cli(tmp.path(), &root)
+        .args(["--json", "notes", "list"])
+        .output()
+        .unwrap();
+    assert!(list_out.status.success());
+    let list_json: Value = serde_json::from_slice(&list_out.stdout).unwrap();
+    let plan_entries: Vec<&str> = list_json
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|n| n["rel_path"].as_str())
+        .filter(|p| p.eq_ignore_ascii_case("notes/plan.md"))
+        .collect();
+    assert_eq!(
+        plan_entries,
+        vec!["notes/Plan.md"],
+        "must not duplicate note under old and new casing"
+    );
+
+    let index_after = fs::read_to_string(root.join("Index.md")).unwrap();
+    assert!(
+        index_after.contains("notes/Plan") || index_after.contains("[[Plan]]"),
+        "Index.md should reference updated casing or valid link: {index_after}"
+    );
+    let bl_out = isolated_cli(tmp.path(), &root)
+        .args(["--json", "backlinks", "notes/Plan.md"])
+        .output()
+        .unwrap();
+    assert!(bl_out.status.success(), "{}", String::from_utf8_lossy(&bl_out.stderr));
+    let bl_json: Value = serde_json::from_slice(&bl_out.stdout).unwrap();
+    assert!(
+        bl_json
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["source_path"] == "Index.md"),
+        "Index.md must remain a backlink to notes/Plan.md: {bl_json}"
+    );
+
+    // 2. Control: exact same path move retains existing conflict/error behavior
+    let same_path = isolated_cli(tmp.path(), &root)
+        .args(["--json", "notes", "move", "notes/Plan.md", "notes/Plan.md"])
+        .output()
+        .unwrap();
+    assert!(
+        !same_path.status.success(),
+        "identical path move must retain existing already-exists error"
+    );
+    assert_eq!(
+        content_sha256_hex(&fs::read(root.join("notes/Plan.md")).unwrap()),
+        orig_hash
+    );
+
+    // 3. Control: moving onto a DIFFERENT existing file fails and preserves both files
+    let collide = isolated_cli(tmp.path(), &root)
+        .args(["--json", "notes", "move", "notes/Plan.md", "notes/Existing.md"])
+        .output()
+        .unwrap();
+    assert!(!collide.status.success());
+    assert_eq!(
+        content_sha256_hex(&fs::read(root.join("notes/Plan.md")).unwrap()),
+        orig_hash
+    );
+    assert_eq!(
+        content_sha256_hex(&fs::read(root.join("notes/Existing.md")).unwrap()),
+        other_hash
+    );
+
+    // 4. Control: normal move to new folder updates links cleanly
+    let normal_mv = isolated_cli(tmp.path(), &root)
+        .args(["--json", "notes", "move", "notes/Plan.md", "Archive/FinalPlan.md"])
+        .output()
+        .unwrap();
+    assert!(normal_mv.status.success(), "{}", String::from_utf8_lossy(&normal_mv.stderr));
+    assert!(root.join("Archive/FinalPlan.md").is_file());
+    assert_eq!(
+        content_sha256_hex(&fs::read(root.join("Archive/FinalPlan.md")).unwrap()),
+        orig_hash
+    );
+}
+
+#[test]
+fn regression_obsidian_obs_10_surgical_task_toggle_eol_fence_and_bom() {
+    use obsidian_cli::vault::fs::toggle_task_at_line_verified;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("Obs10Vault");
+    fs::create_dir_all(&root).unwrap();
+
+    // 1. Mixed CRLF/LF note: toggling task changes ONLY the single checkbox byte (' ' <-> 'x')
+    let mixed_path = root.join("Mixed.md");
+    let mixed_before = b"# Mixed\r\n\n- [ ] Toggle target\n- [x] Keep LF\r\nTail";
+    fs::write(&mixed_path, mixed_before).unwrap();
+    let checked = toggle_task_at_line(&mixed_path, 3).unwrap();
+    assert!(checked);
+    let mixed_after = fs::read(&mixed_path).unwrap();
+    assert_eq!(mixed_after.len(), mixed_before.len());
+    let diffs: Vec<(usize, u8, u8)> = mixed_before
+        .iter()
+        .zip(mixed_after.iter())
+        .enumerate()
+        .filter(|(_, (a, b))| a != b)
+        .map(|(idx, (&a, &b))| (idx, a, b))
+        .collect();
+    assert_eq!(
+        diffs.len(),
+        1,
+        "mixed CRLF/LF toggle must change exactly 1 byte, diffs={diffs:?}"
+    );
+    assert_eq!((diffs[0].1, diffs[0].2), (b' ', b'x'));
+    // Toggle back x -> ' '
+    assert!(!toggle_task_at_line(&mixed_path, 3).unwrap());
+    assert_eq!(fs::read(&mixed_path).unwrap(), mixed_before);
+
+    // 2. Task inside code fence must error with 0 disk writes
+    let fence_path = root.join("CodeTask.md");
+    let fence_before = b"# CodeTask\n\n```md\n- [ ] Inside fence\n```\n\n- [ ] Real task\n";
+    fs::write(&fence_path, fence_before).unwrap();
+    assert!(
+        toggle_task_at_line(&fence_path, 4).is_err(),
+        "toggling - [ ] inside a fenced code block must fail"
+    );
+    assert_eq!(
+        fs::read(&fence_path).unwrap(),
+        fence_before,
+        "failed toggle inside fence must leave bytes untouched"
+    );
+    assert!(toggle_task_at_line(&fence_path, 7).unwrap());
+    assert_eq!(
+        fs::read(&fence_path).unwrap(),
+        b"# CodeTask\n\n```md\n- [ ] Inside fence\n```\n\n- [x] Real task\n"
+    );
+
+    // 3. UTF-8 BOM on line 1 (heading AND first-line task without frontmatter)
+    let bom_heading_path = root.join("BomHeading.md");
+    let bom_heading_bytes = "\u{feff}# BOM Heading\n- [ ] Second line task\n".as_bytes();
+    fs::write(&bom_heading_path, bom_heading_bytes).unwrap();
+
+    let bom_task_path = root.join("BomFirstLineTask.md");
+    let bom_task_bytes = "\u{feff}- [ ] First line BOM task\n- [ ] Second task".as_bytes();
+    fs::write(&bom_task_path, bom_task_bytes).unwrap();
+
+    let vault = vault_from_dir(&root, Some("Obs10Vault"));
+    let storage = Storage::open_in_memory().unwrap();
+    storage.sync_vault(&vault).unwrap();
+
+    let bom_h_detail = storage.load_note_detail(&vault, "BomHeading.md").unwrap();
+    assert_eq!(
+        bom_h_detail.parsed.headings.len(),
+        1,
+        "BOM line-1 heading must be indexed: {:?}",
+        bom_h_detail.parsed.headings
+    );
+    assert_eq!(bom_h_detail.parsed.headings[0].text, "BOM Heading");
+    assert_eq!(bom_h_detail.parsed.headings[0].line_no, 1);
+
+    let bom_t_tasks = storage
+        .list_tasks(&vault.id, obsidian_cli::models::TaskFilter::All, Some("BomFirstLineTask.md"))
+        .unwrap();
+    assert_eq!(
+        bom_t_tasks.len(),
+        2,
+        "BOM line-1 task must be indexed: {bom_t_tasks:?}"
+    );
+    assert_eq!(bom_t_tasks[0].line_no, 1);
+    assert_eq!(bom_t_tasks[0].text, "First line BOM task");
+
+    // Toggle BOM line-1 task -> preserves leading UTF-8 BOM and no-trailing-newline byte-for-byte
+    assert!(toggle_task_at_line(&bom_task_path, 1).unwrap());
+    let bom_task_after = fs::read(&bom_task_path).unwrap();
+    assert_eq!(
+        bom_task_after,
+        "\u{feff}- [x] First line BOM task\n- [ ] Second task".as_bytes(),
+        "BOM and non-checkbox bytes must be preserved exactly"
+    );
+
+    // 4. Controls: pure CRLF, BOM+frontmatter, no trailing newline, expected-text mismatch
+    let crlf_path = root.join("PureCrlf.md");
+    let crlf_before = b"# CRLF\r\n- [ ] One\r\n- [ ] Two";
+    fs::write(&crlf_path, crlf_before).unwrap();
+    assert!(toggle_task_at_line(&crlf_path, 3).unwrap());
+    assert_eq!(fs::read(&crlf_path).unwrap(), b"# CRLF\r\n- [ ] One\r\n- [x] Two");
+
+    let bom_fm_path = root.join("BomFM.md");
+    let bom_fm_before = "\u{feff}---\r\ntags: [t]\r\n---\r\n\r\n# Title\r\n- [ ] After FM".as_bytes();
+    fs::write(&bom_fm_path, bom_fm_before).unwrap();
+    assert!(toggle_task_at_line(&bom_fm_path, 6).unwrap());
+    assert_eq!(
+        fs::read(&bom_fm_path).unwrap(),
+        "\u{feff}---\r\ntags: [t]\r\n---\r\n\r\n# Title\r\n- [x] After FM".as_bytes()
+    );
+
+    // Expected-text mismatch must fail with 0 byte changes
+    let before_mismatch = fs::read(&bom_fm_path).unwrap();
+    assert!(toggle_task_at_line_verified(&bom_fm_path, 6, Some("Wrong text"), None).is_err());
+    assert_eq!(fs::read(&bom_fm_path).unwrap(), before_mismatch);
+}
+
+#[tokio::test]
+async fn regression_obsidian_obs_12_http_get_append_note_and_literal_percent_filename() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("Obs12Vault");
+    fs::create_dir_all(root.join("Sub Folder")).unwrap();
+
+    fs::write(root.join("append.md"), "# append\n\nAppend note body.\n").unwrap();
+    fs::write(
+        root.join("Ratio 50%20Test.md"),
+        "# Ratio 50%20Test\n\nLiteral percent body.\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("Sub Folder/C++ 한글 노트.md"),
+        "# C++ 한글 노트\n\nNormal encoded path body.\n",
+    )
+    .unwrap();
+
+    let vault = vault_from_dir(&root, Some("Obs12Vault"));
+    let mut cfg = AppConfig::default();
+    cfg.upsert_vault(vault.clone(), true);
+    let storage = Storage::open_in_memory().unwrap();
+    storage.sync_vault(&vault).unwrap();
+
+    let state = Arc::new(ServeState {
+        cfg,
+        default_vault: vault.clone(),
+        storage,
+        token: None,
+    });
+    let app = build_router(state).layer(CorsLayer::permissive());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let client = reqwest::Client::new();
+    let base = format!("http://{addr}");
+
+    // 1. GET /api/v1/notes/append and /api/v1/notes/append.md return the same note
+    let r_bare = client
+        .get(format!("{base}/api/v1/notes/append"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r_bare.status(),
+        StatusCode::OK,
+        "GET /api/v1/notes/append must return 200 OK"
+    );
+    let bare_json: Value = r_bare.json().await.unwrap();
+    let r_ext = client
+        .get(format!("{base}/api/v1/notes/append.md"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_ext.status(), StatusCode::OK);
+    let ext_json: Value = r_ext.json().await.unwrap();
+    assert_eq!(bare_json["note"]["summary"]["rel_path"], "append.md");
+    assert_eq!(ext_json["note"]["summary"]["rel_path"], "append.md");
+    assert_eq!(bare_json["note"]["raw_markdown"], ext_json["note"]["raw_markdown"]);
+
+    // 2. Literal %20 in filename (`Ratio 50%20Test.md`) requested with % -> %25 returns exact file
+    let r_pct = client
+        .get(format!("{base}/api/v1/notes/Ratio%2050%2520Test.md"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r_pct.status(),
+        StatusCode::OK,
+        "GET literal percent filename must not double-decode"
+    );
+    let pct_json: Value = r_pct.json().await.unwrap();
+    assert_eq!(pct_json["note"]["summary"]["rel_path"], "Ratio 50%20Test.md");
+    assert!(pct_json["note"]["raw_markdown"]
+        .as_str()
+        .unwrap()
+        .contains("Literal percent body."));
+
+    // 3. Control: POST /api/v1/notes/append still appends exactly once
+    let post_ap = client
+        .post(format!("{base}/api/v1/notes/append"))
+        .json(&json!({ "note": "append", "text": "APPENDED_ONCE_MARKER" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(post_ap.status(), StatusCode::OK);
+    let on_disk = fs::read_to_string(root.join("append.md")).unwrap();
+    assert_eq!(on_disk.matches("APPENDED_ONCE_MARKER").count(), 1);
+
+    // 4. Control: spaces, '+', Korean, subfolder normal GET still works
+    let r_sub = client
+        .get(format!(
+            "{base}/api/v1/notes/Sub%20Folder/C++%20%ED%95%9C%EA%B8%80%20%EB%85%B8%ED%8A%B8.md"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_sub.status(), StatusCode::OK);
+    let sub_json: Value = r_sub.json().await.unwrap();
+    assert_eq!(
+        sub_json["note"]["summary"]["rel_path"],
+        "Sub Folder/C++ 한글 노트.md"
+    );
+
+    server.abort();
+}
+
+#[test]
+fn regression_obsidian_obs_14_hyphen_titles_and_toggle_task_expected_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("Obs14Vault");
+    fs::create_dir_all(&root).unwrap();
+
+    // 1. Create `- 목록 항목`, then read, append, replace, move, and delete with the same spelling
+    let title = "- 목록 항목";
+    let cr = isolated_cli(tmp.path(), &root)
+        .args(["--json", "notes", "create", title])
+        .output()
+        .unwrap();
+    assert!(cr.status.success(), "create failed: {}", String::from_utf8_lossy(&cr.stderr));
+    assert!(root.join("- 목록 항목.md").is_file());
+
+    let rd = isolated_cli(tmp.path(), &root)
+        .args(["--json", "notes", "read", title])
+        .output()
+        .unwrap();
+    assert!(rd.status.success(), "read failed: {}", String::from_utf8_lossy(&rd.stderr));
+    let rd_json: Value = serde_json::from_slice(&rd.stdout).unwrap();
+    assert_eq!(rd_json["summary"]["rel_path"], "- 목록 항목.md");
+
+    let rd_compact = isolated_cli(tmp.path(), &root)
+        .args(["notes", "read", title, "--compact", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        rd_compact.status.success(),
+        "read --compact --json failed: {}",
+        String::from_utf8_lossy(&rd_compact.stderr)
+    );
+    let rd_compact_json: Value = serde_json::from_slice(&rd_compact.stdout).unwrap();
+    assert_eq!(rd_compact_json["rel_path"], "- 목록 항목.md");
+
+    let ap = isolated_cli(tmp.path(), &root)
+        .args(["--json", "notes", "append", title, "- appended bullet"])
+        .output()
+        .unwrap();
+    assert!(ap.status.success(), "append failed: {}", String::from_utf8_lossy(&ap.stderr));
+    assert!(fs::read_to_string(root.join("- 목록 항목.md"))
+        .unwrap()
+        .contains("- appended bullet"));
+
+    let rep = isolated_cli(tmp.path(), &root)
+        .args([
+            "--json",
+            "notes",
+            "replace",
+            title,
+            "--find",
+            "- appended bullet",
+            "--replace",
+            "- updated bullet",
+        ])
+        .output()
+        .unwrap();
+    assert!(rep.status.success(), "replace failed: {}", String::from_utf8_lossy(&rep.stderr));
+    assert!(fs::read_to_string(root.join("- 목록 항목.md"))
+        .unwrap()
+        .contains("- updated bullet"));
+
+    let moved_title = "- 이동된 항목";
+    let mv = isolated_cli(tmp.path(), &root)
+        .args(["--json", "notes", "move", title, moved_title])
+        .output()
+        .unwrap();
+    assert!(mv.status.success(), "move failed: {}", String::from_utf8_lossy(&mv.stderr));
+    assert!(root.join("- 이동된 항목.md").is_file());
+
+    // Control: `--` separator still works for hyphen note identifier
+    let rd_sep = isolated_cli(tmp.path(), &root)
+        .args(["--json", "notes", "read", "--", moved_title])
+        .output()
+        .unwrap();
+    assert!(rd_sep.status.success(), "read after -- failed: {}", String::from_utf8_lossy(&rd_sep.stderr));
+
+    let del = isolated_cli(tmp.path(), &root)
+        .args(["--json", "notes", "delete", "--yes", moved_title])
+        .output()
+        .unwrap();
+    assert!(del.status.success(), "delete failed: {}", String::from_utf8_lossy(&del.stderr));
+    assert!(!root.join("- 이동된 항목.md").exists());
+    assert!(root.join(".trash/- 이동된 항목.md").is_file());
+
+    // 2. toggle-task --expected-text with separate argv `- item` and control `--expected-text=- item`
+    fs::write(root.join("Tasks.md"), "# Tasks\n\n- [ ] - item\n- [ ] other task\n").unwrap();
+    let tog_ok = isolated_cli(tmp.path(), &root)
+        .args(["--json", "toggle-task", "Tasks.md", "3", "--expected-text", "- item"])
+        .output()
+        .unwrap();
+    assert!(
+        tog_ok.status.success(),
+        "toggle-task --expected-text '- item' failed: {}",
+        String::from_utf8_lossy(&tog_ok.stderr)
+    );
+    assert!(fs::read_to_string(root.join("Tasks.md"))
+        .unwrap()
+        .contains("- [x] - item"));
+
+    // Mismatched expected-text must run comparison and fail with Task conflict (not clap exit 2)
+    let tog_mismatch = isolated_cli(tmp.path(), &root)
+        .args(["toggle-task", "Tasks.md", "4", "--expected-text", "- item"])
+        .output()
+        .unwrap();
+    assert!(!tog_mismatch.status.success());
+    let mismatch_err = String::from_utf8_lossy(&tog_mismatch.stderr);
+    assert!(
+        mismatch_err.contains("Task conflict"),
+        "expected Task conflict comparison error, got: {mismatch_err}"
+    );
+    assert!(fs::read_to_string(root.join("Tasks.md"))
+        .unwrap()
+        .contains("- [ ] other task"));
+
+    // Control: `--expected-text=- item` toggles back
+    let tog_eq = isolated_cli(tmp.path(), &root)
+        .args(["--json", "toggle-task", "Tasks.md", "3", "--expected-text=- item"])
+        .output()
+        .unwrap();
+    assert!(
+        tog_eq.status.success(),
+        "toggle-task --expected-text=- item failed: {}",
+        String::from_utf8_lossy(&tog_eq.stderr)
+    );
+    assert!(fs::read_to_string(root.join("Tasks.md"))
+        .unwrap()
+        .contains("- [ ] - item"));
+
+    // 3. Controls: --help, --json, missing values, and option typo diagnostics remain intact
+    let help_read = isolated_cli(tmp.path(), &root)
+        .args(["notes", "read", "--help"])
+        .output()
+        .unwrap();
+    assert!(help_read.status.success());
+    assert!(String::from_utf8_lossy(&help_read.stdout).contains("--compact"));
+
+    let bad_flag_read = isolated_cli(tmp.path(), &root)
+        .args(["notes", "read", "--compct"])
+        .output()
+        .unwrap();
+    assert!(!bad_flag_read.status.success());
+    assert_eq!(
+        bad_flag_read.status.code(),
+        Some(2),
+        "option typo `--compct` must still be rejected by clap as an unknown option, stderr={}",
+        String::from_utf8_lossy(&bad_flag_read.stderr)
+    );
+
+    let missing_expected_val = isolated_cli(tmp.path(), &root)
+        .args(["toggle-task", "Tasks.md", "3", "--expected-text", "--json"])
+        .output()
+        .unwrap();
+    assert!(!missing_expected_val.status.success());
+    assert_eq!(missing_expected_val.status.code(), Some(2));
+
+    let missing_delete_note = isolated_cli(tmp.path(), &root)
+        .args(["notes", "delete", "--yes", "--json"])
+        .output()
+        .unwrap();
+    assert!(!missing_delete_note.status.success());
+    assert_eq!(missing_delete_note.status.code(), Some(2));
+}

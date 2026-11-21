@@ -268,6 +268,8 @@ pub struct WikilinkRef {
 pub struct MarkdownLinkRef {
     pub label: String,
     pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     pub is_image: bool,
     pub line_no: usize,
 }

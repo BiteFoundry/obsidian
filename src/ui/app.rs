@@ -50,9 +50,10 @@ use crate::{
     vault::{
         fs::{
             append_to_note, content_sha256_bytes, create_note, ensure_daily_note,
-            file_mtime_and_size, hydrate_parsed_note_links, inline_image_cache_key,
-            is_html_file_path, move_note_to_trash, resolve_attachment_path,
-            resolve_wikilink_target, safe_vault_path, save_vault_attachment,
+            extract_local_markdown_note_link, file_mtime_and_size, hydrate_parsed_note_links,
+            inline_image_cache_key, is_html_file_path, move_note_to_trash,
+            resolve_attachment_path, resolve_markdown_link_from_source,
+            resolve_wikilink_from_source, safe_vault_path, save_vault_attachment,
             scan_vault_html_files, toggle_task_at_line_verified, VaultHtmlFile,
         },
         merged_vaults,
@@ -759,12 +760,12 @@ impl AppState {
             &aliases_map,
         );
 
-        let outgoing_links: Vec<OutgoingLinkEntry> = parsed
+        let mut outgoing_links: Vec<OutgoingLinkEntry> = parsed
             .wikilinks
             .iter()
             .map(|wl| {
                 let resolved_path =
-                    resolve_wikilink_target(&wl.target_raw, &all_paths, &aliases_map);
+                    resolve_wikilink_from_source(&wl.target_raw, &rel_path, &all_paths, &aliases_map);
                 let resolved = resolved_path.is_some();
                 let target_title = resolved_path
                     .as_ref()
@@ -781,6 +782,30 @@ impl AppState {
                 }
             })
             .collect();
+        for ml in &parsed.md_links {
+            if ml.is_image {
+                continue;
+            }
+            if let Some((target_raw, heading)) = extract_local_markdown_note_link(&ml.url) {
+                let resolved_path =
+                    resolve_markdown_link_from_source(&target_raw, &rel_path, &all_paths);
+                let resolved = resolved_path.is_some();
+                let target_title = resolved_path
+                    .as_ref()
+                    .and_then(|rp| title_by_path.get(rp).cloned())
+                    .unwrap_or_else(|| target_raw.clone());
+                let alias = (!ml.label.trim().is_empty()).then(|| ml.label.trim().to_string());
+                outgoing_links.push(OutgoingLinkEntry {
+                    target_raw,
+                    target_resolved_path: resolved_path,
+                    target_title,
+                    alias,
+                    heading,
+                    is_embed: false,
+                    resolved,
+                });
+            }
+        }
 
         detail.raw_markdown = markdown;
         detail.summary.frontmatter = parsed.frontmatter.clone();

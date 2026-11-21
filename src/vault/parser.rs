@@ -59,7 +59,8 @@ pub fn mime_type_for_path(path: &str) -> &'static str {
 
 /// Parses an Obsidian Markdown document into structured metadata, graph references, tasks, outline, and UI blocks.
 pub fn parse_markdown(rel_path: &str, note_title: &str, raw: &str) -> ParsedNote {
-    let lines: Vec<&str> = raw.lines().collect();
+    let raw_no_bom = raw.strip_prefix('\u{feff}').unwrap_or(raw);
+    let lines: Vec<&str> = raw_no_bom.lines().collect();
     let (frontmatter, body_start_idx) = parse_frontmatter(&lines);
 
     let mut tag_set: BTreeSet<String> = BTreeSet::new();
@@ -109,10 +110,9 @@ pub fn parse_markdown(rel_path: &str, note_title: &str, raw: &str) -> ParsedNote
             continue;
         }
 
-        // Fenced code block (``` or ~~~)
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            let fence_char = trimmed.chars().next().unwrap_or('`');
-            let fence_len = trimmed.chars().take_while(|&c| c == fence_char).count();
+        // Fenced code block (``` or ~~~); backtick lines containing another backtick
+        // (such as ```inline code```) are inline code spans, not multiline fences.
+        if let Some((fence_char, fence_len)) = is_code_fence_opener(trimmed) {
             let language = trimmed[fence_len..].trim().to_string();
             let mut code_lines = Vec::new();
             i += 1;
@@ -261,6 +261,15 @@ pub fn parse_markdown(rel_path: &str, note_title: &str, raw: &str) -> ParsedNote
             && is_table_separator(body_lines[i + 1].trim())
         {
             let headers = split_table_row(trimmed);
+            for cell in &headers {
+                let _ = parse_inline_spans(
+                    cell,
+                    line_no,
+                    &mut wikilinks,
+                    &mut md_links,
+                    &mut tag_set,
+                );
+            }
             plain_parts.push(headers.join(" "));
             i += 2;
             let mut rows = Vec::new();
@@ -270,14 +279,16 @@ pub fn parse_markdown(rel_path: &str, note_title: &str, raw: &str) -> ParsedNote
                     break;
                 }
                 let ln = body_start_idx + i + 1;
-                let _ = parse_inline_spans(
-                    r_trim,
-                    ln,
-                    &mut wikilinks,
-                    &mut md_links,
-                    &mut tag_set,
-                );
                 let row = split_table_row(r_trim);
+                for cell in &row {
+                    let _ = parse_inline_spans(
+                        cell,
+                        ln,
+                        &mut wikilinks,
+                        &mut md_links,
+                        &mut tag_set,
+                    );
+                }
                 plain_parts.push(row.join(" "));
                 rows.push(row);
                 i += 1;
@@ -365,8 +376,7 @@ pub fn parse_markdown(rel_path: &str, note_title: &str, raw: &str) -> ParsedNote
             let next = body_lines[i];
             let nt = next.trim();
             if nt.is_empty()
-                || nt.starts_with("```")
-                || nt.starts_with("~~~")
+                || is_code_fence_opener(nt).is_some()
                 || nt.starts_with('#')
                 || nt.starts_with('>')
                 || is_horizontal_rule(nt)
@@ -569,6 +579,233 @@ fn parse_numbered_line(line: &str) -> Option<(usize, String, &str)> {
     Some((indent, trimmed[..digits_len].to_string(), rest))
 }
 
+pub(crate) fn is_code_fence_opener(trimmed: &str) -> Option<(char, usize)> {
+    if trimmed.starts_with("```") {
+        let flen = trimmed.bytes().take_while(|&b| b == b'`').count();
+        return (!trimmed[flen..].contains('`')).then_some(('`', flen));
+    }
+    if trimmed.starts_with("~~~") {
+        let flen = trimmed.bytes().take_while(|&b| b == b'~').count();
+        return Some(('~', flen));
+    }
+    None
+}
+
+pub(crate) fn find_inline_code_end(line: &str, start: usize) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let len = bytes.len();
+    let ticks = bytes[start..].iter().take_while(|&&b| b == b'`').count();
+    if ticks == 0 {
+        return None;
+    }
+    let mut k = start + ticks;
+    while k < len {
+        if bytes[k] == b'`' {
+            let close_ticks = bytes[k..].iter().take_while(|&&b| b == b'`').count();
+            k += close_ticks;
+            if close_ticks == ticks {
+                return Some(k);
+            }
+        } else {
+            k += 1;
+        }
+    }
+    None
+}
+
+pub(crate) fn find_matching_bracket(line: &str, open_bracket: usize) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let len = bytes.len();
+    let mut j = open_bracket + 1;
+    let mut depth = 1usize;
+    while j < len {
+        if bytes[j] == b'\\' && j + 1 < len {
+            j += 2;
+            continue;
+        }
+        if bytes[j] == b'`' {
+            if let Some(end) = find_inline_code_end(line, j) {
+                j = end;
+            } else {
+                j += bytes[j..].iter().take_while(|&&b| b == b'`').count();
+            }
+            continue;
+        }
+        if bytes[j] == b'[' {
+            depth += 1;
+            j += 1;
+        } else if bytes[j] == b']' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(j);
+            }
+            j += 1;
+        } else {
+            j += 1;
+        }
+    }
+    None
+}
+
+pub(crate) struct MarkdownLinkDest {
+    pub dest_start: usize,
+    pub dest_end: usize,
+    pub title: Option<String>,
+    pub angle_bracketed: bool,
+    pub close_end: usize,
+}
+
+pub(crate) fn parse_inline_markdown_link_dest(
+    line: &str,
+    open_paren: usize,
+) -> Option<MarkdownLinkDest> {
+    let bytes = line.as_bytes();
+    let len = bytes.len();
+    let mut j = open_paren + 1;
+    while j < len && matches!(bytes[j], b' ' | b'\t') {
+        j += 1;
+    }
+    if j >= len {
+        return None;
+    }
+
+    let (dest_start, dest_end, angle_bracketed) = if bytes[j] == b'<' {
+        let start = j + 1;
+        j += 1;
+        while j < len {
+            if bytes[j] == b'\\' && j + 1 < len {
+                j += 2;
+                continue;
+            }
+            if bytes[j] == b'>' {
+                break;
+            }
+            if matches!(bytes[j], b'<' | b'\n' | b'\r') {
+                return None;
+            }
+            j += 1;
+        }
+        if j >= len || bytes[j] != b'>' {
+            return None;
+        }
+        let end = j;
+        j += 1;
+        (start, end, true)
+    } else {
+        let start = j;
+        let mut paren_depth = 0usize;
+        while j < len {
+            if bytes[j] == b'\\' && j + 1 < len && bytes[j + 1].is_ascii_punctuation() {
+                j += 2;
+                continue;
+            }
+            if bytes[j] <= b' ' || bytes[j] == 0x7F {
+                break;
+            }
+            if bytes[j] == b'(' {
+                paren_depth += 1;
+                j += 1;
+            } else if bytes[j] == b')' {
+                if paren_depth == 0 {
+                    break;
+                }
+                paren_depth -= 1;
+                j += 1;
+            } else {
+                j += 1;
+            }
+        }
+        if paren_depth != 0 {
+            return None;
+        }
+        (start, j, false)
+    };
+
+    let ws_start = j;
+    while j < len && matches!(bytes[j], b' ' | b'\t') {
+        j += 1;
+    }
+    if j < len && bytes[j] == b')' {
+        return Some(MarkdownLinkDest {
+            dest_start,
+            dest_end,
+            title: None,
+            angle_bracketed,
+            close_end: j + 1,
+        });
+    }
+
+    if j > ws_start && j < len && matches!(bytes[j], b'"' | b'\'' | b'(') {
+        let close_delim = match bytes[j] {
+            b'"' => b'"',
+            b'\'' => b'\'',
+            b'(' => b')',
+            _ => unreachable!(),
+        };
+        let is_paren_title = bytes[j] == b'(';
+        let title_start = j + 1;
+        j += 1;
+        let mut closed = false;
+        let mut title_end = title_start;
+        while j < len {
+            if bytes[j] == b'\\' && j + 1 < len {
+                j += 2;
+                continue;
+            }
+            if is_paren_title && bytes[j] == b'(' {
+                return None;
+            }
+            if bytes[j] == close_delim {
+                title_end = j;
+                j += 1;
+                closed = true;
+                break;
+            }
+            j += 1;
+        }
+        if !closed {
+            return None;
+        }
+        while j < len && matches!(bytes[j], b' ' | b'\t') {
+            j += 1;
+        }
+        if j < len && bytes[j] == b')' {
+            return Some(MarkdownLinkDest {
+                dest_start,
+                dest_end,
+                title: Some(line[title_start..title_end].to_string()),
+                angle_bracketed,
+                close_end: j + 1,
+            });
+        }
+    }
+
+    None
+}
+
+fn split_wikilink_alias(inner: &str) -> (&str, Option<&str>) {
+    match inner.split_once('|') {
+        Some((lhs, rhs)) => {
+            let lhs = lhs.strip_suffix('\\').unwrap_or(lhs);
+            (lhs.trim(), Some(rhs.trim()))
+        }
+        None => (inner.trim(), None),
+    }
+}
+
+fn wrap_formatted_spans(
+    inner_spans: Vec<InlineSpan>,
+    wrap: impl Fn(String) -> InlineSpan,
+) -> Vec<InlineSpan> {
+    inner_spans
+        .into_iter()
+        .map(|span| match span {
+            InlineSpan::Text { text } => wrap(text),
+            other => other,
+        })
+        .collect()
+}
+
 fn is_table_separator(trimmed: &str) -> bool {
     if !trimmed.contains('-') || !trimmed.contains('|') {
         return false;
@@ -579,8 +816,40 @@ fn is_table_separator(trimmed: &str) -> bool {
 }
 
 fn split_table_row(trimmed: &str) -> Vec<String> {
-    let s = trimmed.trim().trim_start_matches('|').trim_end_matches('|');
-    s.split('|').map(|c| c.trim().to_string()).collect()
+    let s = trimmed.trim();
+    let s = s.strip_prefix('|').unwrap_or(s);
+    let s = if s.ends_with('|') && !s.ends_with("\\|") {
+        &s[..s.len() - 1]
+    } else {
+        s
+    };
+    let bytes = s.as_bytes();
+    let mut cells = Vec::new();
+    let mut start = 0usize;
+    let mut idx = 0usize;
+    while idx < bytes.len() {
+        if bytes[idx] == b'\\' && idx + 1 < bytes.len() {
+            idx += 2;
+            continue;
+        }
+        if bytes[idx] == b'`' {
+            if let Some(end) = find_inline_code_end(s, idx) {
+                idx = end;
+            } else {
+                idx += bytes[idx..].iter().take_while(|&&b| b == b'`').count();
+            }
+            continue;
+        }
+        if bytes[idx] == b'|' {
+            cells.push(s[start..idx].trim().to_string());
+            idx += 1;
+            start = idx;
+            continue;
+        }
+        idx += 1;
+    }
+    cells.push(s[start..].trim().to_string());
+    cells
 }
 
 fn parse_standalone_embed(
@@ -593,10 +862,7 @@ fn parse_standalone_embed(
         if inner.contains("[[") || inner.contains("]]") {
             return None;
         }
-        let (target_part, alias_part) = match inner.split_once('|') {
-            Some((t, a)) => (t.trim(), Some(a.trim())),
-            None => (inner.trim(), None),
-        };
+        let (target_part, alias_part) = split_wikilink_alias(inner);
         let (target, heading) = match target_part.split_once('#') {
             Some((t, h)) => (t.trim(), Some(h.trim().to_string())),
             None => (target_part, None),
@@ -641,28 +907,34 @@ fn parse_standalone_embed(
         }
     }
 
-    if let Some(rest) = trimmed.strip_prefix("![") {
-        if let Some((alt, url_part)) = rest.split_once("](") {
-            if let Some(url) = url_part.strip_suffix(')') {
-                let target = url.trim().trim_matches(['<', '>']);
-                if !target.is_empty() && !alt.contains(']') && is_image_target(target) {
-                    md_links.push(MarkdownLinkRef {
-                        label: alt.to_string(),
-                        url: target.to_string(),
-                        is_image: true,
-                        line_no,
-                    });
-                    return Some(NoteBlock::ImageEmbed {
-                        raw_target: target.to_string(),
-                        alt: if alt.is_empty() {
-                            target.to_string()
-                        } else {
-                            alt.to_string()
-                        },
-                        width_hint: None,
-                        resolved_path: None,
-                        line_no,
-                    });
+    if trimmed.starts_with("![") {
+        if let Some(close_bracket) = find_matching_bracket(trimmed, 1) {
+            if trimmed.as_bytes().get(close_bracket + 1) == Some(&b'(') {
+                if let Some(dest) = parse_inline_markdown_link_dest(trimmed, close_bracket + 1) {
+                    if dest.close_end == trimmed.len() {
+                        let alt = &trimmed[2..close_bracket];
+                        let target = trimmed[dest.dest_start..dest.dest_end].trim();
+                        if !target.is_empty() && is_image_target(target) {
+                            md_links.push(MarkdownLinkRef {
+                                label: alt.to_string(),
+                                url: target.to_string(),
+                                title: dest.title,
+                                is_image: true,
+                                line_no,
+                            });
+                            return Some(NoteBlock::ImageEmbed {
+                                raw_target: target.to_string(),
+                                alt: if alt.is_empty() {
+                                    target.to_string()
+                                } else {
+                                    alt.to_string()
+                                },
+                                width_hint: None,
+                                resolved_path: None,
+                                line_no,
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -697,16 +969,20 @@ pub fn parse_inline_spans(
     while i < len {
         let rest = &input[i..];
 
-        // Inline code: `...`
+        // Inline code: `...`, ``...``, ```...``` (matching exact backtick count)
         if rest.starts_with('`') {
-            if let Some(end) = rest[1..].find('`') {
+            let ticks = rest.bytes().take_while(|&b| b == b'`').count();
+            if let Some(end) = find_inline_code_end(input, i) {
                 flush_text(&mut text_buf, &mut spans);
                 spans.push(InlineSpan::Code {
-                    text: rest[1..1 + end].to_string(),
+                    text: input[i + ticks..end - ticks].to_string(),
                 });
-                i += 1 + end + 1;
+                i = end;
                 continue;
             }
+            text_buf.push_str(&rest[..ticks]);
+            i += ticks;
+            continue;
         }
 
         // Embed or Wikilink: `![[...]]` or `[[...]]`
@@ -716,10 +992,8 @@ pub fn parse_inline_spans(
             if let Some(close) = rest[prefix_len..].find("]]") {
                 let inner = &rest[prefix_len..prefix_len + close];
                 if !inner.contains('\n') && !inner.is_empty() {
-                    let (target_part, alias) = match inner.split_once('|') {
-                        Some((t, a)) => (t.trim(), Some(a.trim().to_string())),
-                        None => (inner.trim(), None),
-                    };
+                    let (target_part, alias_opt) = split_wikilink_alias(inner);
+                    let alias = alias_opt.map(String::from);
                     let (target, heading) = match target_part.split_once('#') {
                         Some((t, h)) => (t.trim(), Some(h.trim().to_string())),
                         None => (target_part, None),
@@ -741,6 +1015,13 @@ pub fn parse_inline_spans(
                         });
                         i += prefix_len + close + 2;
                         continue;
+                    } else if let Some(h) = heading.filter(|h| !h.is_empty()) {
+                        // Same-note heading/block reference like `[[#Section]]` must not leak `#Section` as a tag.
+                        flush_text(&mut text_buf, &mut spans);
+                        let display = alias.unwrap_or_else(|| format!("#{h}"));
+                        spans.push(InlineSpan::Text { text: display });
+                        i += prefix_len + close + 2;
+                        continue;
                     }
                 }
             }
@@ -749,30 +1030,32 @@ pub fn parse_inline_spans(
         // Standard Markdown link / inline image: `![alt](url)` or `[label](url)`
         let md_is_img = rest.starts_with("![");
         if md_is_img || rest.starts_with('[') {
-            let start_off = if md_is_img { 2 } else { 1 };
-            if let Some(mid) = rest[start_off..].find("](") {
-                let label = &rest[start_off..start_off + mid];
-                let after_mid = &rest[start_off + mid + 2..];
-                if let Some(close) = after_mid.find(')') {
-                    let url = after_mid[..close].trim();
-                    if !url.is_empty() && !label.contains('\n') {
-                        flush_text(&mut text_buf, &mut spans);
-                        md_links.push(MarkdownLinkRef {
-                            label: label.to_string(),
-                            url: url.to_string(),
-                            is_image: md_is_img,
-                            line_no,
-                        });
-                        spans.push(InlineSpan::ExternalLink {
-                            label: if label.is_empty() {
-                                url.to_string()
-                            } else {
-                                label.to_string()
-                            },
-                            url: url.to_string(),
-                        });
-                        i += start_off + mid + 2 + close + 1;
-                        continue;
+            let open_bracket = if md_is_img { i + 1 } else { i };
+            if let Some(close_bracket) = find_matching_bracket(input, open_bracket) {
+                if bytes.get(close_bracket + 1) == Some(&b'(') {
+                    if let Some(dest) = parse_inline_markdown_link_dest(input, close_bracket + 1) {
+                        let label = &input[open_bracket + 1..close_bracket];
+                        let url = input[dest.dest_start..dest.dest_end].trim();
+                        if !url.is_empty() && !label.contains('\n') {
+                            flush_text(&mut text_buf, &mut spans);
+                            md_links.push(MarkdownLinkRef {
+                                label: label.to_string(),
+                                url: url.to_string(),
+                                title: dest.title,
+                                is_image: md_is_img,
+                                line_no,
+                            });
+                            spans.push(InlineSpan::ExternalLink {
+                                label: if label.is_empty() {
+                                    url.to_string()
+                                } else {
+                                    label.to_string()
+                                },
+                                url: url.to_string(),
+                            });
+                            i = dest.close_end;
+                            continue;
+                        }
                     }
                 }
             }
@@ -782,10 +1065,13 @@ pub fn parse_inline_spans(
         if rest.starts_with("**") {
             if let Some(end) = rest[2..].find("**") {
                 if end > 0 {
+                    let inner = &rest[2..2 + end];
+                    let inner_spans =
+                        parse_inline_spans(inner, line_no, wikilinks, md_links, tag_set);
                     flush_text(&mut text_buf, &mut spans);
-                    spans.push(InlineSpan::Bold {
-                        text: rest[2..2 + end].to_string(),
-                    });
+                    spans.extend(wrap_formatted_spans(inner_spans, |text| InlineSpan::Bold {
+                        text,
+                    }));
                     i += 2 + end + 2;
                     continue;
                 }
@@ -796,10 +1082,13 @@ pub fn parse_inline_spans(
         if rest.starts_with("==") {
             if let Some(end) = rest[2..].find("==") {
                 if end > 0 {
+                    let inner = &rest[2..2 + end];
+                    let inner_spans =
+                        parse_inline_spans(inner, line_no, wikilinks, md_links, tag_set);
                     flush_text(&mut text_buf, &mut spans);
-                    spans.push(InlineSpan::Highlight {
-                        text: rest[2..2 + end].to_string(),
-                    });
+                    spans.extend(wrap_formatted_spans(inner_spans, |text| {
+                        InlineSpan::Highlight { text }
+                    }));
                     i += 2 + end + 2;
                     continue;
                 }
@@ -810,10 +1099,13 @@ pub fn parse_inline_spans(
         if rest.starts_with("~~") {
             if let Some(end) = rest[2..].find("~~") {
                 if end > 0 {
+                    let inner = &rest[2..2 + end];
+                    let inner_spans =
+                        parse_inline_spans(inner, line_no, wikilinks, md_links, tag_set);
                     flush_text(&mut text_buf, &mut spans);
-                    spans.push(InlineSpan::Strikethrough {
-                        text: rest[2..2 + end].to_string(),
-                    });
+                    spans.extend(wrap_formatted_spans(inner_spans, |text| {
+                        InlineSpan::Strikethrough { text }
+                    }));
                     i += 2 + end + 2;
                     continue;
                 }
@@ -824,10 +1116,13 @@ pub fn parse_inline_spans(
         if rest.starts_with('*') && !rest.starts_with("**") {
             if let Some(end) = rest[1..].find('*') {
                 if end > 0 && !rest[1..].starts_with(' ') {
+                    let inner = &rest[1..1 + end];
+                    let inner_spans =
+                        parse_inline_spans(inner, line_no, wikilinks, md_links, tag_set);
                     flush_text(&mut text_buf, &mut spans);
-                    spans.push(InlineSpan::Italic {
-                        text: rest[1..1 + end].to_string(),
-                    });
+                    spans.extend(wrap_formatted_spans(inner_spans, |text| {
+                        InlineSpan::Italic { text }
+                    }));
                     i += 1 + end + 1;
                     continue;
                 }
@@ -879,6 +1174,7 @@ pub fn parse_inline_spans(
                     md_links.push(MarkdownLinkRef {
                         label: url.to_string(),
                         url: url.to_string(),
+                        title: None,
                         is_image: false,
                         line_no,
                     });

@@ -21,7 +21,7 @@ use crate::{
             toggle_task_at_line_verified,
         },
         init_starter_vault, merged_vaults, native_obsidian_config_path, resolve_active_vault,
-        vault_from_dir,
+        resolve_registered_vault, vault_from_dir,
     },
 };
 
@@ -271,7 +271,32 @@ fn is_hyphen_text_option(cmd_path: &[&str], long_name: &str) -> bool {
         (["daily"], "append")
             | (["notes", "create"], "content")
             | (["notes", "replace"], "find" | "replace")
+            | (["toggle-task"], "expected-text")
     )
+}
+
+fn hyphen_positional_slots(cmd_path: &[&str]) -> usize {
+    match cmd_path {
+        ["notes", "read" | "replace" | "edit" | "delete"] => 1,
+        ["notes", "append" | "move"] => 2,
+        ["toggle-task"] => 1,
+        _ => 0,
+    }
+}
+
+fn looks_like_flag_typo(token: &str) -> bool {
+    if let Some(rest) = token.strip_prefix("--") {
+        let name = rest.split('=').next().unwrap_or(rest);
+        return !name.is_empty()
+            && name.as_bytes()[0].is_ascii_alphabetic()
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    }
+    if let Some(rest) = token.strip_prefix('-') {
+        return !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_alphabetic());
+    }
+    false
 }
 
 fn is_known_flag(cmd: &clap::Command, token: &str) -> bool {
@@ -315,11 +340,37 @@ fn has_potential_hyphen_option_literal(raw: &[OsString]) -> bool {
         if token == "--" {
             return false;
         }
-        if matches!(token, "--append" | "--content" | "--find" | "--replace")
-            && args
-                .peek()
-                .and_then(|next| next.to_str())
-                .is_some_and(|next| next != "--" && next.len() > 1 && next.starts_with('-'))
+        if matches!(
+            token,
+            "--append" | "--content" | "--find" | "--replace" | "--expected-text"
+        ) && args
+            .peek()
+            .and_then(|next| next.to_str())
+            .is_some_and(|next| next != "--" && next.len() > 1 && next.starts_with('-'))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn has_potential_hyphen_note_positional(raw: &[OsString]) -> bool {
+    let mut saw_target_cmd = false;
+    for arg in raw.iter().skip(1) {
+        let Some(token) = arg.to_str() else {
+            continue;
+        };
+        if token == "--" {
+            return false;
+        }
+        if matches!(token, "notes" | "toggle-task") {
+            saw_target_cmd = true;
+            continue;
+        }
+        if saw_target_cmd
+            && token.len() > 1
+            && token.starts_with('-')
+            && !looks_like_flag_typo(token)
         {
             return true;
         }
@@ -333,30 +384,44 @@ where
     T: Into<OsString>,
 {
     let raw: Vec<OsString> = itr.into_iter().map(Into::into).collect();
-    if !has_potential_hyphen_option_literal(&raw) {
+    if !has_potential_hyphen_option_literal(&raw) && !has_potential_hyphen_note_positional(&raw) {
         return raw;
     }
 
     let mut root = <Cli as CommandFactory>::command();
     root.build();
 
-    let mut out = Vec::with_capacity(raw.len());
+    let mut out = Vec::with_capacity(raw.len() + 1);
     out.push(raw[0].clone());
 
     let mut cmd: &clap::Command = &root;
     let mut cmd_path: Vec<&str> = Vec::new();
+    let mut deferred_positionals: Vec<OsString> = Vec::new();
+    let mut has_hyphen_positional = false;
     let mut i = 1usize;
 
     while i < raw.len() {
+        let slots = hyphen_positional_slots(&cmd_path);
         let Some(token) = raw[i].to_str() else {
-            out.push(raw[i].clone());
+            if slots > 0 {
+                deferred_positionals.push(raw[i].clone());
+            } else {
+                out.push(raw[i].clone());
+            }
             i += 1;
             continue;
         };
 
         if token == "--" {
-            out.extend_from_slice(&raw[i..]);
-            break;
+            if has_hyphen_positional {
+                out.push(raw[i].clone());
+                out.extend(deferred_positionals.drain(..));
+                out.extend_from_slice(&raw[i + 1..]);
+            } else {
+                out.extend(deferred_positionals.drain(..));
+                out.extend_from_slice(&raw[i..]);
+            }
+            return out;
         }
 
         if let Some(long_rest) = token.strip_prefix("--") {
@@ -377,9 +442,7 @@ where
                         let next_starts_with_dash =
                             next_str.is_some_and(|s| s.len() > 1 && s.starts_with('-'));
                         if is_hyphen_text_option(&cmd_path, name) {
-                            if next_starts_with_dash
-                                && !is_known_flag(cmd, next_str.unwrap())
-                            {
+                            if next_starts_with_dash && !is_known_flag(cmd, next_str.unwrap()) {
                                 let mut combined = raw[i].clone();
                                 combined.push("=");
                                 combined.push(next_os);
@@ -404,6 +467,15 @@ where
                         }
                     }
                 }
+                out.push(raw[i].clone());
+                i += 1;
+                continue;
+            }
+            if slots > 0 && deferred_positionals.len() < slots && !looks_like_flag_typo(token) {
+                deferred_positionals.push(raw[i].clone());
+                has_hyphen_positional = true;
+                i += 1;
+                continue;
             }
             out.push(raw[i].clone());
             i += 1;
@@ -411,22 +483,39 @@ where
         }
 
         if token.len() > 1 && token.starts_with('-') {
+            if !is_known_flag(cmd, token)
+                && slots > 0
+                && deferred_positionals.len() < slots
+                && !looks_like_flag_typo(token)
+            {
+                deferred_positionals.push(raw[i].clone());
+                has_hyphen_positional = true;
+                i += 1;
+                continue;
+            }
             out.push(raw[i].clone());
             i += 1;
             continue;
         }
 
-        if let Some(sub) = cmd.get_subcommands().find(|sc| {
-            sc.get_name() == token || sc.get_all_aliases().any(|alias| alias == token)
-        }) {
-            cmd_path.push(sub.get_name());
-            cmd = sub;
+        if slots == 0 {
+            if let Some(sub) = cmd.get_subcommands().find(|sc| {
+                sc.get_name() == token || sc.get_all_aliases().any(|alias| alias == token)
+            }) {
+                cmd_path.push(sub.get_name());
+                cmd = sub;
+            }
+            out.push(raw[i].clone());
+        } else {
+            deferred_positionals.push(raw[i].clone());
         }
-
-        out.push(raw[i].clone());
         i += 1;
     }
 
+    if has_hyphen_positional {
+        out.push(OsString::from("--"));
+    }
+    out.extend(deferred_positionals);
     out
 }
 
@@ -490,9 +579,25 @@ pub async fn run(cli: Cli) -> Result<()> {
                 if !path.is_dir() {
                     bail!("Directory does not exist: {}", path.display());
                 }
+                let mut persisted = AppConfig::load_from(&crate::config::config_file_path())
+                    .unwrap_or_else(|_| AppConfig {
+                        active_vault: String::new(),
+                        ..AppConfig::default()
+                    });
                 let profile = vault_from_dir(&path, name.as_deref());
-                cfg.upsert_vault(profile.clone(), true);
-                cfg.save()?;
+                let norm_new = crate::config::normalize_path_key(&profile.path);
+                if let Some(conflict) = merged_vaults(&persisted).into_iter().find(|v| {
+                    v.name.eq_ignore_ascii_case(&profile.name)
+                        && crate::config::normalize_path_key(&v.path) != norm_new
+                }) {
+                    bail!(
+                        "Vault name '{}' is already registered for '{}'. Use a different `--name` or remove the existing vault first.",
+                        conflict.name,
+                        conflict.path.display()
+                    );
+                }
+                persisted.register_vault(profile.clone(), true)?;
+                persisted.save()?;
                 let storage = Storage::open_default()?;
                 let stats = storage.sync_vault(&profile)?;
                 if cli.json {
@@ -514,9 +619,14 @@ pub async fn run(cli: Cli) -> Result<()> {
                 Ok(())
             }
             VaultsCmd::Use { name } => {
-                let target = resolve_active_vault(&cfg, Some(&name))?;
-                cfg.active_vault = target.name.clone();
-                cfg.save()?;
+                let mut persisted = AppConfig::load_from(&crate::config::config_file_path())
+                    .unwrap_or_else(|_| AppConfig {
+                        active_vault: String::new(),
+                        ..AppConfig::default()
+                    });
+                let target = resolve_registered_vault(&persisted, &name)?;
+                persisted.active_vault = target.name.clone();
+                persisted.save()?;
                 if cli.json {
                     println!("{}", serde_json::to_string_pretty(&target)?);
                 } else {
@@ -525,8 +635,15 @@ pub async fn run(cli: Cli) -> Result<()> {
                 Ok(())
             }
             VaultsCmd::Remove { name } => {
-                let removed = cfg.remove_vault(&name);
-                cfg.save()?;
+                let mut persisted = AppConfig::load_from(&crate::config::config_file_path())
+                    .unwrap_or_else(|_| AppConfig {
+                        active_vault: String::new(),
+                        ..AppConfig::default()
+                    });
+                let removed = persisted.remove_vault(&name);
+                if removed {
+                    persisted.save()?;
+                }
                 if cli.json {
                     println!("{}", serde_json::to_string_pretty(&json!({ "removed": removed, "name": name }))?);
                 } else if removed {

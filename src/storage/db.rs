@@ -26,9 +26,11 @@ use crate::{
     },
     vault::{
         fs::{
-            canonical_rel_path_in_vault, content_sha256_hex, file_mtime_ns_and_size,
-            folder_from_rel_path, has_symlink_component_in_vault, hydrate_parsed_note_links, move_note,
-            replace_note_text, resolve_note_identifier, resolve_wikilink_target, rewrite_wikilinks_for_move, safe_vault_path,
+            canonical_rel_path_in_vault, content_sha256_hex, extract_local_markdown_note_link,
+            file_mtime_ns_and_size, folder_from_rel_path, has_symlink_component_in_vault,
+            hydrate_parsed_note_links, move_note, replace_note_text,
+            resolve_markdown_link_from_source, resolve_note_identifier,
+            resolve_wikilink_from_source, rewrite_wikilinks_for_move, safe_vault_path,
             scan_vault_markdown_files, title_from_rel_path,
         },
         parser::parse_markdown,
@@ -106,7 +108,8 @@ impl Storage {
                 target_resolved_path TEXT,
                 alias TEXT,
                 heading TEXT,
-                is_embed INTEGER NOT NULL DEFAULT 0
+                is_embed INTEGER NOT NULL DEFAULT 0,
+                link_kind TEXT NOT NULL DEFAULT 'wikilink'
             );
             CREATE INDEX IF NOT EXISTS idx_links_source ON links(vault_id, source_path);
             CREATE INDEX IF NOT EXISTS idx_links_target ON links(vault_id, target_resolved_path);
@@ -162,12 +165,25 @@ impl Storage {
             "ALTER TABLE notes ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''",
             [],
         );
-        // Row metadata produced by the old frontmatter parser needs one rescan.
-        if conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))? == 0 {
+        let _ = conn.execute(
+            "ALTER TABLE links ADD COLUMN link_kind TEXT NOT NULL DEFAULT 'wikilink'",
+            [],
+        );
+        // Schema version bumps trigger one clean rescan when upgrading an older index.db:
+        // v1: frontmatter parser, v2: source-relative wikilink, parser boundaries & local Markdown links (OBS-02/05/06).
+        const CURRENT_INDEX_VERSION: i64 = 2;
+        if conn.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?
+            < CURRENT_INDEX_VERSION
+        {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            if tx.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))? == 0 {
-                tx.execute("UPDATE notes SET mtime_ms = -1, mtime_ns = -1, content_hash = ''", [])?;
-                tx.pragma_update(None, "user_version", 1)?;
+            if tx.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?
+                < CURRENT_INDEX_VERSION
+            {
+                tx.execute(
+                    "UPDATE notes SET mtime_ms = -1, mtime_ns = -1, content_hash = ''",
+                    [],
+                )?;
+                tx.pragma_update(None, "user_version", CURRENT_INDEX_VERSION)?;
             }
             tx.commit()?;
         }
@@ -801,13 +817,18 @@ impl Storage {
                 }
             }
 
-            let mut link_rows: Vec<(i64, String)> = Vec::new();
+            let mut link_rows: Vec<(i64, String, String, String)> = Vec::new();
             {
                 let mut stmt = tx.prepare(
-                    "SELECT id, target_raw FROM links WHERE vault_id = ?1",
+                    "SELECT id, source_path, target_raw, link_kind FROM links WHERE vault_id = ?1",
                 )?;
                 let rows = stmt.query_map(params![vault_id], |r| {
-                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                    ))
                 })?;
                 for r in rows {
                     link_rows.push(r?);
@@ -815,8 +836,17 @@ impl Storage {
             }
 
             let mut upd = tx.prepare("UPDATE links SET target_resolved_path = ?1 WHERE id = ?2")?;
-            for (id, target_raw) in link_rows {
-                let resolved = resolve_wikilink_target(&target_raw, &all_paths, &aliases_by_path);
+            for (id, source_path, target_raw, link_kind) in link_rows {
+                let resolved = if link_kind == "markdown" {
+                    resolve_markdown_link_from_source(&target_raw, &source_path, &all_paths)
+                } else {
+                    resolve_wikilink_from_source(
+                        &target_raw,
+                        &source_path,
+                        &all_paths,
+                        &aliases_by_path,
+                    )
+                };
                 upd.execute(params![resolved, id])?;
             }
         }
@@ -1914,20 +1944,25 @@ fn resolve_affected_links_in_tx(
     }
 
     let mut seen_link_ids: HashSet<i64> = HashSet::new();
-    let mut link_rows: Vec<(i64, String)> = Vec::new();
+    let mut link_rows: Vec<(i64, String, String, String)> = Vec::new();
 
     if !affected_sources.is_empty() {
         let mut stmt = tx.prepare(
-            "SELECT id, target_raw FROM links WHERE vault_id = ?1 AND source_path = ?2",
+            "SELECT id, source_path, target_raw, link_kind FROM links WHERE vault_id = ?1 AND source_path = ?2",
         )?;
         for src in affected_sources {
             let rows = stmt.query_map(params![vault_id, src], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
             })?;
             for r in rows {
-                let (id, target_raw) = r?;
+                let (id, source_path, target_raw, link_kind) = r?;
                 if seen_link_ids.insert(id) {
-                    link_rows.push((id, target_raw));
+                    link_rows.push((id, source_path, target_raw, link_kind));
                 }
             }
         }
@@ -1935,16 +1970,21 @@ fn resolve_affected_links_in_tx(
 
     if !target_set.is_empty() {
         let mut stmt = tx.prepare(
-            "SELECT id, target_raw FROM links WHERE vault_id = ?1 AND target_resolved_path = ?2",
+            "SELECT id, source_path, target_raw, link_kind FROM links WHERE vault_id = ?1 AND target_resolved_path = ?2",
         )?;
         for tgt in &target_set {
             let rows = stmt.query_map(params![vault_id, tgt], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
             })?;
             for r in rows {
-                let (id, target_raw) = r?;
+                let (id, source_path, target_raw, link_kind) = r?;
                 if seen_link_ids.insert(id) {
-                    link_rows.push((id, target_raw));
+                    link_rows.push((id, source_path, target_raw, link_kind));
                 }
             }
         }
@@ -1952,23 +1992,37 @@ fn resolve_affected_links_in_tx(
 
     if resolve_unresolved {
         let mut stmt = tx.prepare(
-            "SELECT id, target_raw FROM links WHERE vault_id = ?1 AND target_resolved_path IS NULL",
+            "SELECT id, source_path, target_raw, link_kind FROM links WHERE vault_id = ?1 AND target_resolved_path IS NULL",
         )?;
         let rows = stmt.query_map(params![vault_id], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
         })?;
         for r in rows {
-            let (id, target_raw) = r?;
+            let (id, source_path, target_raw, link_kind) = r?;
             if seen_link_ids.insert(id) {
-                link_rows.push((id, target_raw));
+                link_rows.push((id, source_path, target_raw, link_kind));
             }
         }
     }
 
     if !link_rows.is_empty() {
         let mut upd = tx.prepare("UPDATE links SET target_resolved_path = ?1 WHERE id = ?2")?;
-        for (id, target_raw) in link_rows {
-            let resolved = resolve_wikilink_target(&target_raw, &all_paths, &aliases_by_path);
+        for (id, source_path, target_raw, link_kind) in link_rows {
+            let resolved = if link_kind == "markdown" {
+                resolve_markdown_link_from_source(&target_raw, &source_path, &all_paths)
+            } else {
+                resolve_wikilink_from_source(
+                    &target_raw,
+                    &source_path,
+                    &all_paths,
+                    &aliases_by_path,
+                )
+            };
             upd.execute(params![resolved, id])?;
         }
     }
@@ -2035,8 +2089,8 @@ fn upsert_note_in_tx(
     for wl in &parsed.wikilinks {
         tx.execute(
             "INSERT INTO links (
-                vault_id, source_path, target_raw, target_resolved_path, alias, heading, is_embed
-             ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6)",
+                vault_id, source_path, target_raw, target_resolved_path, alias, heading, is_embed, link_kind
+             ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, 'wikilink')",
             params![
                 vault_id,
                 rel_path,
@@ -2046,6 +2100,20 @@ fn upsert_note_in_tx(
                 i64::from(wl.is_embed),
             ],
         )?;
+    }
+    for ml in &parsed.md_links {
+        if ml.is_image {
+            continue;
+        }
+        if let Some((target_raw, heading)) = extract_local_markdown_note_link(&ml.url) {
+            let alias = (!ml.label.trim().is_empty()).then(|| ml.label.trim().to_string());
+            tx.execute(
+                "INSERT INTO links (
+                    vault_id, source_path, target_raw, target_resolved_path, alias, heading, is_embed, link_kind
+                 ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, 0, 'markdown')",
+                params![vault_id, rel_path, target_raw, alias, heading],
+            )?;
+        }
     }
 
     tx.execute(

@@ -57,7 +57,10 @@ pub fn build_router(state: Arc<ServeState>) -> Router {
         .route("/api/v1/vaults", get(handle_list_vaults))
         .route("/api/v1/search", get(handle_search))
         .route("/api/v1/notes", get(handle_list_notes).post(handle_create_note))
-        .route("/api/v1/notes/append", post(handle_append_note))
+        .route(
+            "/api/v1/notes/append",
+            get(handle_read_append_note).post(handle_append_note),
+        )
         .route("/api/v1/notes/{*path}", get(handle_read_note))
         .route("/api/v1/daily", post(handle_daily_note))
         .route("/api/v1/backlinks", get(handle_backlinks))
@@ -237,23 +240,37 @@ struct VaultOnlyQuery {
     vault: Option<String>,
 }
 
+async fn handle_read_append_note(
+    State(state): State<Arc<ServeState>>,
+    headers: HeaderMap,
+    Query(q): Query<VaultOnlyQuery>,
+) -> Response {
+    read_note_response(&state, &headers, "append", q.vault.as_deref())
+}
+
 async fn handle_read_note(
     State(state): State<Arc<ServeState>>,
     headers: HeaderMap,
     AxumPath(path): AxumPath<String>,
     Query(q): Query<VaultOnlyQuery>,
 ) -> Response {
-    if let Err(r) = check_auth(&state, &headers) {
+    read_note_response(&state, &headers, &path, q.vault.as_deref())
+}
+
+fn read_note_response(
+    state: &ServeState,
+    headers: &HeaderMap,
+    note_ref: &str,
+    vault_param: Option<&str>,
+) -> Response {
+    if let Err(r) = check_auth(state, headers) {
         return r;
     }
-    let vault = match resolve_req_vault(&state, q.vault.as_deref()) {
+    let vault = match resolve_req_vault(state, vault_param) {
         Ok(v) => v,
         Err(r) => return r,
     };
-    let decoded = urlencoding::decode(&path)
-        .map(|s| s.into_owned())
-        .unwrap_or(path);
-    match state.storage.load_note_detail(&vault, &decoded) {
+    match state.storage.load_note_detail(&vault, note_ref) {
         Ok(detail) => Json(json!({ "ok": true, "note": detail })).into_response(),
         Err(e) => err_resp(StatusCode::NOT_FOUND, &e.to_string()),
     }

@@ -1,6 +1,6 @@
 {
   "name": "@bitefoundry/obsidian-linux-arm64",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Prebuilt bitefoundry-obsidian binary for Linux arm64",
   "repository": {
     "type": "git",

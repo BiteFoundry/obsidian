@@ -63,6 +63,10 @@ struct DaemonRuntimeInfo {
     endpoint: String,
     secret: String,
     vault_name: String,
+    #[serde(default)]
+    vault_id: Option<String>,
+    #[serde(default)]
+    vault_path: Option<String>,
     started_at_unix: u64,
 }
 
@@ -115,10 +119,41 @@ pub struct TuiDaemonConnection {
 
 /// Starts the background daemon process detached if not already running.
 pub async fn start_daemon(vault_override: Option<&str>) -> Result<DaemonStatus> {
+    let cfg = AppConfig::load();
+    let requested_vault = resolve_active_vault(&cfg, vault_override)?;
     let paths = DaemonPaths::current();
+    let running_info = read_runtime_info(&paths.state_file).ok();
     if let Ok(st) = query_status_at(&paths).await {
         if st.running {
-            return Ok(st);
+            let same_vault = if let Some(ref info) = running_info {
+                if let Some(ref running_id) = info.vault_id {
+                    running_id == &requested_vault.id
+                } else if let Some(ref running_path) = info.vault_path {
+                    crate::config::normalize_path_key(Path::new(running_path))
+                        == crate::config::normalize_path_key(&requested_vault.path)
+                } else {
+                    info.vault_name
+                        .eq_ignore_ascii_case(requested_vault.display_name())
+                }
+            } else {
+                st.vault_name
+                    .as_deref()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(requested_vault.display_name()))
+            };
+            if same_vault {
+                return Ok(st);
+            }
+            let running_name = st
+                .vault_name
+                .as_deref()
+                .or_else(|| running_info.as_ref().map(|i| i.vault_name.as_str()))
+                .unwrap_or("unknown");
+            bail!(
+                "Daemon is already running for vault '{}' (pid={}); cannot start for requested vault '{}'. Stop the running daemon first with `bitefoundry-obsidian daemon stop`.",
+                running_name,
+                st.pid.unwrap_or(0),
+                requested_vault.display_name(),
+            );
         }
     }
 
@@ -235,6 +270,8 @@ pub async fn run_daemon_foreground(
         endpoint: addr.to_string(),
         secret: secret.clone(),
         vault_name: vault.display_name().to_string(),
+        vault_id: Some(vault.id.clone()),
+        vault_path: Some(vault.path.to_string_lossy().into_owned()),
         started_at_unix: started_unix,
     };
     write_atomic_0600(&paths.state_file, &serde_json::to_vec_pretty(&info)?)?;

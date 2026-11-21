@@ -8,7 +8,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 pub const APP_DIR_NAME: &str = "obsidian-cli";
@@ -327,6 +327,31 @@ impl AppConfig {
         }
     }
 
+    pub fn register_vault(&mut self, profile: VaultProfile, make_active: bool) -> Result<()> {
+        let norm_new = normalize_path_key(&profile.path);
+        if let Some(conflict) = self.vaults.iter().find(|v| {
+            v.name.eq_ignore_ascii_case(&profile.name)
+                && normalize_path_key(&v.path) != norm_new
+        }) {
+            bail!(
+                "Vault name '{}' is already registered for '{}'. Use a different `--name` or remove the existing vault first.",
+                conflict.name,
+                conflict.path.display()
+            );
+        }
+        if let Some(existing) = self.vaults.iter_mut().find(|v| {
+            v.id.eq_ignore_ascii_case(&profile.id) || normalize_path_key(&v.path) == norm_new
+        }) {
+            *existing = profile.clone();
+        } else {
+            self.vaults.push(profile.clone());
+        }
+        if make_active || self.active_vault.trim().is_empty() {
+            self.active_vault = profile.name;
+        }
+        Ok(())
+    }
+
     pub fn upsert_vault(&mut self, profile: VaultProfile, make_active: bool) {
         let norm_new = normalize_path_key(&profile.path);
         if let Some(existing) = self.vaults.iter_mut().find(|v| {
@@ -345,18 +370,37 @@ impl AppConfig {
 
     pub fn remove_vault(&mut self, name_or_id: &str) -> bool {
         let needle = name_or_id.trim();
-        let before = self.vaults.len();
-        self.vaults.retain(|v| {
-            !v.name.eq_ignore_ascii_case(needle) && !v.id.eq_ignore_ascii_case(needle)
-        });
-        if self.active_vault.eq_ignore_ascii_case(needle) {
-            self.active_vault = self
-                .vaults
-                .first()
-                .map(|v| v.name.clone())
-                .unwrap_or_default();
+        if needle.is_empty() {
+            return false;
         }
-        self.vaults.len() != before
+        let needle_path = normalize_path_key(Path::new(needle));
+        let active = self.active_vault.trim().to_string();
+        let active_path = (!active.is_empty()).then(|| normalize_path_key(Path::new(&active)));
+
+        let mut removed_any = false;
+        let mut removed_active = false;
+        self.vaults.retain(|v| {
+            let v_path = normalize_path_key(&v.path);
+            let matched = v.name.eq_ignore_ascii_case(needle)
+                || v.id.eq_ignore_ascii_case(needle)
+                || v_path == needle_path;
+            if matched {
+                removed_any = true;
+                if !active.is_empty()
+                    && (v.name.eq_ignore_ascii_case(&active)
+                        || v.id.eq_ignore_ascii_case(&active)
+                        || active_path.as_deref() == Some(v_path.as_str()))
+                {
+                    removed_active = true;
+                }
+            }
+            !matched
+        });
+
+        if removed_active || (!active.is_empty() && active.eq_ignore_ascii_case(needle)) {
+            self.active_vault.clear();
+        }
+        removed_any
     }
 
     pub fn find_vault(&self, query: &str) -> Option<&VaultProfile> {

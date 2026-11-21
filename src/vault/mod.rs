@@ -153,16 +153,15 @@ pub fn resolve_active_vault(
     let all = merged_vaults(cfg);
 
     if let Some(spec) = cli_override.map(str::trim).filter(|s| !s.is_empty()) {
-        if let Some(found) = find_vault_in_slice(&all, spec) {
-            return Ok(found.clone());
-        }
-        let direct = PathBuf::from(spec);
-        if direct.is_dir() {
-            return Ok(vault_from_dir(&direct, None));
-        }
-        bail!(
-            "Vault '{spec}' not found. Run `bitefoundry-obsidian vaults list`, `bitefoundry-obsidian vaults add <path>`, or `bitefoundry-obsidian init <dir>`."
-        );
+        return resolve_explicit_vault(&all, spec, "--vault");
+    }
+
+    if let Some(env_spec) = std::env::var("OBSIDIAN_VAULT")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        return resolve_explicit_vault(&all, &env_spec, "OBSIDIAN_VAULT");
     }
 
     if !cfg.active_vault.trim().is_empty() {
@@ -187,6 +186,58 @@ pub fn resolve_active_vault(
     bail!(
         "No Obsidian vaults found. Run `bitefoundry-obsidian init <dir>` to create a starter vault or `bitefoundry-obsidian vaults add <path>` to register an existing vault."
     )
+}
+
+fn resolve_explicit_vault(
+    all: &[VaultProfile],
+    spec: &str,
+    _source: &str,
+) -> Result<VaultProfile> {
+    if let Some(found) = find_vault_in_slice(all, spec) {
+        if found.exists() {
+            return Ok(found.clone());
+        }
+        bail!(
+            "Vault '{}' directory does not exist: {}",
+            found.name,
+            found.path.display()
+        );
+    }
+    let direct = PathBuf::from(spec);
+    if direct.is_dir() {
+        return Ok(vault_from_dir(&direct, None));
+    }
+    bail!(
+        "Vault '{spec}' not found. Run `bitefoundry-obsidian vaults list`, `bitefoundry-obsidian vaults add <path>`, or `bitefoundry-obsidian init <dir>`."
+    );
+}
+
+/// Resolves a vault strictly from registered or auto-discovered vaults (by name, ID, or path).
+/// Unregistered directories are rejected with guidance to run `vaults add`.
+pub fn resolve_registered_vault(cfg: &AppConfig, spec: &str) -> Result<VaultProfile> {
+    let needle = spec.trim();
+    if needle.is_empty() {
+        bail!("Vault selector cannot be empty.");
+    }
+    let all = merged_vaults(cfg);
+    if let Some(found) = find_vault_in_slice(&all, needle) {
+        if found.exists() {
+            return Ok(found.clone());
+        }
+        bail!(
+            "Registered vault '{}' directory does not exist: {}",
+            found.name,
+            found.path.display()
+        );
+    }
+    if Path::new(needle).is_dir() {
+        bail!(
+            "Vault path '{needle}' is not registered. Register it first with `bitefoundry-obsidian vaults add \"{needle}\"`."
+        );
+    }
+    bail!(
+        "Vault '{needle}' is not registered. Run `bitefoundry-obsidian vaults list` or register a directory with `bitefoundry-obsidian vaults add <path>`."
+    );
 }
 
 pub fn vault_from_dir(dir: &Path, custom_name: Option<&str>) -> VaultProfile {
