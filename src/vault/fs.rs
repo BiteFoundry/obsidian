@@ -530,6 +530,166 @@ fn resolve_move_wikilink_target(
     }))
 }
 
+fn normalize_vault_rel_path(base_folder: &str, raw_path: &str) -> Option<String> {
+    let mut components: Vec<&str> = base_folder
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+    for comp in raw_path.split('/') {
+        match comp {
+            "" | "." => {}
+            ".." => {
+                components.pop()?;
+            }
+            _ => components.push(comp),
+        }
+    }
+    (!components.is_empty()).then(|| components.join("/"))
+}
+
+fn has_uri_scheme(raw: &str) -> bool {
+    let Some((scheme, _)) = raw.split_once(':') else {
+        return false;
+    };
+    let mut chars = scheme.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+}
+
+fn decode_markdown_link_path(path_raw: &str) -> Option<String> {
+    let mut unescaped = String::with_capacity(path_raw.len());
+    let mut chars = path_raw.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            if let Some(&next) = chars.peek() {
+                if next.is_ascii_punctuation() {
+                    unescaped.push(chars.next().unwrap());
+                    continue;
+                }
+            }
+        }
+        unescaped.push(ch);
+    }
+    urlencoding::decode(&unescaped).ok().map(std::borrow::Cow::into_owned)
+}
+
+/// Resolves an inline Markdown link destination path from `source_rel` against known vault note paths.
+fn resolve_move_markdown_target(
+    path_raw: &str,
+    source_rel: &str,
+    paths: &[String],
+) -> Option<String> {
+    fn unique<'a>(mut matches: impl Iterator<Item = &'a String>) -> Option<String> {
+        let first = matches.next()?;
+        matches.next().is_none().then(|| first.clone())
+    }
+
+    if path_raw.is_empty() || path_raw.starts_with("//") || has_uri_scheme(path_raw) {
+        return None;
+    }
+
+    let decoded = decode_markdown_link_path(path_raw)?;
+    if decoded.is_empty()
+        || decoded.starts_with("//")
+        || has_uri_scheme(&decoded)
+        || is_image_target(&decoded)
+    {
+        return None;
+    }
+
+    let match_path = |candidate: &str| -> Option<String> {
+        let with_md = if candidate.to_ascii_lowercase().ends_with(".md") {
+            candidate.to_owned()
+        } else {
+            format!("{candidate}.md")
+        };
+        unique(paths.iter().filter(|p| p.eq_ignore_ascii_case(&with_md)))
+    };
+
+    let source_folder = folder_from_rel_path(source_rel);
+
+    if let Some(rooted) = decoded.strip_prefix('/') {
+        let normalized = normalize_vault_rel_path("", rooted)?;
+        return match_path(&normalized);
+    }
+    if decoded.starts_with("./") || decoded.starts_with("../") {
+        let normalized = normalize_vault_rel_path(&source_folder, &decoded)?;
+        return match_path(&normalized);
+    }
+
+    if let Some(normalized) = normalize_vault_rel_path(&source_folder, &decoded) {
+        if let Some(found) = match_path(&normalized) {
+            return Some(found);
+        }
+    }
+    if !source_folder.is_empty() {
+        if let Some(normalized) = normalize_vault_rel_path("", &decoded) {
+            return match_path(&normalized);
+        }
+    }
+    None
+}
+
+fn relative_markdown_path(source_rel: &str, target_rel: &str) -> String {
+    let source_folder = folder_from_rel_path(source_rel);
+    let source_parts: Vec<&str> = source_folder
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+    let target_parts: Vec<&str> = target_rel
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let common_len = source_parts
+        .iter()
+        .zip(target_parts.iter().take(target_parts.len().saturating_sub(1)))
+        .take_while(|(a, b)| a.eq_ignore_ascii_case(b))
+        .count();
+
+    let mut rel_parts: Vec<&str> = Vec::with_capacity(
+        source_parts.len().saturating_sub(common_len) + target_parts.len().saturating_sub(common_len),
+    );
+    for _ in common_len..source_parts.len() {
+        rel_parts.push("..");
+    }
+    for part in &target_parts[common_len..] {
+        rel_parts.push(part);
+    }
+    rel_parts.join("/")
+}
+
+fn encode_markdown_link_path(rel_path: &str, angle_bracketed: bool) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::with_capacity(rel_path.len());
+    for ch in rel_path.chars() {
+        if ch.is_ascii() {
+            let byte = ch as u8;
+            let needs_encode = if angle_bracketed {
+                byte < 0x20
+                    || byte == 0x7F
+                    || matches!(byte, b'%' | b'#' | b'?' | b'<' | b'>' | b'\\')
+            } else {
+                byte <= 0x20
+                    || byte == 0x7F
+                    || matches!(
+                        byte,
+                        b'%' | b'#' | b'?' | b'(' | b')' | b'<' | b'>' | b'"' | b'\\' | b'[' | b']'
+                    )
+            };
+            if needs_encode {
+                let _ = write!(out, "%{byte:02X}");
+            } else {
+                out.push(ch);
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// Resolves an embedded image/attachment target relative to the note folder, vault root, or common attachment dirs.
 pub fn resolve_attachment_path(
     vault_root: &Path,
@@ -979,9 +1139,9 @@ pub fn move_note(vault_root: &Path, src_rel: &str, dst_rel: &str) -> Result<Stri
     Ok(normalized_dst)
 }
 
-/// Rewrites incoming `[[wikilinks]]` across the vault after moving `old_rel` -> `new_rel`,
-/// preserving headings, aliases, embeds, and skipping fenced/inline code.
-/// Returns the number of note files updated on disk.
+/// Rewrites incoming `[[wikilinks]]` and inline Markdown links across the vault after moving
+/// `old_rel` -> `new_rel`, preserving headings, aliases, embeds, titles, fragments, and skipping
+/// fenced/inline code. Returns the number of note files updated on disk.
 pub fn rewrite_wikilinks_for_move(
     vault_root: &Path,
     old_rel: &str,
@@ -1021,12 +1181,12 @@ pub fn rewrite_wikilinks_for_move(
         let Ok(raw) = fs::read_to_string(&entry.abs_path) else {
             continue;
         };
-        if !raw.contains("[[") {
+        if !raw.contains("[[") && !raw.contains("](") {
             continue;
         }
         let source_after = entry.rel_path.as_str();
         let source_before = if source_after == new_rel { old_rel } else { source_after };
-        let replacement = |target_raw: &str| {
+        let wikilink_replacement = |target_raw: &str| {
             let before = resolve_move_wikilink_target(
                 target_raw, source_before, all_paths_before_move, aliases_by_path,
             )?;
@@ -1046,7 +1206,25 @@ pub fn rewrite_wikilinks_for_move(
             let explicit = if path.contains('/') { path.to_owned() } else { format!("/{path}") };
             (resolve_after(&explicit).as_deref() == Some(expected)).then_some(explicit)
         };
-        let Some(rewritten) = rewrite_markdown_wikilinks(&raw, &replacement) else {
+        let markdown_replacement = |path_raw: &str, angle_bracketed: bool| {
+            let before = resolve_move_markdown_target(
+                path_raw, source_before, all_paths_before_move,
+            )?;
+            let expected = if before == old_rel { new_rel } else { &before };
+            let resolve_after = |path: &str| {
+                resolve_move_markdown_target(path, source_after, &all_paths_after)
+            };
+            if resolve_after(path_raw).as_deref() == Some(expected) {
+                return None;
+            }
+
+            let relative = relative_markdown_path(source_after, expected);
+            let encoded = encode_markdown_link_path(&relative, angle_bracketed);
+            (resolve_after(&encoded).as_deref() == Some(expected)).then_some(encoded)
+        };
+        let Some(rewritten) =
+            rewrite_markdown_links(&raw, &wikilink_replacement, &markdown_replacement)
+        else {
             continue;
         };
         write_atomic(&entry.abs_path, rewritten.as_bytes())?;
@@ -1055,9 +1233,10 @@ pub fn rewrite_wikilinks_for_move(
     Ok(updated_notes)
 }
 
-fn rewrite_markdown_wikilinks(
+fn rewrite_markdown_links(
     raw: &str,
-    replacement: &impl Fn(&str) -> Option<String>,
+    wikilink_replacement: &impl Fn(&str) -> Option<String>,
+    markdown_replacement: &impl Fn(&str, bool) -> Option<String>,
 ) -> Option<String> {
     let mut out = String::with_capacity(raw.len());
     let mut changed = false;
@@ -1088,7 +1267,8 @@ fn rewrite_markdown_wikilinks(
             continue;
         }
 
-        let (new_line, line_changed) = rewrite_line_wikilinks(line, replacement);
+        let (new_line, line_changed) =
+            rewrite_line_links(line, wikilink_replacement, markdown_replacement);
         changed |= line_changed;
         out.push_str(&new_line);
         out.push_str(ending);
@@ -1097,9 +1277,193 @@ fn rewrite_markdown_wikilinks(
     changed.then_some(out)
 }
 
-fn rewrite_line_wikilinks(
+fn find_inline_code_end(line: &str, start: usize) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let len = bytes.len();
+    let ticks = bytes[start..].iter().take_while(|&&b| b == b'`').count();
+    if ticks == 0 {
+        return None;
+    }
+    let mut k = start + ticks;
+    while k < len {
+        if bytes[k] == b'`' {
+            let close_ticks = bytes[k..].iter().take_while(|&&b| b == b'`').count();
+            k += close_ticks;
+            if close_ticks == ticks {
+                return Some(k);
+            }
+        } else {
+            k += 1;
+        }
+    }
+    None
+}
+
+fn find_matching_bracket(line: &str, open_bracket: usize) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let len = bytes.len();
+    let mut j = open_bracket + 1;
+    let mut depth = 1usize;
+    while j < len {
+        if bytes[j] == b'\\' && j + 1 < len {
+            j += 2;
+            continue;
+        }
+        if bytes[j] == b'`' {
+            if let Some(end) = find_inline_code_end(line, j) {
+                j = end;
+            } else {
+                j += bytes[j..].iter().take_while(|&&b| b == b'`').count();
+            }
+            continue;
+        }
+        if bytes[j] == b'[' {
+            depth += 1;
+            j += 1;
+        } else if bytes[j] == b']' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(j);
+            }
+            j += 1;
+        } else {
+            j += 1;
+        }
+    }
+    None
+}
+
+struct MarkdownLinkDest {
+    dest_start: usize,
+    dest_end: usize,
+    angle_bracketed: bool,
+    close_end: usize,
+}
+
+fn parse_inline_markdown_link_dest(line: &str, open_paren: usize) -> Option<MarkdownLinkDest> {
+    let bytes = line.as_bytes();
+    let len = bytes.len();
+    let mut j = open_paren + 1;
+    while j < len && matches!(bytes[j], b' ' | b'\t') {
+        j += 1;
+    }
+    if j >= len {
+        return None;
+    }
+
+    let (dest_start, dest_end, angle_bracketed) = if bytes[j] == b'<' {
+        let start = j + 1;
+        j += 1;
+        while j < len {
+            if bytes[j] == b'\\' && j + 1 < len {
+                j += 2;
+                continue;
+            }
+            if bytes[j] == b'>' {
+                break;
+            }
+            if matches!(bytes[j], b'<' | b'\n' | b'\r') {
+                return None;
+            }
+            j += 1;
+        }
+        if j >= len || bytes[j] != b'>' {
+            return None;
+        }
+        let end = j;
+        j += 1;
+        (start, end, true)
+    } else {
+        let start = j;
+        let mut paren_depth = 0usize;
+        while j < len {
+            if bytes[j] == b'\\' && j + 1 < len && bytes[j + 1].is_ascii_punctuation() {
+                j += 2;
+                continue;
+            }
+            if bytes[j] <= b' ' || bytes[j] == 0x7F {
+                break;
+            }
+            if bytes[j] == b'(' {
+                paren_depth += 1;
+                j += 1;
+            } else if bytes[j] == b')' {
+                if paren_depth == 0 {
+                    break;
+                }
+                paren_depth -= 1;
+                j += 1;
+            } else {
+                j += 1;
+            }
+        }
+        if paren_depth != 0 {
+            return None;
+        }
+        (start, j, false)
+    };
+
+    let ws_start = j;
+    while j < len && matches!(bytes[j], b' ' | b'\t') {
+        j += 1;
+    }
+    if j < len && bytes[j] == b')' {
+        return Some(MarkdownLinkDest {
+            dest_start,
+            dest_end,
+            angle_bracketed,
+            close_end: j + 1,
+        });
+    }
+
+    if j > ws_start && j < len && matches!(bytes[j], b'"' | b'\'' | b'(') {
+        let close_delim = match bytes[j] {
+            b'"' => b'"',
+            b'\'' => b'\'',
+            b'(' => b')',
+            _ => unreachable!(),
+        };
+        let is_paren_title = bytes[j] == b'(';
+        j += 1;
+        let mut closed = false;
+        while j < len {
+            if bytes[j] == b'\\' && j + 1 < len {
+                j += 2;
+                continue;
+            }
+            if is_paren_title && bytes[j] == b'(' {
+                return None;
+            }
+            if bytes[j] == close_delim {
+                j += 1;
+                closed = true;
+                break;
+            }
+            j += 1;
+        }
+        if !closed {
+            return None;
+        }
+        while j < len && matches!(bytes[j], b' ' | b'\t') {
+            j += 1;
+        }
+        if j < len && bytes[j] == b')' {
+            return Some(MarkdownLinkDest {
+                dest_start,
+                dest_end,
+                angle_bracketed,
+                close_end: j + 1,
+            });
+        }
+    }
+
+    None
+}
+
+fn rewrite_line_links(
     line: &str,
-    replacement: &impl Fn(&str) -> Option<String>,
+    wikilink_replacement: &impl Fn(&str) -> Option<String>,
+    markdown_replacement: &impl Fn(&str, bool) -> Option<String>,
 ) -> (String, bool) {
     let bytes = line.as_bytes();
     let len = bytes.len();
@@ -1108,23 +1472,23 @@ fn rewrite_line_wikilinks(
     let mut changed = false;
 
     while i < len {
+        // Preserve backslash-escaped delimiters so `\[...](...)` is not treated as a link
+        if bytes[i] == b'\\' && i + 1 < len && matches!(bytes[i + 1], b'\\' | b'[' | b'`') {
+            out.push_str(&line[i..i + 2]);
+            i += 2;
+            continue;
+        }
+
         // Preserve inline code spans verbatim
         if bytes[i] == b'`' {
-            let start = i;
-            let ticks = bytes[i..].iter().take_while(|&&b| b == b'`').count();
-            i += ticks;
-            while i < len {
-                if bytes[i] == b'`' {
-                    let close_ticks = bytes[i..].iter().take_while(|&&b| b == b'`').count();
-                    i += close_ticks;
-                    if close_ticks == ticks {
-                        break;
-                    }
-                } else {
-                    i += 1;
-                }
+            if let Some(end) = find_inline_code_end(line, i) {
+                out.push_str(&line[i..end]);
+                i = end;
+            } else {
+                let ticks = bytes[i..].iter().take_while(|&&b| b == b'`').count();
+                out.push_str(&line[i..i + ticks]);
+                i += ticks;
             }
-            out.push_str(&line[start..i]);
             continue;
         }
 
@@ -1140,7 +1504,7 @@ fn rewrite_line_wikilinks(
                     None => (target_and_heading, None),
                 };
 
-                if let Some(target) = replacement(target_raw) {
+                if let Some(target) = wikilink_replacement(target_raw) {
                     out.push_str("[[");
                     out.push_str(&target);
                     if let Some(h) = heading_opt {
@@ -1160,6 +1524,30 @@ fn rewrite_line_wikilinks(
                 out.push_str(&line[i..i + 2 + rel_close + 2]);
                 i += 2 + rel_close + 2;
                 continue;
+            }
+        }
+
+        if bytes[i] == b'[' {
+            if let Some(close_bracket) = find_matching_bracket(line, i) {
+                if bytes.get(close_bracket + 1) == Some(&b'(') {
+                    if let Some(dest) = parse_inline_markdown_link_dest(line, close_bracket + 1) {
+                        let raw_dest = &line[dest.dest_start..dest.dest_end];
+                        let path_len = raw_dest.find('#').unwrap_or(raw_dest.len());
+                        let path_raw = &raw_dest[..path_len];
+                        if let Some(new_path) =
+                            markdown_replacement(path_raw, dest.angle_bracketed)
+                        {
+                            out.push_str(&line[i..dest.dest_start]);
+                            out.push_str(&new_path);
+                            out.push_str(&line[dest.dest_start + path_len..dest.close_end]);
+                            changed = true;
+                        } else {
+                            out.push_str(&line[i..dest.close_end]);
+                        }
+                        i = dest.close_end;
+                        continue;
+                    }
+                }
             }
         }
 
@@ -1347,5 +1735,41 @@ mod tests {
         let trashed = move_note_to_trash(dir.path(), "Tasks.md").unwrap();
         assert!(!note.exists());
         assert!(trashed.is_file());
+    }
+
+    #[test]
+    fn test_relative_markdown_path_and_encoding() {
+        assert_eq!(
+            relative_markdown_path("Incoming.md", "Archive/Review.md"),
+            "Archive/Review.md"
+        );
+        assert_eq!(
+            relative_markdown_path("Projects/Index.md", "Projects/Renamed Plan.md"),
+            "Renamed Plan.md"
+        );
+        assert_eq!(
+            relative_markdown_path("Projects/Sub/Index.md", "Projects/Other/Target.md"),
+            "../Other/Target.md"
+        );
+        assert_eq!(
+            relative_markdown_path("Projects/Sub/Index.md", "Root.md"),
+            "../../Root.md"
+        );
+        assert_eq!(
+            relative_markdown_path("Archive/Review.md", "Archive/Review.md"),
+            "Review.md"
+        );
+        assert_eq!(
+            encode_markdown_link_path("Archive/Falsify Plan (v2).md", false),
+            "Archive/Falsify%20Plan%20%28v2%29.md"
+        );
+        assert_eq!(
+            encode_markdown_link_path("Archive/Falsify Plan (v2).md", true),
+            "Archive/Falsify Plan (v2).md"
+        );
+        assert_eq!(
+            encode_markdown_link_path("../Projects/계획 초안.md", false),
+            "../Projects/계획%20초안.md"
+        );
     }
 }

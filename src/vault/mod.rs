@@ -161,7 +161,7 @@ pub fn resolve_active_vault(
             return Ok(vault_from_dir(&direct, None));
         }
         bail!(
-            "Vault '{spec}' not found. Run `obsidian vaults list`, `obsidian vaults add <path>`, or `obsidian init <dir>`."
+            "Vault '{spec}' not found. Run `bitefoundry-obsidian vaults list`, `bitefoundry-obsidian vaults add <path>`, or `bitefoundry-obsidian init <dir>`."
         );
     }
 
@@ -185,7 +185,7 @@ pub fn resolve_active_vault(
     }
 
     bail!(
-        "No Obsidian vaults found. Run `obsidian init <dir>` to create a starter vault or `obsidian vaults add <path>` to register an existing vault."
+        "No Obsidian vaults found. Run `bitefoundry-obsidian init <dir>` to create a starter vault or `bitefoundry-obsidian vaults add <path>` to register an existing vault."
     )
 }
 

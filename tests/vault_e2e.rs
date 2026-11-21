@@ -512,7 +512,8 @@ fn mcp_move_note_rewrites_link_targets_and_preserves_other_bytes() {
     assert_eq!(fs::read(root.join("Archive/Review.md")).unwrap(), original.as_bytes());
     let expected = incoming
         .replace("[[Draft#Scope", "[[Archive/Review#Scope")
-        .replace("[[Draft#^keep", "[[Archive/Review#^keep");
+        .replace("[[Draft#^keep", "[[Archive/Review#^keep")
+        .replace("(Inbox/Draft.md#Scope)", "(Archive/Review.md#Scope)");
     assert_eq!(fs::read(root.join("Incoming.md")).unwrap(), expected.as_bytes());
     assert_eq!(fs::read(root.join("Elsewhere/Review.md")).unwrap(), unrelated.as_bytes());
     assert!(mcp.storage.get_note_summary(&vault.id, "Archive/Review.md").unwrap().unwrap().is_bookmarked);
@@ -571,13 +572,408 @@ fn cli_and_mcp_move_respect_source_folder_and_leave_ambiguous_links_verbatim() {
 }
 
 fn isolated_cli(test_root: &std::path::Path, vault: &std::path::Path) -> std::process::Command {
+    let mut command = isolated_cli_base(test_root);
+    command.arg("--vault").arg(vault);
+    command
+}
+
+fn isolated_cli_base(test_root: &std::path::Path) -> std::process::Command {
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_bitefoundry-obsidian"));
     command
         .env("OBSIDIAN_CONFIG_DIR", test_root.join("config"))
         .env("OBSIDIAN_DATA_DIR", test_root.join("data"))
-        .arg("--vault")
-        .arg(vault);
+        .env("OBSIDIAN_APP_CONFIG_PATH", test_root.join("obsidian.json"));
     command
+}
+
+#[test]
+fn cli_and_mcp_move_rewrites_inline_markdown_links_and_preserves_bytes() {
+    for use_mcp in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("vault");
+        fs::create_dir_all(root.join("Projects")).unwrap();
+        fs::create_dir_all(root.join("Notes")).unwrap();
+
+        let plan_body = "# Falsify Plan\n\n## Scope\n\nBody.\n";
+        fs::write(root.join("Projects/Falsify Plan.md"), plan_body).unwrap();
+        fs::write(root.join("Notes/Sibling.md"), "# Sibling\n\n## Top\n").unwrap();
+
+        // Root index with both inline Markdown link and wikilink (matching audit case)
+        let index_before = "[링크](Projects/Falsify%20Plan.md)\n[[Falsify Plan|Wiki]]\n";
+        fs::write(root.join("Index.md"), index_before).unwrap();
+
+        // Markdown-only note (no `[[` at all) with titles, fragments, angle brackets, code, URLs, CRLF, no trailing newline
+        let md_only_before = concat!(
+            "[계획](../Projects/Falsify%20Plan.md#Scope \"제목 (유지)\")\r\n",
+            "[각괄호](<../Projects/Falsify Plan.md#Heading> 'single')\n",
+            "[괄호제목](../Projects/Falsify%20Plan.md (paren))\r\n",
+            "[형제](Sibling.md#Top)\n",
+            "[루트](/Projects/Falsify%20Plan.md)\r\n",
+            "`[코드](../Projects/Falsify%20Plan.md)`\n",
+            "```md\r\n",
+            "[펜스](../Projects/Falsify%20Plan.md)\r\n",
+            "```\n",
+            "[외부](https://example.com/Projects/Falsify%20Plan.md)\r\n",
+            "[메일](mailto:team@example.invalid)"
+        );
+        fs::write(root.join("Notes/OnlyMarkdown.md"), md_only_before).unwrap();
+
+        // Same-depth referrer whose link stays valid when moved to a sibling folder
+        let same_depth_before = "[같은깊이](../Projects/Falsify%20Plan.md)\n";
+        fs::write(root.join("Notes/SameDepth.md"), same_depth_before).unwrap();
+
+        let run_move = |src: &str, dst: &str| -> Value {
+            if use_mcp {
+                let vault = vault_from_dir(&root, Some("fixture"));
+                let mut cfg = AppConfig::default();
+                cfg.upsert_vault(vault.clone(), true);
+                let mcp = McpServer::new(cfg, vault, Storage::open_in_memory().unwrap());
+                mcp.dispatch_tool("move_note", &json!({ "src": src, "dst": dst }))
+                    .unwrap()
+            } else {
+                let output = isolated_cli(tmp.path(), &root)
+                    .args(["--json", "notes", "move", src, dst])
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                serde_json::from_slice(&output.stdout).unwrap()
+            }
+        };
+
+        // 1. Move target note -> updates Index.md, Notes/OnlyMarkdown.md, and Notes/SameDepth.md
+        let moved = run_move("Projects/Falsify Plan.md", "Archive/Renamed Plan.md");
+        assert_eq!(moved["updated_links_in_notes"], 3);
+        assert!(!root.join("Projects/Falsify Plan.md").exists());
+        assert!(root.join("Archive/Renamed Plan.md").is_file());
+
+        let index_after = fs::read_to_string(root.join("Index.md")).unwrap();
+        assert_eq!(
+            index_after,
+            "[링크](Archive/Renamed%20Plan.md)\n[[Renamed Plan|Wiki]]\n"
+        );
+        // Verify both rewritten targets actually open the moved file on disk.
+        let md_dest = index_after
+            .lines()
+            .next()
+            .unwrap()
+            .strip_prefix("[링크](")
+            .unwrap()
+            .strip_suffix(')')
+            .unwrap();
+        let md_decoded = urlencoding::decode(md_dest).unwrap();
+        assert_eq!(fs::read_to_string(root.join(md_decoded.as_ref())).unwrap(), plan_body);
+
+        let vault = vault_from_dir(&root, Some("fixture"));
+        let storage = Storage::open_in_memory().unwrap();
+        storage.sync_vault(&vault).unwrap();
+        assert_eq!(
+            storage.resolve_note_path(&vault.id, "Renamed Plan").unwrap(),
+            "Archive/Renamed Plan.md"
+        );
+
+        let md_only_after_target_move = concat!(
+            "[계획](../Archive/Renamed%20Plan.md#Scope \"제목 (유지)\")\r\n",
+            "[각괄호](<../Archive/Renamed Plan.md#Heading> 'single')\n",
+            "[괄호제목](../Archive/Renamed%20Plan.md (paren))\r\n",
+            "[형제](Sibling.md#Top)\n",
+            "[루트](../Archive/Renamed%20Plan.md)\r\n",
+            "`[코드](../Projects/Falsify%20Plan.md)`\n",
+            "```md\r\n",
+            "[펜스](../Projects/Falsify%20Plan.md)\r\n",
+            "```\n",
+            "[외부](https://example.com/Projects/Falsify%20Plan.md)\r\n",
+            "[메일](mailto:team@example.invalid)"
+        );
+        assert_eq!(
+            fs::read(root.join("Notes/OnlyMarkdown.md")).unwrap(),
+            md_only_after_target_move.as_bytes()
+        );
+        assert_eq!(
+            fs::read(root.join("Notes/SameDepth.md")).unwrap(),
+            "[같은깊이](../Archive/Renamed%20Plan.md)\n".as_bytes()
+        );
+
+        // 2. Move a referring note to a deeper folder -> updates its own broken relative links,
+        //    leaving already-valid rooted link intact.
+        let rooted_addition = format!(
+            "{}\n[절대](/Archive/Renamed%20Plan.md)",
+            md_only_after_target_move
+        );
+        fs::write(root.join("Notes/OnlyMarkdown.md"), &rooted_addition).unwrap();
+        let moved_ref = run_move("Notes/OnlyMarkdown.md", "Deep/Nested/OnlyMarkdown.md");
+        assert_eq!(moved_ref["updated_links_in_notes"], 1);
+        let md_only_after_self_move = concat!(
+            "[계획](../../Archive/Renamed%20Plan.md#Scope \"제목 (유지)\")\r\n",
+            "[각괄호](<../../Archive/Renamed Plan.md#Heading> 'single')\n",
+            "[괄호제목](../../Archive/Renamed%20Plan.md (paren))\r\n",
+            "[형제](../../Notes/Sibling.md#Top)\n",
+            "[루트](../../Archive/Renamed%20Plan.md)\r\n",
+            "`[코드](../Projects/Falsify%20Plan.md)`\n",
+            "```md\r\n",
+            "[펜스](../Projects/Falsify%20Plan.md)\r\n",
+            "```\n",
+            "[외부](https://example.com/Projects/Falsify%20Plan.md)\r\n",
+            "[메일](mailto:team@example.invalid)\n",
+            "[절대](/Archive/Renamed%20Plan.md)"
+        );
+        assert_eq!(
+            fs::read(root.join("Deep/Nested/OnlyMarkdown.md")).unwrap(),
+            md_only_after_self_move.as_bytes()
+        );
+
+        // 3. Move a referring note to a sibling folder at the same depth -> relative path still
+        //    points to the same file, so it is preserved byte-for-byte without rewriting.
+        let moved_same_depth = run_move("Notes/SameDepth.md", "Other/SameDepth.md");
+        assert_eq!(moved_same_depth["updated_links_in_notes"], 0);
+        assert_eq!(
+            fs::read(root.join("Other/SameDepth.md")).unwrap(),
+            "[같은깊이](../Archive/Renamed%20Plan.md)\n".as_bytes()
+        );
+    }
+}
+
+#[test]
+fn cli_hyphen_inputs_write_expected_bytes_and_preserve_flags() {
+    let tmp = tempfile::tempdir().unwrap();
+    let vault = tmp.path().join("vault");
+    fs::create_dir(&vault).unwrap();
+    fs::write(vault.join("AppendNote.md"), "# Append\n원문\n").unwrap();
+    fs::write(vault.join("ReplaceNote.md"), "# Replace\n- 목록 항목\n유지\n").unwrap();
+
+    // 1. `daily --append` accepts Korean bullet and two-line list, plus trailing `--json`.
+    let out = isolated_cli(tmp.path(), &vault)
+        .args([
+            "daily",
+            "--date",
+            "2026-11-20",
+            "--append",
+            "- 목록 항목",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let daily_json: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(daily_json["rel_path"], "Daily Notes/2026-11-20.md");
+
+    let out = isolated_cli(tmp.path(), &vault)
+        .args(["daily", "--date", "2026-11-20", "--append", "- first\n- second"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let daily_bytes = fs::read_to_string(vault.join("Daily Notes/2026-11-20.md")).unwrap();
+    assert!(
+        daily_bytes.ends_with("- 목록 항목\n- first\n- second\n"),
+        "unexpected daily note content:\n{daily_bytes}"
+    );
+
+    // Missing value followed by `--json` or `--help` must fail without writing a file.
+    for bad_args in [
+        &["daily", "--date", "2026-11-21", "--append", "--json"][..],
+        &["daily", "--date", "2026-11-21", "--append", "--help"][..],
+    ] {
+        let bad_daily = isolated_cli(tmp.path(), &vault)
+            .args(bad_args)
+            .output()
+            .unwrap();
+        assert!(!bad_daily.status.success(), "expected failure for {bad_args:?}");
+        assert!(!vault.join("Daily Notes/2026-11-21.md").exists());
+    }
+
+    // Actual help invocation (after a completed hyphen value) prints help with 0 writes.
+    let help_daily = isolated_cli(tmp.path(), &vault)
+        .args(["daily", "--date", "2026-11-21", "--append", "- 목록 항목", "--help"])
+        .output()
+        .unwrap();
+    assert!(help_daily.status.success());
+    assert!(String::from_utf8_lossy(&help_daily.stdout).contains("--append <APPEND>"));
+    assert!(!vault.join("Daily Notes/2026-11-21.md").exists());
+
+    // Explicit `=` allows flag-looking literal text.
+    let eq_daily = isolated_cli(tmp.path(), &vault)
+        .args(["daily", "--date", "2026-11-22", "--append=--json"])
+        .output()
+        .unwrap();
+    assert!(eq_daily.status.success(), "{}", String::from_utf8_lossy(&eq_daily.stderr));
+    assert!(fs::read_to_string(vault.join("Daily Notes/2026-11-22.md"))
+        .unwrap()
+        .ends_with("--json\n"));
+
+    // 2. `notes create` accepts leading-hyphen title and `--content`, preserving missing-value checks.
+    let created = isolated_cli(tmp.path(), &vault)
+        .args([
+            "notes",
+            "create",
+            "- 목록 항목",
+            "--content",
+            "- 첫 줄\n- 둘째 줄",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let created_json: Value = serde_json::from_slice(&created.stdout).unwrap();
+    assert_eq!(created_json["rel_path"], "- 목록 항목.md");
+    let created_disk = fs::read_to_string(vault.join("- 목록 항목.md")).unwrap();
+    assert!(
+        created_disk.ends_with("# - 목록 항목\n\n- 첫 줄\n- 둘째 줄\n"),
+        "unexpected created note:\n{created_disk}"
+    );
+
+    let bad_create = isolated_cli(tmp.path(), &vault)
+        .args(["notes", "create", "ShouldNotExist", "--content", "--json"])
+        .output()
+        .unwrap();
+    assert!(!bad_create.status.success());
+    assert!(!vault.join("ShouldNotExist.md").exists());
+
+    let eq_create = isolated_cli(tmp.path(), &vault)
+        .args(["notes", "create", "FlagBody", "--content=--json"])
+        .output()
+        .unwrap();
+    assert!(eq_create.status.success(), "{}", String::from_utf8_lossy(&eq_create.stderr));
+    assert!(fs::read_to_string(vault.join("FlagBody.md"))
+        .unwrap()
+        .ends_with("--json\n"));
+
+    let sep_create = isolated_cli(tmp.path(), &vault)
+        .args(["notes", "create", "--", "--json"])
+        .output()
+        .unwrap();
+    assert!(sep_create.status.success(), "{}", String::from_utf8_lossy(&sep_create.stderr));
+    assert!(vault.join("--json.md").is_file());
+
+    // 3. `search` accepts leading-hyphen query while preserving `--json` and missing query error.
+    let search = isolated_cli(tmp.path(), &vault)
+        .args(["search", "- 목록 항목", "--json"])
+        .output()
+        .unwrap();
+    assert!(search.status.success(), "{}", String::from_utf8_lossy(&search.stderr));
+    let hits: Value = serde_json::from_slice(&search.stdout).unwrap();
+    assert!(
+        hits.as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h["rel_path"] == "- 목록 항목.md"),
+        "expected created hyphen-title note in search results: {hits}"
+    );
+
+    let bad_search = isolated_cli(tmp.path(), &vault)
+        .args(["search", "--json"])
+        .output()
+        .unwrap();
+    assert!(!bad_search.status.success());
+
+    // 4. Control commands: `notes append` and `notes replace` verified on disk + missing value guards.
+    let append_ok = isolated_cli(tmp.path(), &vault)
+        .args(["notes", "append", "AppendNote", "- 목록 항목\n- 둘째", "--json"])
+        .output()
+        .unwrap();
+    assert!(append_ok.status.success(), "{}", String::from_utf8_lossy(&append_ok.stderr));
+    assert_eq!(
+        fs::read(vault.join("AppendNote.md")).unwrap(),
+        "# Append\n원문\n- 목록 항목\n- 둘째\n".as_bytes()
+    );
+
+    let append_bad = isolated_cli(tmp.path(), &vault)
+        .args(["notes", "append", "AppendNote", "--json"])
+        .output()
+        .unwrap();
+    assert!(!append_bad.status.success());
+    assert_eq!(
+        fs::read(vault.join("AppendNote.md")).unwrap(),
+        "# Append\n원문\n- 목록 항목\n- 둘째\n".as_bytes()
+    );
+
+    let replace_ok = isolated_cli(tmp.path(), &vault)
+        .args([
+            "notes",
+            "replace",
+            "ReplaceNote",
+            "--find",
+            "- 목록 항목",
+            "--replace",
+            "- 수정 항목",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(replace_ok.status.success(), "{}", String::from_utf8_lossy(&replace_ok.stderr));
+    assert_eq!(
+        fs::read(vault.join("ReplaceNote.md")).unwrap(),
+        "# Replace\n- 수정 항목\n유지\n".as_bytes()
+    );
+
+    let replace_bad = isolated_cli(tmp.path(), &vault)
+        .args([
+            "notes",
+            "replace",
+            "ReplaceNote",
+            "--find",
+            "- 수정 항목",
+            "--replace",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(!replace_bad.status.success());
+    assert_eq!(
+        fs::read(vault.join("ReplaceNote.md")).unwrap(),
+        "# Replace\n- 수정 항목\n유지\n".as_bytes()
+    );
+}
+
+#[test]
+fn cli_vault_guidance_uses_current_binary_name() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    // 1. `vaults list` with no discovered or registered vaults
+    let list = isolated_cli_base(tmp.path())
+        .args(["vaults", "list"])
+        .output()
+        .unwrap();
+    assert!(list.status.success(), "{}", String::from_utf8_lossy(&list.stderr));
+    let list_stdout = String::from_utf8_lossy(&list.stdout);
+    assert_eq!(
+        list_stdout.trim(),
+        "No vaults found. Run `bitefoundry-obsidian init <dir>` or `bitefoundry-obsidian vaults add <path>`."
+    );
+
+    // 2. Command requiring an active vault when no vaults exist
+    let empty = isolated_cli_base(tmp.path())
+        .args(["notes", "list"])
+        .output()
+        .unwrap();
+    assert!(!empty.status.success());
+    let empty_stderr = String::from_utf8_lossy(&empty.stderr);
+    assert!(
+        empty_stderr.contains(
+            "No Obsidian vaults found. Run `bitefoundry-obsidian init <dir>` to create a starter vault or `bitefoundry-obsidian vaults add <path>` to register an existing vault."
+        ),
+        "unexpected empty vault stderr: {empty_stderr}"
+    );
+
+    // 3. Explicit `--vault` that does not exist
+    let missing = isolated_cli_base(tmp.path())
+        .args(["--vault", "missing-vault", "notes", "list"])
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    let missing_stderr = String::from_utf8_lossy(&missing.stderr);
+    assert!(
+        missing_stderr.contains(
+            "Vault 'missing-vault' not found. Run `bitefoundry-obsidian vaults list`, `bitefoundry-obsidian vaults add <path>`, or `bitefoundry-obsidian init <dir>`."
+        ),
+        "unexpected missing vault stderr: {missing_stderr}"
+    );
 }
 
 #[test]
