@@ -1290,7 +1290,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{GraphData, GraphEdge, GraphNode};
+    use crate::models::{GraphData, GraphEdge, GraphNode, LinkStatus};
 
     fn make_node(id: &str, depth: usize, deg: usize) -> GraphNode {
         GraphNode {
@@ -1298,6 +1298,7 @@ mod tests {
             title: id.trim_end_matches(".md").to_string(),
             folder: String::new(),
             resolved: true,
+            status: LinkStatus::Resolved,
             depth,
             in_degree: deg,
             out_degree: 0,

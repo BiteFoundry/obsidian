@@ -87,6 +87,14 @@ pub(crate) fn markdown_body_offset(raw: &str) -> usize {
     frontmatter_closing_start(raw, line_end(raw, 0)).map_or(bom_end, |start| line_end(raw, start))
 }
 
+pub(crate) fn read_frontmatter_properties(raw: &str) -> Result<BTreeMap<String, Value>> {
+    let opening_end = line_end(raw, 0);
+    let Some(closing_start) = frontmatter_closing_start(raw, opening_end) else {
+        return Ok(BTreeMap::new());
+    };
+    read_properties(&raw[opening_end..closing_start])
+}
+
 fn frontmatter_closing_start(raw: &str, opening_end: usize) -> Option<usize> {
     if !opening_delimiter(&raw[..opening_end]) {
         return None;
@@ -321,7 +329,7 @@ fn replace_value(
     Ok(())
 }
 
-fn render(value: &Value) -> String {
+pub(crate) fn render(value: &Value) -> String {
     match value {
         Value::String(s)
             if s.starts_with(|ch: char| ch.is_alphabetic() || ch == '_')

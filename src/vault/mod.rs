@@ -15,7 +15,10 @@ use chrono::Local;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::config::{normalize_path_key, write_atomic, AppConfig, VaultProfile};
+use crate::{
+    config::{normalize_path_key, write_atomic, AppConfig, VaultProfile},
+    models::CodedError,
+};
 
 #[derive(Debug, Deserialize)]
 struct NativeObsidianConfig {
@@ -204,9 +207,11 @@ fn resolve_explicit_vault(all: &[VaultProfile], spec: &str, _source: &str) -> Re
     if direct.is_dir() {
         return Ok(vault_from_dir(&direct, None));
     }
-    bail!(
-        "Vault '{spec}' not found. Run `bitefoundry-obsidian vaults list`, `bitefoundry-obsidian vaults add <path>`, or `bitefoundry-obsidian init <dir>`."
-    );
+    Err(CodedError::new(
+        "vault_not_found",
+        format!("Vault '{spec}' not found. Run `bitefoundry-obsidian vaults list`, `bitefoundry-obsidian vaults add <path>`, or `bitefoundry-obsidian init <dir>`."),
+    )
+    .into())
 }
 
 /// Resolves a vault strictly from registered or auto-discovered vaults (by name, ID, or path).

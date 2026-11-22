@@ -10,7 +10,7 @@ use crate::{
     config::{AppConfig, DEFAULT_SERVE_PORT},
     daemon,
     mcp::McpServer,
-    models::{LinkStatus, NoteContent, NoteOmittedCounts, TaskFilter, VaultSummary},
+    models::{CodedError, LinkStatus, NoteContent, NoteOmittedCounts, TaskFilter, VaultSummary},
     serve,
     storage::Storage,
     tui, updater,
@@ -110,7 +110,7 @@ pub enum Commands {
     /// List Markdown checklist tasks across the vault or inside a single note.
     Tasks {
         /// Show only open (`- [ ]`) tasks.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "done")]
         open: bool,
         /// Show only completed (`- [x]`) tasks.
         #[arg(long)]
@@ -915,6 +915,13 @@ pub async fn run(cli: Cli) -> Result<()> {
                     Ok(())
                 }
                 NotesCmd::Append { note, text } => {
+                    if text.is_empty() {
+                        return Err(CodedError::new(
+                            "invalid_argument",
+                            "Text to append must not be empty",
+                        )
+                        .into());
+                    }
                     let rel_path = storage.resolve_note_path(&vault.id, &note)?;
                     let abs = safe_vault_path(&vault.path, &rel_path)?;
                     append_to_note(&abs, &text)?;
@@ -981,7 +988,11 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
                 NotesCmd::Delete { note, yes } => {
                     if !yes {
-                        bail!("Refusing to trash note without --yes");
+                        return Err(CodedError::new(
+                            "confirmation_required",
+                            "Refusing to trash note without --yes",
+                        )
+                        .into());
                     }
                     let rel_path = storage.resolve_note_path(&vault.id, &note)?;
                     let trashed = move_note_to_trash(&vault.path, &rel_path)?;
@@ -1005,27 +1016,40 @@ pub async fn run(cli: Cli) -> Result<()> {
             let vault = resolve_active_vault(&cfg, cli.vault.as_deref())?;
             let storage = Storage::open_default()?;
             let (rel_path, abs, created) = ensure_daily_note(&vault, date.as_deref())?;
+            let mut appended = false;
             if let Some(txt) = append.as_deref().filter(|s| !s.trim().is_empty()) {
                 append_to_note(&abs, txt)?;
+                appended = true;
             }
             storage.sync_vault(&vault)?;
             if cli.json {
-                let note_val = if full {
-                    let detail = storage.load_note_detail(&vault, &rel_path)?;
-                    serde_json::to_value(&detail)?
+                if appended && !full {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({
+                            "rel_path": rel_path,
+                            "created": created,
+                            "appended": true,
+                        }))?
+                    );
                 } else {
-                    let content = storage.load_note_content(&vault, &rel_path)?;
-                    let counts = storage.note_omitted_counts(&vault.id, &content.rel_path)?;
-                    cli_compact_note_json(&content, counts, cli.vault.as_deref())
-                };
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&json!({
-                        "rel_path": rel_path,
-                        "created": created,
-                        "note": note_val,
-                    }))?
-                );
+                    let note_val = if full {
+                        let detail = storage.load_note_detail(&vault, &rel_path)?;
+                        serde_json::to_value(&detail)?
+                    } else {
+                        let content = storage.load_note_content(&vault, &rel_path)?;
+                        let counts = storage.note_omitted_counts(&vault.id, &content.rel_path)?;
+                        cli_compact_note_json(&content, counts, cli.vault.as_deref())
+                    };
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json!({
+                            "rel_path": rel_path,
+                            "created": created,
+                            "note": note_val,
+                        }))?
+                    );
+                }
             } else {
                 let content = storage.load_note_content(&vault, &rel_path)?;
                 println!("{}", content.raw_markdown);
@@ -1095,7 +1119,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 Some(n) => Some(storage.resolve_note_path(&vault.id, n)?),
                 None => None,
             };
-            let graph = storage.get_graph(&vault.id, center.as_deref(), depth)?;
+            let graph = storage.get_graph(&vault, center.as_deref(), depth)?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&graph)?);
             } else {

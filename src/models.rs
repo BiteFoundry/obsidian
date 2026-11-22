@@ -8,6 +8,44 @@ use serde::{Deserialize, Serialize};
 
 pub const POLL_RETRY_SUMMARY: &str = "Watcher idle — retrying on next interval";
 
+/// Machine-readable error carrying a stable code and optional disambiguation candidates.
+#[derive(Debug, Clone)]
+pub struct CodedError {
+    pub code: &'static str,
+    pub message: String,
+    pub candidates: Vec<String>,
+}
+
+impl CodedError {
+    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            candidates: Vec::new(),
+        }
+    }
+
+    pub fn with_candidates(
+        code: &'static str,
+        message: impl Into<String>,
+        candidates: Vec<String>,
+    ) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            candidates,
+        }
+    }
+}
+
+impl std::fmt::Display for CodedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CodedError {}
+
 /// Semantic Obsidian callout type (`> [!tip]`, `> [!warning]`, etc.).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -437,6 +475,8 @@ pub struct GraphNode {
     pub title: String,
     pub folder: String,
     pub resolved: bool,
+    #[serde(default)]
+    pub status: LinkStatus,
     pub depth: usize,
     pub in_degree: usize,
     pub out_degree: usize,

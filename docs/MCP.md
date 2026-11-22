@@ -29,14 +29,14 @@ Existing 0.1.x settings use `"command": "obsidian"` or `"command": "obs"`. Set `
 | 2 | `search_notes` | `query`, `limit?`, `vault?` | SQLite FTS5 search with `<3`-char Korean/CJK `LIKE` fallback (`limit` default 20, clamped `1..200`; response includes `limit`, `returned`, `has_more`, `next_cursor`) |
 | 3 | `read_note` | `note`, `compact?`, `vault?` | Compact by default (`rel_path`, `title`, `raw_markdown`, `mtime_ms`, `omitted`, `hint`); pass `compact: false` for frontmatter, tags, headings, tasks, backlinks & outgoing links |
 | 4 | `list_notes` | `folder?`, `limit?`, `cursor?`, `vault?` | Paginated note list (`limit` `1..500`, default 50; returns `count`, `returned`, `total`, `has_more`, `next_cursor`, `notes`) |
-| 5 | `create_note` | `title`, `folder?`, `content?`, `tags?`, `vault?` | Create a new `.md` note atomically with YAML frontmatter |
+| 5 | `create_note` | `title`, `folder?`, `content?`, `tags?`, `vault?` | Create a new `.md` note atomically with YAML frontmatter (`tags` must be an array of strings and errors if `content` frontmatter already defines `tags`) |
 | 6 | `append_note` | `note`, `text`, `vault?` | Append Markdown text, tasks, or callouts atomically |
 | 7 | `update_frontmatter` | `note`, `properties`, `vault?` | Set or delete (`null`) top-level YAML properties |
 | 8 | `delete_note` | `note`, `confirm` (`true`), `vault?` | Safely move a note into `<vault>/.trash/` (requires `confirm: true`) |
-| 9 | `daily_note` | `date?`, `append?`, `vault?` | Open or create today's Daily Note and optionally append text; returns `created`, `raw_markdown`, `rel_path`, `omitted`, `hint` (call `read_note` with `compact: false` for metadata; each call with `append` appends again) |
+| 9 | `daily_note` | `date?`, `append?`, `vault?` | Open or create today's Daily Note and optionally append text; calls with non-empty `append` return a receipt (`rel_path`, `created`, `appended`, `hint`), while calls without `append` return `rel_path`, `created`, `raw_markdown`, `omitted`, `hint` (call `read_note` with `compact: false` for metadata; each call with `append` appends again) |
 | 10 | `get_backlinks` | `note`, `vault?` | Return incoming linked mentions (backlinks) with snippet context |
 | 11 | `get_outgoing_links` | `note`, `vault?` | Return outgoing wikilinks and embeds with `status` (`resolved`, `attachment`, `ambiguous`, `missing`) and `candidates` |
-| 12 | `get_local_graph` | `note?`, `depth?`, `vault?` | Return local BFS neighborhood (`depth` clamped `1..5`, applied `depth` returned; `in_degree` = distinct referring notes, `out_degree` = distinct targets excluding image embeds/self-links; omitting `note` returns the full vault graph) |
+| 12 | `get_local_graph` | `note?`, `depth?`, `vault?` | Return local BFS neighborhood (`depth` clamped `1..5`, applied `depth` returned; each node includes `status`: `resolved`, `ambiguous`, or `missing`; `in_degree` = distinct referring notes, `out_degree` = distinct targets excluding existing attachments and self-links; omitting `note` returns the full vault graph) |
 | 13 | `list_tags` | `vault?` | List all inline and frontmatter `#tags` with note counts |
 | 14 | `find_by_tag` | `tag`, `vault?` | Find all notes matching a tag (including nested subtags) |
 | 15 | `list_tasks` | `status?`, `note?`, `limit?`, `cursor?`, `vault?` | Paginated checklist tasks (`all`, `open`, `done`; `limit` `1..500`, default 50; returns `count`, `returned`, `total`, `has_more`, `next_cursor`, `tasks`) |

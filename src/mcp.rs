@@ -133,7 +133,7 @@ impl McpServer {
                     .unwrap_or_else(|| json!({}));
                 match self.dispatch_tool(name, &args) {
                     Ok(payload) => {
-                        let text = serde_json::to_string_pretty(&payload)
+                        let text = serde_json::to_string(&payload)
                             .unwrap_or_else(|_| payload.to_string());
                         Some(json!({
                             "jsonrpc": "2.0",
@@ -288,15 +288,22 @@ impl McpServer {
                 let title = req_str(args, "title")?;
                 let folder = args.get("folder").and_then(|v| v.as_str());
                 let content = args.get("content").and_then(|v| v.as_str());
-                let tags: Vec<String> = args
-                    .get("tags")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|i| i.as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                let tags: Vec<String> = match args.get("tags") {
+                    None => Vec::new(),
+                    Some(v) => {
+                        let arr = v
+                            .as_array()
+                            .ok_or_else(|| anyhow!("Invalid 'tags': expected an array of strings"))?;
+                        let mut out = Vec::with_capacity(arr.len());
+                        for item in arr {
+                            let s = item.as_str().ok_or_else(|| {
+                                anyhow!("Invalid 'tags': expected an array of strings")
+                            })?;
+                            out.push(s.to_string());
+                        }
+                        out
+                    }
+                };
                 let (rel_path, _) = create_note(&vault.path, title, folder, content, &tags)?;
                 let _ = self.storage.sync_vault(&vault);
                 Ok(json!({ "created": true, "rel_path": rel_path }))
@@ -382,10 +389,21 @@ impl McpServer {
                 let date = args.get("date").and_then(|v| v.as_str());
                 let append = args.get("append").and_then(|v| v.as_str());
                 let (rel_path, abs, created) = ensure_daily_note(&vault, date)?;
+                let mut appended = false;
                 if let Some(txt) = append.filter(|s| !s.trim().is_empty()) {
                     append_to_note(&abs, txt)?;
+                    appended = true;
                 }
-                let counts = if self.storage.sync_vault(&vault).is_ok() {
+                let synced = self.storage.sync_vault(&vault).is_ok();
+                if appended {
+                    return Ok(json!({
+                        "rel_path": rel_path,
+                        "created": created,
+                        "appended": true,
+                        "hint": mcp_read_note_hint(&rel_path),
+                    }));
+                }
+                let counts = if synced {
                     self.storage.note_omitted_counts(&vault.id, &rel_path).ok()
                 } else {
                     None
@@ -430,9 +448,7 @@ impl McpServer {
                     None => None,
                 };
                 let depth = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(2) as usize;
-                let graph = self
-                    .storage
-                    .get_graph(&vault.id, center.as_deref(), depth)?;
+                let graph = self.storage.get_graph(&vault, center.as_deref(), depth)?;
                 Ok(serde_json::to_value(graph)?)
             }
             "list_tags" => {
@@ -450,15 +466,14 @@ impl McpServer {
             }
             "list_tasks" => {
                 let vault = self.resolve_vault(args)?;
-                let filter = match args
-                    .get("status")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_ascii_lowercase())
-                    .as_deref()
-                {
-                    Some("open") => TaskFilter::Open,
-                    Some("done") => TaskFilter::Done,
-                    _ => TaskFilter::All,
+                let filter = match args.get("status") {
+                    None => TaskFilter::All,
+                    Some(v) => match v.as_str().map(|s| s.to_ascii_lowercase()).as_deref() {
+                        Some("all") => TaskFilter::All,
+                        Some("open") => TaskFilter::Open,
+                        Some("done") => TaskFilter::Done,
+                        _ => bail!("Invalid 'status': expected all, open or done"),
+                    },
                 };
                 let note_path = match args
                     .get("note")
@@ -705,7 +720,7 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "daily_note",
-            "Open or create today's Daily Note (or a specific YYYY-MM-DD date) and optionally append text. The result is the write receipt plus the note body; for metadata call read_note with the returned rel_path and compact:false. Each call with append appends again.",
+            "Open or create today's Daily Note (or a specific YYYY-MM-DD date) and optionally append text. Calls with non-empty append return a receipt (rel_path, created, appended, hint); calls without append return the note body. For full metadata call read_note with the returned rel_path and compact:false. Each call with append appends again.",
             json!({
                 "type": "object",
                 "properties": {

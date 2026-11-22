@@ -14,14 +14,14 @@ use std::{
     time::Instant,
 };
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use crate::{
     config::{ensure_parent, VaultProfile},
     models::{
-        BacklinkEntry, GraphData, GraphEdge, GraphNode, HeadingEntry, IndexStats, LinkStatus,
-        ListPage, NoteContent, NoteDetail, NoteMove, NoteOmittedCounts, NoteSummary,
+        BacklinkEntry, CodedError, GraphData, GraphEdge, GraphNode, HeadingEntry, IndexStats,
+        LinkStatus, ListPage, NoteContent, NoteDetail, NoteMove, NoteOmittedCounts, NoteSummary,
         NoteTextReplacement, OutgoingLinkEntry, ParsedNote, SearchHit, SearchPage, TagCount,
         TaskEntry, TaskFilter,
     },
@@ -29,8 +29,8 @@ use crate::{
         fs::{
             canonical_rel_path_in_vault, content_sha256_hex, extract_local_markdown_note_link,
             file_mtime_and_size, file_mtime_ns_and_size, folder_from_rel_path,
-            has_symlink_component_in_vault, hydrate_parsed_note_links, move_note,
-            normalize_rel_path, replace_note_text, resolve_attachment_staged,
+            has_symlink_component_in_vault, hydrate_parsed_note_links, is_local_attachment_dest,
+            move_note, normalize_rel_path, replace_note_text, resolve_attachment_staged,
             resolve_markdown_link_from_source, resolve_note_identifier,
             resolve_wikilink_from_source, rewrite_wikilinks_for_move, safe_vault_path,
             scan_vault_markdown_files, title_from_rel_path, wikilink_candidates_from_source,
@@ -1509,7 +1509,7 @@ impl Storage {
                 continue;
             }
 
-            if link_kind == "wikilink" && crate::vault::parser::is_image_target(&target_raw) {
+            if link_kind == "wikilink" && is_local_attachment_dest(&target_raw) {
                 if let Some((abs, _)) =
                     resolve_attachment_staged(&vault.path, source_rel_path, &target_raw)
                 {
@@ -1528,18 +1528,6 @@ impl Storage {
                         continue;
                     }
                 }
-                out.push(OutgoingLinkEntry {
-                    target_raw,
-                    target_resolved_path: None,
-                    target_title,
-                    alias,
-                    heading,
-                    is_embed,
-                    resolved: false,
-                    status: LinkStatus::Missing,
-                    candidates: Vec::new(),
-                });
-                continue;
             }
 
             if link_kind == "wikilink" {
@@ -1586,15 +1574,17 @@ impl Storage {
     /// Builds a Local (BFS around `center_rel_path` up to `depth`) or Global (`center_rel_path == None`) Knowledge Graph.
     pub fn get_graph(
         &self,
-        vault_id: &str,
+        vault: &VaultProfile,
         center_rel_path: Option<&str>,
         depth: usize,
     ) -> Result<GraphData> {
         let depth = depth.clamp(1, 5);
+        let (all_paths, aliases_map) = self.all_paths_and_aliases(&vault.id)?;
         let conn = self
             .conn
             .lock()
             .map_err(|_| anyhow!("Storage lock poisoned"))?;
+        let vault_id = vault.id.as_str();
         let tags_map = load_tags_map(&conn, vault_id)?;
 
         // Load all notes metadata
@@ -1615,11 +1605,12 @@ impl Storage {
             }
         }
 
-        // Load all edges (excluding image embeds so graph shows note-to-note connections)
+        // Load all edges (excluding image and existing local attachment embeds so graph shows note-to-note connections)
         let mut all_edges: Vec<(String, String, bool, bool)> = Vec::new();
+        let mut unresolved_status: HashMap<String, LinkStatus> = HashMap::new();
         {
             let mut stmt = conn.prepare(
-                "SELECT source_path, target_raw, target_resolved_path, is_embed
+                "SELECT source_path, target_raw, target_resolved_path, is_embed, link_kind
                  FROM links WHERE vault_id = ?1
                  ORDER BY id ASC",
             )?;
@@ -1629,16 +1620,40 @@ impl Storage {
                     r.get::<_, String>(1)?,
                     r.get::<_, Option<String>>(2)?,
                     r.get::<_, i64>(3)? != 0,
+                    r.get::<_, String>(4)?,
                 ))
             })?;
             for r in rows {
-                let (src, raw, resolved_opt, is_embed) = r?;
+                let (src, raw, resolved_opt, is_embed, link_kind) = r?;
                 if crate::vault::parser::is_image_target(&raw) {
                     continue;
                 }
                 let (target_id, is_resolved) = match resolved_opt {
                     Some(rp) => (rp, true),
-                    None => (format!("unresolved:{raw}"), false),
+                    None => {
+                        if is_local_attachment_dest(&raw)
+                            && resolve_attachment_staged(&vault.path, &src, &raw).is_some()
+                        {
+                            continue;
+                        }
+                        let target_id = format!("unresolved:{raw}");
+                        let is_ambiguous = link_kind == "wikilink"
+                            && wikilink_candidates_from_source(
+                                &raw,
+                                &src,
+                                &all_paths,
+                                &aliases_map,
+                            )
+                            .len()
+                                >= 2;
+                        let entry = unresolved_status
+                            .entry(target_id.clone())
+                            .or_insert(LinkStatus::Missing);
+                        if is_ambiguous {
+                            *entry = LinkStatus::Ambiguous;
+                        }
+                        (target_id, false)
+                    }
                 };
                 if src == target_id {
                     continue;
@@ -1703,6 +1718,7 @@ impl Storage {
                     title: title.clone(),
                     folder: folder.clone(),
                     resolved: true,
+                    status: LinkStatus::Resolved,
                     depth: *d,
                     in_degree: *in_deg.get(id).unwrap_or(&0),
                     out_degree: *out_deg.get(id).unwrap_or(&0),
@@ -1710,11 +1726,16 @@ impl Storage {
                 });
             } else {
                 let raw_name = id.strip_prefix("unresolved:").unwrap_or(id).to_string();
+                let status = unresolved_status
+                    .get(id)
+                    .copied()
+                    .unwrap_or(LinkStatus::Missing);
                 nodes.push(GraphNode {
                     id: id.clone(),
                     title: raw_name,
                     folder: String::new(),
                     resolved: false,
+                    status,
                     depth: *d,
                     in_degree: *in_deg.get(id).unwrap_or(&0),
                     out_degree: 0,
@@ -1981,7 +2002,7 @@ fn page_after<T, K: Ord>(
 fn parse_note_cursor(raw: &str) -> Result<(String, String, String)> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        bail!("Invalid cursor: '{raw}'");
+        return Err(CodedError::new("invalid_argument", format!("Invalid cursor: '{raw}'")).into());
     }
     let folder = folder_from_rel_path(trimmed).to_ascii_lowercase();
     let title = title_from_rel_path(trimmed).to_ascii_lowercase();
@@ -1996,13 +2017,20 @@ fn parse_task_cursor(raw: &str) -> Result<(bool, String, String, usize)> {
     let checked = match checked_str {
         "0" => false,
         "1" => true,
-        _ => bail!("Invalid cursor: '{raw}'"),
+        _ => {
+            return Err(
+                CodedError::new("invalid_argument", format!("Invalid cursor: '{raw}'")).into(),
+            );
+        }
     };
-    let line_no: usize = line_str
-        .parse()
-        .map_err(|_| anyhow!("Invalid cursor: '{raw}'"))?;
+    let line_no: usize = line_str.parse().map_err(|_| {
+        anyhow::Error::from(CodedError::new(
+            "invalid_argument",
+            format!("Invalid cursor: '{raw}'"),
+        ))
+    })?;
     if note_path.trim().is_empty() {
-        bail!("Invalid cursor: '{raw}'");
+        return Err(CodedError::new("invalid_argument", format!("Invalid cursor: '{raw}'")).into());
     }
     let note_title = title_from_rel_path(note_path).to_ascii_lowercase();
     Ok((checked, note_title, note_path.to_string(), line_no))
@@ -2140,6 +2168,20 @@ fn run_fts5_search(
     Ok(out)
 }
 
+fn escape_like_pattern(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            '\\' | '%' | '_' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 fn run_like_search(
     conn: &Connection,
     vault_id: &str,
@@ -2147,23 +2189,23 @@ fn run_like_search(
     limit: usize,
     tags_map: &HashMap<String, Vec<String>>,
 ) -> Result<Vec<SearchHit>> {
-    let pattern = format!("%{}%", query.to_lowercase());
+    let pattern = format!("%{}%", escape_like_pattern(&query.to_lowercase()));
     let mut stmt = conn.prepare(
         "SELECT n.rel_path, n.title, n.folder, n.body_plain, n.word_count, n.mtime_ms
          FROM notes n
          WHERE n.vault_id = ?1
            AND (
-             LOWER(n.title) LIKE ?2
-             OR LOWER(n.rel_path) LIKE ?2
-             OR LOWER(n.aliases_json) LIKE ?2
-             OR LOWER(n.body_plain) LIKE ?2
+             LOWER(n.title) LIKE ?2 ESCAPE '\\'
+             OR LOWER(n.rel_path) LIKE ?2 ESCAPE '\\'
+             OR LOWER(n.aliases_json) LIKE ?2 ESCAPE '\\'
+             OR LOWER(n.body_plain) LIKE ?2 ESCAPE '\\'
              OR EXISTS (
                 SELECT 1 FROM tags t
-                WHERE t.vault_id = n.vault_id AND t.note_path = n.rel_path AND LOWER(t.tag) LIKE ?2
+                WHERE t.vault_id = n.vault_id AND t.note_path = n.rel_path AND LOWER(t.tag) LIKE ?2 ESCAPE '\\'
              )
            )
          ORDER BY
-           CASE WHEN LOWER(n.title) LIKE ?2 THEN 0 ELSE 1 END,
+           CASE WHEN LOWER(n.title) LIKE ?2 ESCAPE '\\' THEN 0 ELSE 1 END,
            n.mtime_ms DESC,
            n.rel_path ASC
          LIMIT ?3",
@@ -2783,7 +2825,7 @@ mod tests {
 
         // Local graph
         let graph = storage
-            .get_graph(&vault.id, Some("Projects/RFC.md"), 2)
+            .get_graph(&vault, Some("Projects/RFC.md"), 2)
             .unwrap();
         assert!(graph.nodes.len() >= 3); // RFC, Storage Engine, Missing Note (unresolved)
 

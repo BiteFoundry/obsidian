@@ -153,7 +153,7 @@ fn test_vault_engine_backlinks_graph_orphans_daily_task_toggle_and_korean_search
 
     // Local graph
     let graph = storage
-        .get_graph(&vault.id, Some("Projects/Q4 Architecture RFC.md"), 2)
+        .get_graph(&vault, Some("Projects/Q4 Architecture RFC.md"), 2)
         .unwrap();
     assert!(graph.nodes.len() >= 3);
     assert!(graph.edges.len() >= 2);
@@ -4174,7 +4174,14 @@ fn regression_obsidian_obs_13_vault_selection_conflicts_and_daemon() {
         "daemon start for VaultB while VaultA daemon runs must fail, stdout={}",
         String::from_utf8_lossy(&start_b_out)
     );
-    let start_b_err = String::from_utf8_lossy(&start_b_err_bytes);
+    assert!(
+        start_b_err_bytes.is_empty(),
+        "expected empty stderr on --json error, got: {}",
+        String::from_utf8_lossy(&start_b_err_bytes)
+    );
+    let start_b_json: Value = serde_json::from_slice(&start_b_out).unwrap();
+    assert_eq!(start_b_json["ok"], false);
+    let start_b_err = start_b_json["error"]["message"].as_str().unwrap_or("");
     assert!(
         start_b_err.contains("VaultA") && start_b_err.contains("VaultB"),
         "daemon conflict error must include both running and requested vault names, got: {start_b_err}"
@@ -4320,7 +4327,7 @@ fn regression_obsidian_obs_02_source_relative_wikilink_index_matches_move() {
     );
 
     let graph = storage
-        .get_graph(&vault.id, Some("LongBetaFolder/Guide.md"), 1)
+        .get_graph(&vault, Some("LongBetaFolder/Guide.md"), 1)
         .unwrap();
     assert!(graph
         .edges
@@ -4664,7 +4671,7 @@ fn regression_obsidian_obs_06_local_markdown_note_links_in_graph() {
         plan_bl.iter().any(|b| b.source_path == "R.md"),
         "Projects/Plan.md must have R.md as backlink: {plan_bl:?}"
     );
-    let graph = storage.get_graph(&vault.id, Some("R.md"), 1).unwrap();
+    let graph = storage.get_graph(&vault, Some("R.md"), 1).unwrap();
     assert!(graph
         .edges
         .iter()
@@ -5315,6 +5322,20 @@ fn regression_obsidian_obs_14_hyphen_titles_and_toggle_task_expected_text() {
         .unwrap()
         .contains("- [ ] - item"));
 
+    // W6: empty --expected-text must run comparison and fail instead of silently skipping
+    let before_empty_expected = fs::read(root.join("Tasks.md")).unwrap();
+    let tog_empty = isolated_cli(tmp.path(), &root)
+        .args(["toggle-task", "Tasks.md", "3", "--expected-text", ""])
+        .output()
+        .unwrap();
+    assert!(!tog_empty.status.success());
+    assert!(
+        String::from_utf8_lossy(&tog_empty.stderr).contains("Task conflict"),
+        "expected Task conflict for empty expected-text, got: {}",
+        String::from_utf8_lossy(&tog_empty.stderr)
+    );
+    assert_eq!(fs::read(root.join("Tasks.md")).unwrap(), before_empty_expected);
+
     // 3. Controls: --help, --json, missing values, and option typo diagnostics remain intact
     let help_read = isolated_cli(tmp.path(), &root)
         .args(["notes", "read", "--help"])
@@ -5591,12 +5612,13 @@ fn plan_daily_note_receipt_appends_once_and_points_to_read_note() {
         )
         .unwrap();
     let expected_keys: std::collections::BTreeSet<String> =
-        ["created", "hint", "omitted", "raw_markdown", "rel_path"]
+        ["appended", "created", "hint", "rel_path"]
             .into_iter()
             .map(String::from)
             .collect();
     assert_eq!(plan_json_keys(&first), expected_keys);
     assert_eq!(first["created"], true);
+    assert_eq!(first["appended"], true);
 
     let rel_path = first["rel_path"].as_str().unwrap().to_string();
     let hint = first["hint"].as_str().unwrap();
@@ -5615,31 +5637,6 @@ fn plan_daily_note_receipt_appends_once_and_points_to_read_note() {
     let compact = mcp
         .dispatch_tool("read_note", &json!({ "note": rel_path }))
         .unwrap();
-
-    assert_eq!(
-        first["omitted"]["fields"],
-        json!(["title", "mtime_ms", "folder", "frontmatter", "word_count"])
-    );
-    for key in [
-        "backlinks",
-        "outgoing_links",
-        "tags",
-        "aliases",
-        "headings",
-        "tasks",
-    ] {
-        assert!(
-            first["omitted"][key].is_u64(),
-            "expected numeric omitted.{key}, got {:?}",
-            first["omitted"][key]
-        );
-        assert_eq!(
-            first["omitted"][key].as_u64().unwrap() as usize,
-            full[key].as_array().unwrap().len(),
-            "omitted.{key} must equal read_note compact:false length"
-        );
-    }
-    assert!(first["omitted"]["tasks"].as_u64().unwrap() >= 1);
 
     let cli_daily_out = isolated_cli(tmp.path(), &root)
         .env("OBSIDIAN_AUTO_DAEMON", "0")
@@ -5667,9 +5664,100 @@ fn plan_daily_note_receipt_appends_once_and_points_to_read_note() {
         .unwrap();
     assert_eq!(second["created"], false);
     assert_eq!(
+        second["omitted"]["fields"],
+        json!(["title", "mtime_ms", "folder", "frontmatter", "word_count"])
+    );
+    for key in [
+        "backlinks",
+        "outgoing_links",
+        "tags",
+        "aliases",
+        "headings",
+        "tasks",
+    ] {
+        assert!(
+            second["omitted"][key].is_u64(),
+            "expected numeric omitted.{key}, got {:?}",
+            second["omitted"][key]
+        );
+        assert_eq!(
+            second["omitted"][key].as_u64().unwrap() as usize,
+            full[key].as_array().unwrap().len(),
+            "omitted.{key} must equal read_note compact:false length"
+        );
+    }
+    assert!(second["omitted"]["tasks"].as_u64().unwrap() >= 1);
+    assert_eq!(
         fs::read_to_string(root.join(&rel_path)).unwrap(),
         disk_after_reads
     );
+
+    // CLI daily --append --json returns minimal receipt; --full preserves full note detail
+    let cli_append_out = isolated_cli(tmp.path(), &root)
+        .env("OBSIDIAN_AUTO_DAEMON", "0")
+        .args([
+            "daily",
+            "--date",
+            "2026-11-22",
+            "--append",
+            "- [ ] receipt",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        cli_append_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cli_append_out.stderr)
+    );
+    let cli_append: Value = serde_json::from_slice(&cli_append_out.stdout).unwrap();
+    assert_eq!(
+        plan_json_keys(&cli_append),
+        ["appended", "created", "rel_path"]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    );
+    assert_eq!(cli_append["appended"], true);
+    assert_eq!(cli_append["created"], true);
+
+    let cli_append_full_out = isolated_cli(tmp.path(), &root)
+        .env("OBSIDIAN_AUTO_DAEMON", "0")
+        .args([
+            "daily",
+            "--date",
+            "2026-11-22",
+            "--append",
+            "- [ ] full",
+            "--json",
+            "--full",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        cli_append_full_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cli_append_full_out.stderr)
+    );
+    let cli_append_full: Value = serde_json::from_slice(&cli_append_full_out.stdout).unwrap();
+    assert!(cli_append_full["note"].get("summary").is_some());
+    assert!(cli_append_full["note"]["parsed"].get("blocks").is_some());
+
+    // Control (F-05a): CLI notes read --json --full keeps parsed.blocks, body_markdown, body_plain
+    let read_full_out = isolated_cli(tmp.path(), &root)
+        .env("OBSIDIAN_AUTO_DAEMON", "0")
+        .args(["notes", "read", &rel_path, "--json", "--full"])
+        .output()
+        .unwrap();
+    assert!(
+        read_full_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&read_full_out.stderr)
+    );
+    let read_full: Value = serde_json::from_slice(&read_full_out.stdout).unwrap();
+    assert!(read_full["parsed"].get("blocks").is_some());
+    assert!(read_full["parsed"].get("body_markdown").is_some());
+    assert!(read_full["parsed"].get("body_plain").is_some());
 }
 
 #[test]
@@ -5902,12 +5990,13 @@ fn plan_outgoing_links_classify_attachment_ambiguous_missing() {
         fs::create_dir_all(root.join(d)).unwrap();
     }
     fs::write(root.join("Attachments/pic.png"), b"png").unwrap();
+    fs::write(root.join("Attachments/doc.pdf"), b"%PDF-1.4").unwrap();
     fs::write(root.join("a/Dup.md"), "A").unwrap();
     fs::write(root.join("b/Dup.md"), "B").unwrap();
     fs::write(root.join("Real.md"), "# Real\n").unwrap();
     fs::write(
         root.join("a/Src.md"),
-        "![[pic.png]]\n![[nope.png]]\n[[Dup]]\n[[Ghost]]\n[[Real]]\n",
+        "![[pic.png]]\n![[doc.pdf]]\n![[nope.png]]\n[[Dup]]\n[[Ghost]]\n[[Real]]\n",
     )
     .unwrap();
     fs::write(root.join("Root.md"), "[[Dup]]\n").unwrap();
@@ -5941,6 +6030,11 @@ fn plan_outgoing_links_classify_attachment_ambiguous_missing() {
     assert_eq!(pic["status"], "attachment");
     assert_eq!(pic["resolved"], true);
     assert_eq!(pic["target_resolved_path"], "Attachments/pic.png");
+
+    let doc = find_entry(&src_json, "doc.pdf");
+    assert_eq!(doc["status"], "attachment");
+    assert_eq!(doc["resolved"], true);
+    assert_eq!(doc["target_resolved_path"], "Attachments/doc.pdf");
 
     let nope = find_entry(&src_json, "nope.png");
     assert_eq!(nope["status"], "missing");
@@ -6006,7 +6100,31 @@ fn plan_outgoing_links_classify_attachment_ambiguous_missing() {
         .iter()
         .find(|n| n["rel_path"] == "a/Src.md")
         .unwrap();
-    assert_eq!(src_summary["outgoing_count"], 5);
+    assert_eq!(src_summary["outgoing_count"], 6);
+
+    // W5: graph excludes existing non-image attachments and marks ambiguous targets
+    let src_graph: Value =
+        serde_json::from_slice(&run(&["graph", "a/Src.md", "--depth", "1", "--json"]).stdout)
+            .unwrap();
+    assert!(
+        !src_graph["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["id"].as_str().unwrap_or("").contains("doc.pdf")),
+        "existing doc.pdf attachment must not appear as a graph node: {src_graph}"
+    );
+    let root_graph: Value =
+        serde_json::from_slice(&run(&["graph", "Root.md", "--depth", "1", "--json"]).stdout)
+            .unwrap();
+    let ambig_node = root_graph["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["id"] == "unresolved:Dup")
+        .unwrap_or_else(|| panic!("missing unresolved:Dup in {root_graph}"));
+    assert_eq!(ambig_node["status"], "ambiguous");
+    assert_eq!(ambig_node["resolved"], false);
 
     fs::remove_file(root.join("Attachments/pic.png")).unwrap();
     let after_del: Value =
@@ -6313,7 +6431,9 @@ fn plan_graph_degrees_depth_and_order_are_exact() {
             .unwrap_or_else(|| panic!("missing node {id} in {g1}"))
     };
     assert_eq!(find_node("unresolved:Ghost")["in_degree"], 2);
+    assert_eq!(find_node("unresolved:Ghost")["status"], "missing");
     assert_eq!(find_node("A.md")["out_degree"], 2);
+    assert_eq!(find_node("A.md")["status"], "resolved");
     assert_eq!(find_node("C.md")["in_degree"], 1);
 
     let g_hi: Value =
@@ -6728,4 +6848,463 @@ fn plan_daemon_status_reports_unknown_note_total_when_stopped() {
         st["total_notes"].is_null(),
         "expected null total_notes, got {st}"
     );
+}
+
+#[test]
+fn move_destination_spelling_does_not_change_link_rewrites() {
+    for use_mcp in [false, true] {
+        let mut control_ref_bytes: Option<Vec<u8>> = None;
+        for dst in [
+            "Sub/TargetMoved.md",
+            "./Sub/TargetMoved.md",
+            "Sub//TargetMoved.md",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("vault");
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join("Target.md"), "# Target\n").unwrap();
+            fs::write(root.join("Ref.md"), "See [[Target]] and [Doc](Target.md)\n").unwrap();
+
+            let (moved, links) = if use_mcp {
+                let mcp = plan_mcp_server(&root);
+                let moved = mcp
+                    .dispatch_tool("move_note", &json!({ "src": "Target.md", "dst": dst }))
+                    .unwrap();
+                let links = mcp
+                    .dispatch_tool("get_outgoing_links", &json!({ "note": "Ref.md" }))
+                    .unwrap()["outgoing_links"]
+                    .clone();
+                (moved, links)
+            } else {
+                let out = isolated_cli(tmp.path(), &root)
+                    .env("OBSIDIAN_AUTO_DAEMON", "0")
+                    .args(["notes", "move", "Target.md", dst, "--json"])
+                    .output()
+                    .unwrap();
+                assert!(
+                    out.status.success(),
+                    "move to {dst} failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let moved: Value = serde_json::from_slice(&out.stdout).unwrap();
+
+                let links_out = isolated_cli(tmp.path(), &root)
+                    .env("OBSIDIAN_AUTO_DAEMON", "0")
+                    .args(["links", "Ref.md", "--json"])
+                    .output()
+                    .unwrap();
+                assert!(
+                    links_out.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&links_out.stderr)
+                );
+                let links: Value = serde_json::from_slice(&links_out.stdout).unwrap();
+                (moved, links)
+            };
+
+            assert_eq!(moved["to"], "Sub/TargetMoved.md", "dst={dst}");
+            let ref_bytes = fs::read(root.join("Ref.md")).unwrap();
+            let ref_text = String::from_utf8(ref_bytes.clone()).unwrap();
+            if let Some(expected) = &control_ref_bytes {
+                assert_eq!(
+                    &ref_bytes, expected,
+                    "Ref.md bytes diverged for dst={dst} (use_mcp={use_mcp})"
+                );
+            } else {
+                assert!(
+                    ref_text.contains("](Sub/TargetMoved.md)"),
+                    "expected rewritten markdown link in control Ref.md, got: {ref_text}"
+                );
+                control_ref_bytes = Some(ref_bytes);
+            }
+
+            let arr = links.as_array().unwrap();
+            assert!(!arr.is_empty());
+            for entry in arr {
+                assert_eq!(
+                    entry["status"], "resolved",
+                    "unresolved link after move to {dst}: {entry}"
+                );
+            }
+        }
+
+        // Index-excluded destinations (bare '.md' and dot-folders) must be rejected without moving.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("vault");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("ToVanish.md"), "# Vanish\n").unwrap();
+        fs::write(root.join("ToDotDir.md"), "# DotDir\n").unwrap();
+
+        for (src, bad_dst) in [
+            ("ToVanish.md", ".md"),
+            ("ToDotDir.md", ".hidden/Lost.md"),
+        ] {
+            if use_mcp {
+                let mcp = plan_mcp_server(&root);
+                assert!(
+                    mcp.dispatch_tool("move_note", &json!({ "src": src, "dst": bad_dst }))
+                        .is_err(),
+                    "expected MCP move to {bad_dst} to fail"
+                );
+                assert!(root.join(src).is_file());
+                assert!(mcp
+                    .dispatch_tool("read_note", &json!({ "note": src }))
+                    .is_ok());
+            } else {
+                let out = isolated_cli(tmp.path(), &root)
+                    .env("OBSIDIAN_AUTO_DAEMON", "0")
+                    .args(["notes", "move", src, bad_dst, "--json"])
+                    .output()
+                    .unwrap();
+                assert_eq!(out.status.code(), Some(1), "expected exit 1 for {bad_dst}");
+                assert!(out.stderr.is_empty());
+                let err_json: Value = serde_json::from_slice(&out.stdout).unwrap();
+                assert_eq!(err_json["ok"], false);
+                assert_eq!(err_json["error"]["code"], "invalid_destination");
+                assert!(root.join(src).is_file());
+
+                let read_out = isolated_cli(tmp.path(), &root)
+                    .env("OBSIDIAN_AUTO_DAEMON", "0")
+                    .args(["notes", "read", src, "--json"])
+                    .output()
+                    .unwrap();
+                assert!(read_out.status.success());
+            }
+        }
+    }
+}
+
+#[test]
+fn move_keeps_non_image_wikilink_embeds_pointing_at_same_file() {
+    for use_mcp in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("vault");
+        fs::create_dir_all(root.join("TeamA/Specs")).unwrap();
+        fs::write(
+            root.join("TeamA/Specs/Hub.md"),
+            "![[./local.pdf]]\n[Local PDF](./local.pdf)\n",
+        )
+        .unwrap();
+        fs::write(root.join("TeamA/Specs/local.pdf"), b"%PDF-1.4").unwrap();
+
+        if use_mcp {
+            let mcp = plan_mcp_server(&root);
+            mcp.dispatch_tool(
+                "move_note",
+                &json!({ "src": "TeamA/Specs/Hub.md", "dst": "TeamB/Specs/Hub.md" }),
+            )
+            .unwrap();
+        } else {
+            let out = isolated_cli(tmp.path(), &root)
+                .env("OBSIDIAN_AUTO_DAEMON", "0")
+                .args([
+                    "notes",
+                    "move",
+                    "TeamA/Specs/Hub.md",
+                    "TeamB/Specs/Hub.md",
+                    "--json",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        assert_eq!(
+            fs::read_to_string(root.join("TeamB/Specs/Hub.md")).unwrap(),
+            "![[TeamA/Specs/local.pdf]]\n[Local PDF](../../TeamA/Specs/local.pdf)\n"
+        );
+    }
+}
+
+#[test]
+fn create_note_keeps_tags_and_reports_real_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("vault");
+    fs::create_dir_all(&root).unwrap();
+
+    let run_cli = |args: &[&str]| {
+        isolated_cli(tmp.path(), &root)
+            .env("OBSIDIAN_AUTO_DAEMON", "0")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+
+    // 1. Frontmatter content + --tags merges tags into existing frontmatter
+    let fm_out = run_cli(&[
+        "notes",
+        "create",
+        "FMWithTags",
+        "--content",
+        "---\nstatus: draft\n---\n\n# FMWithTags\nBody\n",
+        "--tags",
+        "urgent,ops",
+        "--json",
+    ]);
+    assert!(
+        fm_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&fm_out.stderr)
+    );
+    let fm_disk = fs::read_to_string(root.join("FMWithTags.md")).unwrap();
+    assert!(fm_disk.contains("status: draft"), "got:\n{fm_disk}");
+    assert!(fm_disk.contains("tags: [urgent, ops]"), "got:\n{fm_disk}");
+    let tag_out = run_cli(&["tags", "urgent", "--json"]);
+    assert!(tag_out.status.success());
+    let tagged: Value = serde_json::from_slice(&tag_out.stdout).unwrap();
+    assert!(tagged
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|n| n["rel_path"] == "FMWithTags.md"));
+
+    // Conflicting tags in both frontmatter and --tags must fail without writing
+    let conflict_out = run_cli(&[
+        "notes",
+        "create",
+        "ConflictTags",
+        "--content",
+        "---\ntags: [existing]\n---\nBody\n",
+        "--tags",
+        "extra",
+        "--json",
+    ]);
+    assert_eq!(conflict_out.status.code(), Some(1));
+    assert!(conflict_out.stderr.is_empty());
+    let conflict_json: Value = serde_json::from_slice(&conflict_out.stdout).unwrap();
+    assert_eq!(conflict_json["ok"], false);
+    assert_eq!(conflict_json["error"]["code"], "invalid_argument");
+    assert!(!root.join("ConflictTags.md").exists());
+
+    // 2. Horizontal rule `---` without closing frontmatter is not mistaken for frontmatter
+    let hr_out = run_cli(&[
+        "notes",
+        "create",
+        "HRWithTags",
+        "--content",
+        "---\nParagraph under HR\n",
+        "--tags",
+        "hrtag",
+        "--json",
+    ]);
+    assert!(
+        hr_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&hr_out.stderr)
+    );
+    let hr_disk = fs::read_to_string(root.join("HRWithTags.md")).unwrap();
+    assert!(hr_disk.contains("created: "), "got:\n{hr_disk}");
+    assert!(hr_disk.contains("tags: [hrtag]\n"), "got:\n{hr_disk}");
+    assert!(hr_disk.contains("# HRWithTags\n"), "got:\n{hr_disk}");
+    assert!(hr_disk.contains("---\nParagraph under HR\n"), "got:\n{hr_disk}");
+
+    // 3. Leading slash in title returns normalized rel_path matching disk/index
+    let slash_out = run_cli(&[
+        "notes",
+        "create",
+        "/LeadingSlash",
+        "--content",
+        "Body",
+        "--json",
+    ]);
+    assert!(
+        slash_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&slash_out.stderr)
+    );
+    let slash_json: Value = serde_json::from_slice(&slash_out.stdout).unwrap();
+    assert_eq!(slash_json["rel_path"], "LeadingSlash.md");
+    assert!(root.join("LeadingSlash.md").is_file());
+
+    // 4. MCP string tags rejected (isError: true, file not created)
+    let mcp = plan_mcp_server(&root);
+    let rpc_err = mcp
+        .handle_rpc(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "create_note",
+                "arguments": {
+                    "title": "McpStringTags",
+                    "tags": "tag1,tag2",
+                    "content": "Hello"
+                }
+            }
+        }))
+        .unwrap();
+    assert_eq!(rpc_err["result"]["isError"], true);
+    assert!(!root.join("McpStringTags.md").exists());
+
+    // 5. YAML-special tag characters are safely quoted and round-trip as strings
+    mcp.dispatch_tool(
+        "create_note",
+        &json!({
+            "title": "BrokenYaml",
+            "tags": ["normal", "key: value"],
+            "content": "Hello"
+        }),
+    )
+    .unwrap();
+    let yaml_disk = fs::read_to_string(root.join("BrokenYaml.md")).unwrap();
+    assert!(
+        yaml_disk.contains("tags: [normal, \"key: value\"]\n"),
+        "got:\n{yaml_disk}"
+    );
+    let read_back = mcp
+        .dispatch_tool(
+            "read_note",
+            &json!({ "note": "BrokenYaml.md", "compact": false }),
+        )
+        .unwrap();
+    let tags = read_back["tags"].as_array().unwrap();
+    assert_eq!(tags.len(), 2, "expected 2 string tags, got: {read_back}");
+    assert!(tags.iter().any(|t| t == "normal"));
+    assert!(tags.iter().any(|t| t == "key: value"));
+
+    // Control: plain tags format unchanged
+    let plain_out = run_cli(&["notes", "create", "Plain", "--tags", "a,b", "--json"]);
+    assert!(plain_out.status.success());
+    let plain_disk = fs::read_to_string(root.join("Plain.md")).unwrap();
+    assert!(plain_disk.contains("tags: [a, b]\n"), "got:\n{plain_disk}");
+}
+
+#[test]
+fn cli_json_runtime_errors_are_one_stdout_object() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("vault");
+    fs::create_dir_all(root.join("a")).unwrap();
+    fs::create_dir_all(root.join("b")).unwrap();
+    fs::write(root.join("a/Dup.md"), "# A\n").unwrap();
+    fs::write(root.join("b/Dup.md"), "# B\n").unwrap();
+    fs::write(root.join("N.md"), "# N\n").unwrap();
+
+    let run_cli = |args: &[&str]| {
+        isolated_cli(tmp.path(), &root)
+            .env("OBSIDIAN_AUTO_DAEMON", "0")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+
+    // 1. not_found
+    let not_found = run_cli(&["notes", "read", "Nope", "--json"]);
+    assert_eq!(not_found.status.code(), Some(1));
+    assert!(not_found.stderr.is_empty());
+    let nf_json: Value = serde_json::from_slice(&not_found.stdout).unwrap();
+    assert_eq!(nf_json["ok"], false);
+    assert_eq!(nf_json["error"]["code"], "not_found");
+    assert!(nf_json["error"].get("candidates").is_none());
+
+    // 2. ambiguous with candidates
+    let ambig = run_cli(&["notes", "read", "Dup", "--json"]);
+    assert_eq!(ambig.status.code(), Some(1));
+    assert!(ambig.stderr.is_empty());
+    let ambig_json: Value = serde_json::from_slice(&ambig.stdout).unwrap();
+    assert_eq!(ambig_json["ok"], false);
+    assert_eq!(ambig_json["error"]["code"], "ambiguous");
+    assert_eq!(
+        ambig_json["error"]["candidates"],
+        json!(["a/Dup.md", "b/Dup.md"])
+    );
+
+    // 3. confirmation_required
+    let del = run_cli(&["notes", "delete", "N", "--json"]);
+    assert_eq!(del.status.code(), Some(1));
+    assert!(del.stderr.is_empty());
+    let del_json: Value = serde_json::from_slice(&del.stdout).unwrap();
+    assert_eq!(del_json["ok"], false);
+    assert_eq!(del_json["error"]["code"], "confirmation_required");
+
+    // 4. Text mode control unchanged
+    let text_err = run_cli(&["notes", "read", "Nope"]);
+    assert_eq!(text_err.status.code(), Some(1));
+    assert!(text_err.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&text_err.stderr).starts_with("Error: "),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&text_err.stderr)
+    );
+
+    // 5. N.md was not deleted
+    assert!(root.join("N.md").is_file());
+}
+
+#[test]
+fn task_filters_and_empty_append_are_rejected_not_ignored() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("vault");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("Tasks.md"), "- [ ] open item\n- [x] done item\n").unwrap();
+    fs::write(root.join("Orphan.md"), "# Orphan\n").unwrap();
+
+    // 1. MCP list_tasks rejects unknown status instead of silently falling back to all
+    let mcp = plan_mcp_server(&root);
+    assert!(mcp
+        .dispatch_tool("list_tasks", &json!({ "status": "completed" }))
+        .is_err());
+    let done_only = mcp
+        .dispatch_tool("list_tasks", &json!({ "status": "done" }))
+        .unwrap();
+    let done_tasks = done_only["tasks"].as_array().unwrap();
+    assert_eq!(done_tasks.len(), 1);
+    assert_eq!(done_tasks[0]["checked"], true);
+
+    // 2. CLI tasks --open --done fails with clap exit 2
+    let conflict = isolated_cli(tmp.path(), &root)
+        .env("OBSIDIAN_AUTO_DAEMON", "0")
+        .args(["tasks", "--open", "--done"])
+        .output()
+        .unwrap();
+    assert_eq!(conflict.status.code(), Some(2));
+
+    // 4. CLI notes append "" fails with exit 1 and leaves file untouched
+    let before = fs::read(root.join("Orphan.md")).unwrap();
+    let empty_append = isolated_cli(tmp.path(), &root)
+        .env("OBSIDIAN_AUTO_DAEMON", "0")
+        .args(["notes", "append", "Orphan.md", "", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(empty_append.status.code(), Some(1));
+    assert!(empty_append.stderr.is_empty());
+    let err_json: Value = serde_json::from_slice(&empty_append.stdout).unwrap();
+    assert_eq!(err_json["ok"], false);
+    assert_eq!(err_json["error"]["code"], "invalid_argument");
+    assert_eq!(fs::read(root.join("Orphan.md")).unwrap(), before);
+}
+
+#[test]
+fn search_like_fallback_treats_percent_and_underscore_literally() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("vault");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("OnlyAXB.md"), "Contains aXb only.\n").unwrap();
+    fs::write(root.join("Literal.md"), "Contains a_b and 100%.\n").unwrap();
+
+    let run_search = |query: &str| -> Vec<String> {
+        let out = isolated_cli(tmp.path(), &root)
+            .env("OBSIDIAN_AUTO_DAEMON", "0")
+            .args(["search", query, "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let val: Value = serde_json::from_slice(&out.stdout).unwrap();
+        val["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["rel_path"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    assert_eq!(run_search("a_b"), vec!["Literal.md".to_string()]);
+    assert_eq!(run_search("%"), vec!["Literal.md".to_string()]);
 }

@@ -472,7 +472,7 @@ async fn handle_graph(
         None => None,
     };
     let depth = q.depth.unwrap_or(2).clamp(1, 5);
-    match state.storage.get_graph(&vault.id, center.as_deref(), depth) {
+    match state.storage.get_graph(&vault, center.as_deref(), depth) {
         Ok(graph) => Json(json!({ "ok": true, "graph": graph })).into_response(),
         Err(e) => err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }

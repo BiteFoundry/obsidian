@@ -12,13 +12,13 @@ use std::{
     time::UNIX_EPOCH,
 };
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::Local;
 use sha2::{Digest, Sha256};
 
 use crate::{
     config::{ensure_parent, write_atomic, VaultProfile},
-    models::{InlineSpan, NoteBlock, NoteImageRef, ParsedNote},
+    models::{CodedError, InlineSpan, NoteBlock, NoteImageRef, ParsedNote},
     vault::parser::{
         find_inline_code_end, find_matching_bracket, is_code_fence_opener, is_image_target,
         mime_type_for_path, parse_inline_markdown_link_dest, parse_single_task_line,
@@ -762,7 +762,7 @@ fn resolve_move_markdown_target_staged(
 }
 
 /// True for a local destination whose last segment has an extension other than .md.
-fn is_local_attachment_dest(decoded: &str) -> bool {
+pub(crate) fn is_local_attachment_dest(decoded: &str) -> bool {
     let trimmed = decoded.trim().trim_matches(['<', '>']);
     let path_part = trimmed
         .split('#')
@@ -1131,7 +1131,11 @@ pub fn toggle_task_at_line_verified(
     let parsed = crate::vault::parser::parse_markdown("", "", &raw);
     let Some(indexed_task) = parsed.tasks.iter().find(|t| t.line_no == line_no) else {
         let preview = &raw[line_start..line_end];
-        bail!("Line {line_no} does not contain a Markdown task checkbox: {preview}");
+        return Err(CodedError::new(
+            "invalid_argument",
+            format!("Line {line_no} does not contain a Markdown task checkbox: {preview}"),
+        )
+        .into());
     };
 
     let bom_offset = if line_no == 1 && raw[line_start..line_end].starts_with('\u{feff}') {
@@ -1141,25 +1145,37 @@ pub fn toggle_task_at_line_verified(
     };
     let line_for_parse = &raw[line_start + bom_offset..line_end];
     let Some((was_checked, clean_text, raw_text)) = parse_single_task_line(line_for_parse) else {
-        bail!("Line {line_no} does not contain a Markdown task checkbox: {line_for_parse}");
+        return Err(CodedError::new(
+            "invalid_argument",
+            format!("Line {line_no} does not contain a Markdown task checkbox: {line_for_parse}"),
+        )
+        .into());
     };
-    if let Some(exp_text) = expected_text.map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(exp_text) = expected_text.map(str::trim) {
         if clean_text.trim() != exp_text
             && raw_text.trim() != exp_text
             && indexed_task.text.trim() != exp_text
         {
-            bail!(
-                "Task conflict at line {line_no}: expected '{exp_text}', found '{clean_text}' (file modified externally)"
-            );
+            return Err(CodedError::new(
+                "conflict",
+                format!(
+                    "Task conflict at line {line_no}: expected '{exp_text}', found '{clean_text}' (file modified externally)"
+                ),
+            )
+            .into());
         }
     }
     if let Some(exp_checked) = expected_checked {
         if was_checked != exp_checked {
-            bail!(
-                "Task conflict at line {line_no}: checkbox state changed externally (expected {}, found {})",
-                if exp_checked { "[x]" } else { "[ ]" },
-                if was_checked { "[x]" } else { "[ ]" }
-            );
+            return Err(CodedError::new(
+                "conflict",
+                format!(
+                    "Task conflict at line {line_no}: checkbox state changed externally (expected {}, found {})",
+                    if exp_checked { "[x]" } else { "[ ]" },
+                    if was_checked { "[x]" } else { "[ ]" }
+                ),
+            )
+            .into());
         }
     }
 
@@ -1171,7 +1187,13 @@ pub fn toggle_task_at_line_verified(
         {
             (pos + 1, b' ', false)
         } else {
-            bail!("Line {line_no} does not contain a Markdown task checkbox: {line_for_parse}");
+            return Err(CodedError::new(
+                "invalid_argument",
+                format!(
+                    "Line {line_no} does not contain a Markdown task checkbox: {line_for_parse}"
+                ),
+            )
+            .into());
         };
 
     let mut out_bytes = raw.into_bytes();
@@ -1203,7 +1225,7 @@ pub fn create_note(
 ) -> Result<(String, PathBuf)> {
     let clean_title = sanitize_note_filename(title);
     if clean_title.is_empty() {
-        bail!("Note title cannot be empty");
+        return Err(CodedError::new("invalid_argument", "Note title cannot be empty").into());
     }
     let rel_path = match folder.map(str::trim).filter(|f| !f.is_empty()) {
         Some(f) => {
@@ -1222,31 +1244,62 @@ pub fn create_note(
             }
         }
     };
+    let Some(rel_path) = normalize_vault_rel_path("", &rel_path) else {
+        return Err(CodedError::new("invalid_argument", "Note title cannot be empty").into());
+    };
 
     let abs_path = safe_vault_path(vault_root, &rel_path)?;
     if abs_path.exists() {
-        bail!("Note already exists: {rel_path}");
+        return Err(CodedError::new(
+            "already_exists",
+            format!("Note already exists: {rel_path}"),
+        )
+        .into());
     }
 
     let today = Local::now().format("%Y-%m-%d").to_string();
     let display_title = title_from_rel_path(&rel_path);
+    let clean_tags: Vec<String> = tags
+        .iter()
+        .map(|t| t.trim().trim_start_matches('#').to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let rendered_tags = (!clean_tags.is_empty()).then(|| {
+        serde_json::Value::Array(
+            clean_tags
+                .into_iter()
+                .map(serde_json::Value::String)
+                .collect(),
+        )
+    });
     let mut body = String::new();
     if let Some(c) = content {
-        let trimmed = c.trim_start();
-        if trimmed.starts_with("---") {
-            body.push_str(c);
+        let bom_len = c.len() - c.trim_start_matches('\u{feff}').len();
+        if super::frontmatter::markdown_body_offset(c) > bom_len {
+            if let Some(tags_val) = rendered_tags {
+                let existing = super::frontmatter::read_frontmatter_properties(c)?;
+                if existing.contains_key("tags") {
+                    return Err(CodedError::new(
+                        "invalid_argument",
+                        "Content frontmatter already defines tags; remove --tags or the frontmatter tags",
+                    )
+                    .into());
+                }
+                let mut updates = std::collections::BTreeMap::new();
+                updates.insert("tags".to_string(), tags_val);
+                body = upsert_frontmatter_in_markdown(c, &updates)?;
+            } else {
+                body.push_str(c);
+            }
         } else {
+            let trimmed = c.trim_start();
             body.push_str("---\n");
             body.push_str(&format!("created: {today}\n"));
-            if !tags.is_empty() {
-                let clean_tags: Vec<String> = tags
-                    .iter()
-                    .map(|t| t.trim().trim_start_matches('#').to_string())
-                    .filter(|t| !t.is_empty())
-                    .collect();
-                if !clean_tags.is_empty() {
-                    body.push_str(&format!("tags: [{}]\n", clean_tags.join(", ")));
-                }
+            if let Some(tags_val) = rendered_tags {
+                body.push_str(&format!(
+                    "tags: {}\n",
+                    super::frontmatter::render(&tags_val)
+                ));
             }
             body.push_str("---\n\n");
             if !trimmed.starts_with("# ") {
@@ -1257,15 +1310,11 @@ pub fn create_note(
     } else {
         body.push_str("---\n");
         body.push_str(&format!("created: {today}\n"));
-        if !tags.is_empty() {
-            let clean_tags: Vec<String> = tags
-                .iter()
-                .map(|t| t.trim().trim_start_matches('#').to_string())
-                .filter(|t| !t.is_empty())
-                .collect();
-            if !clean_tags.is_empty() {
-                body.push_str(&format!("tags: [{}]\n", clean_tags.join(", ")));
-            }
+        if let Some(tags_val) = rendered_tags {
+            body.push_str(&format!(
+                "tags: {}\n",
+                super::frontmatter::render(&tags_val)
+            ));
         }
         body.push_str("---\n\n");
         body.push_str(&format!("# {display_title}\n\n"));
@@ -1304,7 +1353,12 @@ pub(crate) fn replace_note_text(abs_path: &Path, find: &str, replace: &str) -> R
     let first_char_len = find
         .chars()
         .next()
-        .context("Search text must contain at least one character")?
+        .ok_or_else(|| {
+            anyhow::Error::from(CodedError::new(
+                "invalid_argument",
+                "Search text must contain at least one character",
+            ))
+        })?
         .len_utf8();
     let raw = fs::read_to_string(abs_path)
         .with_context(|| format!("Failed to read note: {}", abs_path.display()))?;
@@ -1384,16 +1438,37 @@ pub fn move_note(vault_root: &Path, src_rel: &str, dst_rel: &str) -> Result<Stri
     if !src.is_file() {
         bail!("Source note not found: {src_rel}");
     }
-    let normalized_dst = if dst_rel.to_ascii_lowercase().ends_with(".md") {
-        dst_rel
-            .replace('\\', "/")
-            .trim_start_matches('/')
-            .to_string()
+    let raw_dst = dst_rel.replace('\\', "/");
+    let with_md = if raw_dst.to_ascii_lowercase().ends_with(".md") {
+        raw_dst
     } else {
-        format!("{}.md", dst_rel.replace('\\', "/").trim_start_matches('/'))
+        format!("{raw_dst}.md")
+    };
+    let Some(normalized_dst) = normalize_vault_rel_path("", &with_md) else {
+        return Err(CodedError::new(
+            "invalid_destination",
+            format!("Destination must be a path within the vault: {dst_rel}"),
+        )
+        .into());
     };
     if cfg!(windows) && normalized_dst.contains(':') {
-        bail!("Destination must be a path within the vault: {dst_rel}");
+        return Err(CodedError::new(
+            "invalid_destination",
+            format!("Destination must be a path within the vault: {dst_rel}"),
+        )
+        .into());
+    }
+    let has_ignored_dir = normalized_dst
+        .rsplit_once('/')
+        .is_some_and(|(dir, _)| dir.split('/').any(is_ignored_dir_name));
+    if has_ignored_dir || !is_markdown_file_path(&normalized_dst) {
+        return Err(CodedError::new(
+            "invalid_destination",
+            format!(
+                "Destination is outside the vault index: {normalized_dst} (dot-folders and a bare '.md' name are not indexed)"
+            ),
+        )
+        .into());
     }
     let dst = safe_vault_path(vault_root, &normalized_dst)?;
     let mut case_only_same_dir_rename = false;
@@ -1414,7 +1489,11 @@ pub fn move_note(vault_root: &Path, src_rel: &str, dst_rel: &str) -> Result<Stri
             if same_canonical_entry {
                 case_only_same_dir_rename = true;
             } else {
-                bail!("Destination note already exists: {normalized_dst}");
+                return Err(CodedError::new(
+                    "already_exists",
+                    format!("Destination note already exists: {normalized_dst}"),
+                )
+                .into());
             }
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -1430,7 +1509,11 @@ pub fn move_note(vault_root: &Path, src_rel: &str, dst_rel: &str) -> Result<Stri
         .starts_with(vault_root.canonicalize()?)
         || has_symlink_component_in_vault(vault_root, &normalized_dst)
     {
-        bail!("Destination must be a path within the vault: {dst_rel}");
+        return Err(CodedError::new(
+            "invalid_destination",
+            format!("Destination must be a path within the vault: {dst_rel}"),
+        )
+        .into());
     }
     ensure_parent(&dst)?;
     if case_only_same_dir_rename {
@@ -1517,22 +1600,37 @@ pub fn rewrite_wikilinks_for_move(
         };
         let is_case_only_rename = old_rel != new_rel && old_rel.eq_ignore_ascii_case(new_rel);
         let wikilink_replacement = |target_raw: &str| {
-            if source_after == new_rel && is_image_target(target_raw) {
-                let (before_abs, _) = resolve_attachment_staged(vault_root, old_rel, target_raw)?;
-                if let Some((after_abs, _)) =
-                    resolve_attachment_staged(vault_root, new_rel, target_raw)
+            if source_after == new_rel
+                && (is_image_target(target_raw)
+                    || (is_local_attachment_dest(target_raw)
+                        && resolve_move_wikilink_target(
+                            target_raw,
+                            source_before,
+                            all_paths_before_move,
+                            aliases_by_path,
+                        )
+                        .is_none()))
+            {
+                if let Some((before_abs, base)) =
+                    resolve_attachment_staged(vault_root, old_rel, target_raw)
                 {
-                    if same_file(&before_abs, &after_abs) {
-                        return None;
+                    if let Some((after_abs, after_base)) =
+                        resolve_attachment_staged(vault_root, new_rel, target_raw)
+                    {
+                        if same_file(&before_abs, &after_abs)
+                            && (base != PathBase::Explicit || after_base == PathBase::Explicit)
+                        {
+                            return None;
+                        }
                     }
+                    let cand1 = normalize_rel_path(before_abs.strip_prefix(vault_root).ok()?);
+                    if resolve_attachment_staged(vault_root, new_rel, &cand1)
+                        .is_some_and(|(abs, _)| same_file(&before_abs, &abs))
+                    {
+                        return Some(cand1);
+                    }
+                    return Some(format!("/{cand1}"));
                 }
-                let cand1 = normalize_rel_path(before_abs.strip_prefix(vault_root).ok()?);
-                if resolve_attachment_staged(vault_root, new_rel, &cand1)
-                    .is_some_and(|(abs, _)| same_file(&before_abs, &abs))
-                {
-                    return Some(cand1);
-                }
-                return Some(format!("/{cand1}"));
             }
             let before = resolve_move_wikilink_target(
                 target_raw,
@@ -1927,17 +2025,23 @@ pub fn resolve_note_identifier(
 ) -> Result<String> {
     let mut candidates = note_identifier_candidates(input, all_rel_paths, aliases_by_path);
     match candidates.len() {
-        0 => Err(anyhow!("Note not found in vault: '{input}'")),
+        0 => Err(CodedError::new("not_found", format!("Note not found in vault: '{input}'")).into()),
         1 => Ok(candidates.remove(0)),
         n => {
+            let preview_candidates: Vec<String> = candidates.iter().take(10).cloned().collect();
             let preview = if n > 10 {
-                format!("{}, +{} more", candidates[..10].join(", "), n - 10)
+                format!("{}, +{} more", preview_candidates.join(", "), n - 10)
             } else {
-                candidates.join(", ")
+                preview_candidates.join(", ")
             };
-            Err(anyhow!(
-                "Ambiguous note reference '{input}': {n} notes match ({preview}). Use a vault-relative path."
-            ))
+            Err(CodedError::with_candidates(
+                "ambiguous",
+                format!(
+                    "Ambiguous note reference '{input}': {n} notes match ({preview}). Use a vault-relative path."
+                ),
+                preview_candidates,
+            )
+            .into())
         }
     }
 }

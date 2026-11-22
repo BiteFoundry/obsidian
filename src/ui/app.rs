@@ -416,7 +416,7 @@ impl AppState {
         };
         self.graph = self
             .storage
-            .get_graph(&self.active_vault.id, center.as_deref(), ui.graph_depth)
+            .get_graph(&self.active_vault, center.as_deref(), ui.graph_depth)
             .unwrap_or_default();
         ui.graph_sim.sync_from_graph(&self.graph);
     }
