@@ -798,6 +798,68 @@ fn classify_notify_event(
     out
 }
 
+/// What one batch did to the locked-file retry map.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RetryPlan {
+    /// Locked paths that got another retry scheduled by this batch.
+    scheduled: usize,
+    /// Locked paths dropped because they already used `MAX_LOCKED_RETRIES` retries.
+    gave_up: usize,
+}
+
+/// Updates the bounded retry counters after an incremental batch.
+///
+/// - a path that was attempted and is no longer locked is removed (it synced or vanished);
+/// - a path that was not attempted is left alone, so an unrelated batch cannot drop its retry;
+/// - a locked path below `MAX_LOCKED_RETRIES` is counted and scheduled again;
+/// - a locked path already at the limit is removed (give up).
+///
+/// When the batch escalated to a full sync (`was_full`) nothing counts as attempted, because a
+/// full sync does not report which files were locked.
+fn update_locked_retries(
+    retries: &mut HashMap<String, u8>,
+    attempted: &HashSet<String>,
+    locked: Vec<String>,
+    was_full: bool,
+) -> RetryPlan {
+    let mut plan = RetryPlan::default();
+    if was_full {
+        return plan;
+    }
+    let locked: HashSet<String> = locked.into_iter().collect();
+    retries.retain(|path, _| !attempted.contains(path) || locked.contains(path));
+    for path in locked {
+        let count = retries.entry(path.clone()).or_insert(0);
+        if *count < MAX_LOCKED_RETRIES {
+            *count += 1;
+            plan.scheduled += 1;
+        } else {
+            retries.remove(&path);
+            plan.gave_up += 1;
+        }
+    }
+    plan
+}
+
+/// The retry timer after a batch: restarted when a retry was scheduled, cleared when nothing is
+/// pending, otherwise the existing deadline is kept (or armed if there was none), so the timer
+/// is never armed with an empty map and never idle with a pending retry.
+fn next_retry_deadline(
+    retries_empty: bool,
+    current: Option<Instant>,
+    scheduled: bool,
+    now: Instant,
+) -> Option<Instant> {
+    let fresh = now + Duration::from_millis(LOCKED_FILE_RETRY_MS);
+    if scheduled {
+        Some(fresh)
+    } else if retries_empty {
+        None
+    } else {
+        current.or(Some(fresh))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn process_batch(
     batch: PendingBatch,
@@ -826,12 +888,18 @@ async fn process_batch(
         )
         .await;
         diag.post_init_full_scans.fetch_add(1, Ordering::Relaxed);
+        // A full sync skips locked files without reporting them, so pending retries stay due.
+        *retry_at =
+            next_retry_deadline(locked_retries.is_empty(), *retry_at, false, Instant::now());
         return;
     }
 
     let vault_clone = vault.clone();
     let storage_clone = storage.clone();
     let mut md_paths: Vec<String> = batch.md_paths.into_iter().collect();
+    // The paths this batch asks `sync_paths` to look at. A pending retry outside this set was
+    // not attempted, so this batch says nothing about whether it is still locked.
+    let attempted: HashSet<String> = md_paths.iter().cloned().collect();
     let html_paths: Vec<String> = batch.html_paths.into_iter().collect();
     let dir_created: Vec<String> = batch.dir_created_or_renamed.into_iter().collect();
     let dir_removed: Vec<String> = batch.dir_removed_or_renamed.into_iter().collect();
@@ -964,24 +1032,15 @@ async fn process_batch(
             }
 
             // Update bounded retries for transiently locked files.
-            let locked_set: HashSet<String> = locked.into_iter().collect();
-            locked_retries.retain(|k, _| locked_set.contains(k));
-            let mut scheduled_retry = false;
-            for lp in locked_set {
-                let count = locked_retries.entry(lp).or_insert(0);
-                if *count < MAX_LOCKED_RETRIES {
-                    *count += 1;
-                    scheduled_retry = true;
-                    diag.locked_retries.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-            locked_retries.retain(|_, c| *c <= MAX_LOCKED_RETRIES);
-            if scheduled_retry {
-                *retry_at = Some(Instant::now() + Duration::from_millis(LOCKED_FILE_RETRY_MS));
-            } else {
-                locked_retries.clear();
-                *retry_at = None;
-            }
+            let plan = update_locked_retries(locked_retries, &attempted, locked, was_full);
+            diag.locked_retries
+                .fetch_add(plan.scheduled as u64, Ordering::Relaxed);
+            *retry_at = next_retry_deadline(
+                locked_retries.is_empty(),
+                *retry_at,
+                plan.scheduled > 0,
+                Instant::now(),
+            );
 
             if should_emit {
                 let _ = events_tx.send(CoreEvent::VaultIndexed { stats });
@@ -1106,6 +1165,136 @@ mod tests {
     use super::*;
     use crate::config::write_atomic;
     use crate::vault::vault_from_dir;
+
+    fn obs06_set(paths: &[&str]) -> HashSet<String> {
+        paths.iter().map(|p| p.to_string()).collect()
+    }
+
+    fn obs06_locked(paths: &[&str]) -> Vec<String> {
+        paths.iter().map(|p| p.to_string()).collect()
+    }
+
+    #[test]
+    fn obs06_unrelated_success_keeps_pending_retry() {
+        let now = Instant::now();
+        let deadline = Some(now + Duration::from_millis(40));
+        let mut retries = HashMap::from([("A.md".to_string(), 1u8)]);
+
+        let plan = update_locked_retries(&mut retries, &obs06_set(&["B.md"]), Vec::new(), false);
+
+        assert_eq!(plan, RetryPlan::default());
+        assert_eq!(retries, HashMap::from([("A.md".to_string(), 1u8)]));
+        // The existing deadline is kept, not pushed back and not cleared.
+        assert_eq!(
+            next_retry_deadline(retries.is_empty(), deadline, false, now),
+            deadline
+        );
+        // With no deadline left (the timer already fired) one is armed again.
+        assert_eq!(
+            next_retry_deadline(retries.is_empty(), None, false, now),
+            Some(now + Duration::from_millis(LOCKED_FILE_RETRY_MS))
+        );
+    }
+
+    #[test]
+    fn obs06_attempted_success_clears_retry() {
+        let now = Instant::now();
+        let mut retries = HashMap::from([("A.md".to_string(), 1u8)]);
+
+        let plan = update_locked_retries(&mut retries, &obs06_set(&["A.md"]), Vec::new(), false);
+
+        assert_eq!(plan, RetryPlan::default());
+        assert!(retries.is_empty());
+        let deadline = Some(now + Duration::from_millis(40));
+        assert_eq!(
+            next_retry_deadline(retries.is_empty(), deadline, false, now),
+            None
+        );
+    }
+
+    #[test]
+    fn obs06_retry_gives_up_at_max() {
+        let now = Instant::now();
+        let mut retries: HashMap<String, u8> = HashMap::new();
+        let attempted = obs06_set(&["A.md"]);
+        let mut deadline = None;
+
+        for attempt in 1..=MAX_LOCKED_RETRIES {
+            let plan =
+                update_locked_retries(&mut retries, &attempted, obs06_locked(&["A.md"]), false);
+            assert_eq!(
+                plan,
+                RetryPlan {
+                    scheduled: 1,
+                    gave_up: 0
+                }
+            );
+            assert_eq!(retries.get("A.md"), Some(&attempt));
+            deadline = next_retry_deadline(retries.is_empty(), deadline, true, now);
+            assert!(deadline.is_some());
+        }
+
+        // Locked once more after MAX_LOCKED_RETRIES retries: give up.
+        let plan = update_locked_retries(&mut retries, &attempted, obs06_locked(&["A.md"]), false);
+        assert_eq!(
+            plan,
+            RetryPlan {
+                scheduled: 0,
+                gave_up: 1
+            }
+        );
+        assert!(retries.is_empty());
+        assert_eq!(
+            next_retry_deadline(retries.is_empty(), deadline, plan.scheduled > 0, now),
+            None
+        );
+    }
+
+    #[test]
+    fn obs06_full_sync_does_not_drop_pending() {
+        let now = Instant::now();
+        let deadline = Some(now + Duration::from_millis(40));
+        let mut retries = HashMap::from([("A.md".to_string(), 1u8)]);
+
+        let plan = update_locked_retries(&mut retries, &obs06_set(&["A.md"]), Vec::new(), true);
+
+        assert_eq!(plan, RetryPlan::default());
+        assert_eq!(retries, HashMap::from([("A.md".to_string(), 1u8)]));
+        assert_eq!(
+            next_retry_deadline(retries.is_empty(), deadline, false, now),
+            deadline
+        );
+    }
+
+    #[test]
+    fn obs06_mixed_batch_tracks_each_path_separately() {
+        let mut retries = HashMap::from([
+            ("A.md".to_string(), 1u8),
+            ("Gone.md".to_string(), 2u8),
+            ("Limit.md".to_string(), MAX_LOCKED_RETRIES),
+        ]);
+        // A is pending and untouched; Gone and Limit are retried; B is newly locked.
+        let attempted = obs06_set(&["Gone.md", "Limit.md", "B.md"]);
+
+        let plan = update_locked_retries(
+            &mut retries,
+            &attempted,
+            obs06_locked(&["Limit.md", "B.md"]),
+            false,
+        );
+
+        assert_eq!(
+            plan,
+            RetryPlan {
+                scheduled: 1,
+                gave_up: 1
+            }
+        );
+        assert_eq!(
+            retries,
+            HashMap::from([("A.md".to_string(), 1u8), ("B.md".to_string(), 1u8)])
+        );
+    }
 
     #[tokio::test]
     async fn test_native_watcher_incremental_save_atomic_rename_dir_and_zero_idle_rescans() {
