@@ -10,7 +10,7 @@ use bitefoundry_html::{sniff_content_kind, ContentKind, NativeHtmlServer};
 use chrono::Local;
 
 use crate::{
-    config::{write_atomic, AppConfig, DensityMode, PageWidthMode, VaultProfile},
+    config::{write_atomic, AppConfig, PageWidthMode, VaultProfile},
     img_preview::{
         decode_and_render_for_protocol, decode_and_render_halfblocks, detect_graphics_caps,
         RenderedTerminalImage, TerminalGraphicsCaps, TerminalImageProtocol,
@@ -117,7 +117,6 @@ pub struct UiState {
     pub show_sidebar: bool,
     pub show_inspector: bool,
     pub page_width: PageWidthMode,
-    pub density: DensityMode,
     pub show_inline_hrefs: bool,
     pub sidebar_tab: SidebarTab,
     pub sidebar_selected: usize,
@@ -153,7 +152,6 @@ impl UiState {
             show_sidebar: cfg.show_sidebar,
             show_inspector: cfg.show_inspector,
             page_width: cfg.page_width,
-            density: cfg.density,
             show_inline_hrefs: cfg.show_inline_hrefs,
             sidebar_tab: SidebarTab::Files,
             sidebar_selected: 0,
@@ -1870,11 +1868,6 @@ impl AppState {
                 ui.theme = Theme::detect(preset);
                 let _ = self.cfg.save();
             }
-            Action::SetDensity(d) => {
-                self.cfg.density = d;
-                ui.density = d;
-                let _ = self.cfg.save();
-            }
             Action::SetPageWidth(w) => {
                 self.cfg.page_width = w;
                 ui.page_width = w;
@@ -1888,10 +1881,6 @@ impl AppState {
             }
             Action::ToggleInlineImages => {
                 self.cfg.inline_images = !self.cfg.inline_images;
-                let _ = self.cfg.save();
-            }
-            Action::ToggleNotify => {
-                self.cfg.notify = !self.cfg.notify;
                 let _ = self.cfg.save();
             }
 

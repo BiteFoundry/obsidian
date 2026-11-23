@@ -4,7 +4,7 @@
 use std::{fs, path::Path, process::Command};
 
 use obsidian_cli::{
-    config::{AppConfig, DensityMode, PageWidthMode, ThemePreset, VaultProfile},
+    config::{AppConfig, PageWidthMode, ThemePreset, VaultProfile},
     models::{CoreEvent, SidebarTab},
     storage::Storage,
     sync::{FocusTarget, SyncCommand, SyncController},
@@ -387,7 +387,6 @@ fn main() {
         active_vault: vault.name.clone(),
         vaults: vec![vault.clone(), second_vault],
         theme: ThemePreset::ObsidianDark,
-        density: DensityMode::Cozy,
         page_width: PageWidthMode::Centered,
         show_sidebar: true,
         show_inspector: true,

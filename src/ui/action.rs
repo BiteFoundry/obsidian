@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use crate::{
-    config::{DensityMode, ImageProtocolPreference, PageWidthMode, ThemePreset},
+    config::{ImageProtocolPreference, PageWidthMode, ThemePreset},
     models::SidebarTab,
     ui::overlays::OverlayKind,
 };
@@ -115,11 +115,9 @@ pub enum Action {
 
     // Settings
     SetTheme(ThemePreset),
-    SetDensity(DensityMode),
     SetPageWidth(PageWidthMode),
     SetImageProtocol(ImageProtocolPreference),
     ToggleInlineImages,
-    ToggleNotify,
 
     // Text input inside overlays
     Input(char),

@@ -1,4 +1,9 @@
 //! Desktop notifications via `notify-rust` on a background thread.
+//!
+//! Nothing calls this module at the moment: the `notify` setting that was meant to drive it was
+//! never wired to a caller and has been removed. The module and its tests are kept so a later
+//! change can either connect it or delete it together with the `notify-rust` dependency.
+#![allow(dead_code)]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 

@@ -42,31 +42,6 @@ impl PageWidthMode {
     }
 }
 
-/// List density mode in TUI (`Cozy` default vs `Compact`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum DensityMode {
-    #[default]
-    Cozy,
-    Compact,
-}
-
-impl DensityMode {
-    pub fn toggle(self) -> Self {
-        match self {
-            Self::Cozy => Self::Compact,
-            Self::Compact => Self::Cozy,
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Cozy => "Cozy",
-            Self::Compact => "Compact",
-        }
-    }
-}
-
 /// Terminal color theme preset (`Auto` detects `NO_COLOR`, `COLORTERM`, and `TERM`).
 /// Includes 5 curated palettes: Obsidian Dark, Catppuccin Mocha, Tokyo Night, Nord, Warm Paper.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash, Serialize, Deserialize)]
@@ -225,8 +200,6 @@ pub struct AppConfig {
     pub vaults: Vec<VaultProfile>,
     /// GitHub `owner/repo` used by `bitefoundry-obsidian update`.
     pub github_repo: String,
-    /// Enable desktop toast/bell notifications in TUI.
-    pub notify: bool,
     /// Show left navigation sidebar in wide/medium layout.
     pub show_sidebar: bool,
     /// Show right backlinks & outgoing links inspector pane.
@@ -243,12 +216,13 @@ pub struct AppConfig {
     pub download_dir: String,
     /// Background filesystem watch/reindex poll interval (ms).
     pub watch_poll_ms: u64,
-    /// Automatically attach to or start the lightweight background watcher daemon (`OBSIDIAN_AUTO_DAEMON=1|true`).
-    pub auto_daemon: bool,
-    /// TUI list density (`cozy` or `compact`).
-    pub density: DensityMode,
     /// TUI color theme preset.
     pub theme: ThemePreset,
+    /// Set by [`AppConfig::load`] when the config file exists but could not be read or parsed.
+    /// Such a config holds defaults only, and [`AppConfig::save_to`] refuses to write it, so the
+    /// broken file is never replaced. Never stored in the file.
+    #[serde(skip)]
+    pub load_failed: bool,
 }
 
 impl Default for AppConfig {
@@ -258,7 +232,6 @@ impl Default for AppConfig {
             vaults: Vec::new(),
             github_repo: first_non_empty_env(&["OBSIDIAN_GITHUB_REPO"])
                 .unwrap_or_else(|| DEFAULT_GITHUB_REPO.to_string()),
-            notify: true,
             show_sidebar: true,
             show_inspector: true,
             page_width: PageWidthMode::Centered,
@@ -269,31 +242,39 @@ impl Default for AppConfig {
                 .unwrap_or_default(),
             download_dir: String::new(),
             watch_poll_ms: 2_500,
-            auto_daemon: std::env::var("OBSIDIAN_AUTO_DAEMON")
-                .ok()
-                .and_then(|s| parse_env_bool(&s))
-                .unwrap_or(false),
-            density: DensityMode::default(),
             theme: ThemePreset::default(),
+            load_failed: false,
         }
     }
 }
 
 impl AppConfig {
+    /// Loads the config for this run, with environment overrides applied.
+    ///
+    /// A missing file yields the defaults. A file that exists but cannot be read or parsed also
+    /// yields the defaults, with a warning on stderr and `load_failed` set, so the run can go on
+    /// read-only and no later save replaces the file.
     pub fn load() -> Self {
-        let Ok(mut cfg) = Self::load_from(&config_file_path()) else {
-            return Self::default();
+        let path = config_file_path();
+        let mut cfg = match Self::read_optional(&path) {
+            Ok(Some(cfg)) => cfg,
+            Ok(None) => return Self::default(),
+            Err(_) => {
+                eprintln!(
+                    "warning: {} could not be parsed; using defaults for this run, settings will not be saved",
+                    path.display()
+                );
+                return Self {
+                    load_failed: true,
+                    ..Self::default()
+                };
+            }
         };
         if let Some(v) = first_non_empty_env(&["OBSIDIAN_VAULT"]) {
             cfg.active_vault = v;
         }
         if let Some(repo) = first_non_empty_env(&["OBSIDIAN_GITHUB_REPO"]) {
             cfg.github_repo = repo;
-        }
-        if let Ok(ad) = std::env::var("OBSIDIAN_AUTO_DAEMON") {
-            if let Some(parsed) = parse_env_bool(&ad) {
-                cfg.auto_daemon = parsed;
-            }
         }
         if let Some(proto) = first_non_empty_env(&["OBSIDIAN_IMAGE_PROTOCOL"]) {
             if let Some(parsed) = ImageProtocolPreference::parse_str(&proto) {
@@ -314,7 +295,49 @@ impl AppConfig {
         self.save_to(&config_file_path())
     }
 
+    /// Reads the config file as stored, for commands that change it and write it back.
+    ///
+    /// A missing file yields an empty config (first run). A file that cannot be read or parsed
+    /// is an error, so the caller stops before anything is written.
+    pub fn load_persisted() -> Result<Self> {
+        Self::load_persisted_from(&config_file_path())
+    }
+
+    /// [`AppConfig::load_persisted`] for an explicit path.
+    pub fn load_persisted_from(path: &Path) -> Result<Self> {
+        Ok(Self::read_optional(path)?.unwrap_or_else(|| Self {
+            active_vault: String::new(),
+            ..Self::default()
+        }))
+    }
+
+    /// `Ok(None)` when `path` does not exist; an unreadable or unparsable file is an error.
+    fn read_optional(path: &Path) -> Result<Option<Self>> {
+        let raw = match fs::read_to_string(path) {
+            Ok(raw) => raw,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => bail!(
+                "Config file {} could not be read: {err}. Nothing was changed. Fix the file or move it aside, then retry.",
+                path.display()
+            ),
+        };
+        match toml::from_str(&raw) {
+            Ok(cfg) => Ok(Some(cfg)),
+            Err(err) => bail!(
+                "Config file {} could not be parsed: {}\nNothing was changed. Fix the file or move it aside, then retry.",
+                path.display(),
+                err.to_string().trim_end()
+            ),
+        }
+    }
+
     pub fn save_to(&self, path: &Path) -> Result<()> {
+        if self.load_failed {
+            bail!(
+                "Config file {} could not be parsed when it was loaded, so it is not overwritten. Fix the file or move it aside, then retry.",
+                config_file_path().display()
+            );
+        }
         ensure_parent(path)?;
         let raw = toml::to_string_pretty(self).context("Failed to serialize config")?;
         write_atomic(path, raw.as_bytes())
@@ -633,14 +656,6 @@ fn first_non_empty_env(keys: &[&str]) -> Option<String> {
     None
 }
 
-fn parse_env_bool(input: &str) -> Option<bool> {
-    match input.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
-        _ => None,
-    }
-}
-
 fn expand_tilde(input: &str) -> PathBuf {
     if input == "~" {
         return dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
@@ -774,5 +789,68 @@ mod tests {
         );
         assert_eq!(strip_verbatim_prefix(r"\\?\UNCLE\v"), r"UNCLE\v");
         assert_eq!(strip_verbatim_prefix(r"\\?\한글"), "한글");
+    }
+
+    const OBS08_BROKEN: &str = "active_vault = \"Kept\"\n\n[[vaults]]\nid = \"v-kept\"\nname = \"Kept\"\npath = '/tmp/kept'\n\nthis line is not toml ===\n";
+
+    #[test]
+    fn obs08_load_marks_failed_and_save_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        // A missing file is a first run, not a failure.
+        let fresh = AppConfig::load_persisted_from(&path).unwrap();
+        assert!(fresh.vaults.is_empty());
+        assert!(fresh.active_vault.is_empty());
+        assert!(!fresh.load_failed);
+
+        fs::write(&path, OBS08_BROKEN).unwrap();
+        let err = AppConfig::load_persisted_from(&path)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("config.toml"), "{err}");
+        assert!(err.contains("could not be parsed"), "{err}");
+        assert!(err.contains("Nothing was changed"), "{err}");
+
+        // A config that failed to load refuses to save, to this path or any other.
+        let failed = AppConfig {
+            load_failed: true,
+            ..AppConfig::default()
+        };
+        assert!(failed.save_to(&path).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), OBS08_BROKEN);
+        let other = dir.path().join("other.toml");
+        assert!(failed.save_to(&other).is_err());
+        assert!(!other.exists());
+
+        // The flag never reaches the file.
+        let saved = dir.path().join("saved.toml");
+        AppConfig::default().save_to(&saved).unwrap();
+        assert!(!fs::read_to_string(&saved).unwrap().contains("load_failed"));
+    }
+
+    #[test]
+    fn obs08_legacy_keys_still_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "active_vault = \"Old\"\nnotify = false\nauto_daemon = true\ndensity = \"compact\"\ntheme = \"nord\"\nwatch_poll_ms = 900\n",
+        )
+        .unwrap();
+
+        let loaded = AppConfig::load_persisted_from(&path).unwrap();
+        assert_eq!(loaded.active_vault, "Old");
+        assert_eq!(loaded.theme, ThemePreset::Nord);
+        assert_eq!(loaded.watch_poll_ms, 900);
+        assert!(!loaded.load_failed);
+
+        // The removed keys disappear the next time the file is saved.
+        loaded.save_to(&path).unwrap();
+        let saved = fs::read_to_string(&path).unwrap();
+        for key in ["notify", "auto_daemon", "density"] {
+            assert!(!saved.contains(key), "{key} survived in:\n{saved}");
+        }
+        assert!(saved.contains("theme = \"nord\""));
     }
 }

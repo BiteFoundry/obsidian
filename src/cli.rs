@@ -605,7 +605,7 @@ fn cli_compact_note_json(
 
 pub async fn run(cli: Cli) -> Result<()> {
     updater::cleanup_stale_old_binary();
-    let mut cfg = AppConfig::load();
+    let cfg = AppConfig::load();
 
     match cli.command {
         None => {
@@ -663,11 +663,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 if !path.is_dir() {
                     bail!("Directory does not exist: {}", path.display());
                 }
-                let mut persisted = AppConfig::load_from(&crate::config::config_file_path())
-                    .unwrap_or_else(|_| AppConfig {
-                        active_vault: String::new(),
-                        ..AppConfig::default()
-                    });
+                let mut persisted = AppConfig::load_persisted()?;
                 let profile = vault_from_dir(&path, name.as_deref());
                 let norm_new = crate::config::normalize_path_key(&profile.path);
                 if let Some(conflict) = merged_vaults(&persisted).into_iter().find(|v| {
@@ -703,11 +699,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 Ok(())
             }
             VaultsCmd::Use { name } => {
-                let mut persisted = AppConfig::load_from(&crate::config::config_file_path())
-                    .unwrap_or_else(|_| AppConfig {
-                        active_vault: String::new(),
-                        ..AppConfig::default()
-                    });
+                let mut persisted = AppConfig::load_persisted()?;
                 let target = resolve_registered_vault(&persisted, &name)?;
                 persisted.active_vault = target.name.clone();
                 persisted.save()?;
@@ -723,11 +715,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 Ok(())
             }
             VaultsCmd::Remove { name } => {
-                let mut persisted = AppConfig::load_from(&crate::config::config_file_path())
-                    .unwrap_or_else(|_| AppConfig {
-                        active_vault: String::new(),
-                        ..AppConfig::default()
-                    });
+                let mut persisted = AppConfig::load_persisted()?;
                 let removed = persisted.remove_vault(&name);
                 if removed {
                     persisted.save()?;
@@ -747,9 +735,12 @@ pub async fn run(cli: Cli) -> Result<()> {
         },
 
         Some(Commands::Init { dir }) => {
+            // Read the stored config first: a broken file must stop the command before the
+            // starter vault is created.
+            let mut persisted = AppConfig::load_persisted()?;
             let profile = init_starter_vault(&dir)?;
-            cfg.upsert_vault(profile.clone(), true);
-            cfg.save()?;
+            persisted.upsert_vault(profile.clone(), true);
+            persisted.save()?;
             let storage = Storage::open_default()?;
             let stats = storage.sync_vault(&profile)?;
             if cli.json {

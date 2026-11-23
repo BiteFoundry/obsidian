@@ -37,7 +37,6 @@ scratch="$(mktemp -d)"
 export OBSIDIAN_CONFIG_DIR="$scratch/config"
 export OBSIDIAN_DATA_DIR="$scratch/data"
 export OBSIDIAN_APP_CONFIG_PATH="$scratch/obsidian.json"
-export OBSIDIAN_AUTO_DAEMON=0
 printf '%s\n' '{"vaults":{}}' > "$OBSIDIAN_APP_CONFIG_PATH"
 vault="$scratch/vault"
 bitefoundry-obsidian init "$vault"

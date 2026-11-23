@@ -8168,3 +8168,96 @@ fn obs15_unc_vault_opens() {
         Some("Projects/Q4 Architecture RFC.md")
     );
 }
+
+fn obs08_run(test_root: &std::path::Path, args: &[&str]) -> std::process::Output {
+    isolated_cli_base(test_root).args(args).output().unwrap()
+}
+
+#[test]
+fn obs08_vaults_add_use_remove_refuse_unparsable_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let test_root = tmp.path();
+    let vault_dir = test_root.join("existing-vault");
+    fs::create_dir_all(&vault_dir).unwrap();
+    fs::write(vault_dir.join("Note.md"), "# Note\n").unwrap();
+    fs::write(test_root.join("obsidian.json"), "{\"vaults\":{}}").unwrap();
+
+    let config_path = test_root.join("config/config.toml");
+    fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+    // A valid registered vault followed by a syntax error.
+    let broken = format!(
+        "active_vault = \"X\"\n\n[[vaults]]\nid = \"v-x\"\nname = \"X\"\npath = '{}'\n\nthis line is not toml ===\n",
+        vault_dir.display()
+    );
+    fs::write(&config_path, &broken).unwrap();
+
+    let new_vault = test_root.join("starter-vault");
+    let vault_arg = vault_dir.to_str().unwrap();
+    let new_vault_arg = new_vault.to_str().unwrap();
+    let mutating: [&[&str]; 4] = [
+        &["vaults", "add", vault_arg],
+        &["vaults", "use", "X"],
+        &["vaults", "remove", "X"],
+        &["init", new_vault_arg],
+    ];
+    for args in mutating {
+        let output = obs08_run(test_root, args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{args:?} succeeded: {stderr}");
+        assert!(stderr.contains("config.toml"), "{args:?}: {stderr}");
+        assert!(stderr.contains("Nothing was changed"), "{args:?}: {stderr}");
+        assert_eq!(
+            fs::read(&config_path).unwrap(),
+            broken.as_bytes(),
+            "{args:?} changed the config file"
+        );
+    }
+    // `init` stops before creating the starter vault.
+    assert!(!new_vault.exists());
+
+    // Read-only commands still run on defaults, with a warning, and leave the file alone.
+    let output = isolated_cli(test_root, &vault_dir)
+        .args(["--json", "notes", "list"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("could not be parsed"), "{stderr}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Note.md"));
+    assert_eq!(fs::read(&config_path).unwrap(), broken.as_bytes());
+}
+
+#[test]
+fn obs08_missing_config_still_bootstraps() {
+    let tmp = tempfile::tempdir().unwrap();
+    let test_root = tmp.path();
+    let vault_dir = test_root.join("first-vault");
+    fs::create_dir_all(&vault_dir).unwrap();
+    fs::write(vault_dir.join("Note.md"), "# Note\n").unwrap();
+    fs::write(test_root.join("obsidian.json"), "{\"vaults\":{}}").unwrap();
+    let config_path = test_root.join("config/config.toml");
+    assert!(!config_path.exists());
+
+    let output = obs08_run(test_root, &["vaults", "add", vault_dir.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).is_empty());
+
+    let saved = AppConfig::load_from(&config_path).unwrap();
+    assert_eq!(saved.vaults.len(), 1);
+    assert_eq!(saved.active_vault, "first-vault");
+
+    // `init` bootstraps the same way and keeps the earlier registration.
+    let starter = test_root.join("starter-vault");
+    let output = obs08_run(test_root, &["init", starter.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let saved = AppConfig::load_from(&config_path).unwrap();
+    assert_eq!(saved.vaults.len(), 2);
+}

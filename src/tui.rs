@@ -619,6 +619,10 @@ pub async fn run_tui(cfg: AppConfig, vault: VaultProfile, storage: Storage) -> R
         ui.term_height = sz.height;
     }
     app.reload_from_storage(&mut ui);
+    if cfg.load_failed {
+        ui.toasts
+            .warning("config.toml could not be parsed: using defaults, settings will not be saved");
+    }
 
     let mut reader = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(100));

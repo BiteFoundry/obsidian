@@ -1,4 +1,4 @@
-//! Settings Overlay (`Ctrl+,`): 5 curated Obsidian palettes, layout width, density, inspector, inline images.
+//! Settings Overlay (`Ctrl+,`): 5 curated Obsidian palettes, layout width, inspector, inline images.
 
 use ratatui::{
     layout::Rect,
@@ -9,7 +9,7 @@ use ratatui::{
 };
 
 use crate::{
-    config::{DensityMode, ImageProtocolPreference, PageWidthMode, ThemePreset},
+    config::{ImageProtocolPreference, PageWidthMode, ThemePreset},
     ui::{
         action::Action,
         app::{AppState, UiState},
@@ -34,11 +34,9 @@ pub struct SettingsOverlay {
     pub selected: usize,
     pub theme: ThemePreset,
     pub width: PageWidthMode,
-    pub density: DensityMode,
     pub show_inspector: bool,
     pub inline_images: bool,
     pub image_protocol: ImageProtocolPreference,
-    pub notify: bool,
 }
 
 impl SettingsOverlay {
@@ -47,16 +45,14 @@ impl SettingsOverlay {
             selected: 0,
             theme: app.cfg.theme,
             width: ui.page_width,
-            density: ui.density,
             show_inspector: ui.show_inspector,
             inline_images: app.cfg.inline_images,
             image_protocol: app.cfg.image_protocol,
-            notify: app.cfg.notify,
         }
     }
 
     pub fn handle(&mut self, action: &Action) -> OverlayOutcome {
-        const ITEMS: usize = 7;
+        const ITEMS: usize = 5;
         match action {
             Action::CloseOverlay | Action::Input('q') => OverlayOutcome::Close,
             Action::Quit | Action::QuitConfirm => OverlayOutcome::NotHandled,
@@ -93,24 +89,16 @@ impl SettingsOverlay {
                 OverlayOutcome::Dispatch(Action::SetPageWidth(self.width))
             }
             2 => {
-                self.density = self.density.toggle();
-                OverlayOutcome::Dispatch(Action::SetDensity(self.density))
-            }
-            3 => {
                 self.show_inspector = !self.show_inspector;
                 OverlayOutcome::Dispatch(Action::ToggleInspector)
             }
-            4 => {
+            3 => {
                 self.inline_images = !self.inline_images;
                 OverlayOutcome::Dispatch(Action::ToggleInlineImages)
             }
-            5 => {
+            4 => {
                 self.image_protocol = self.image_protocol.next();
                 OverlayOutcome::Dispatch(Action::SetImageProtocol(self.image_protocol))
-            }
-            6 => {
-                self.notify = !self.notify;
-                OverlayOutcome::Dispatch(Action::ToggleNotify)
             }
             _ => OverlayOutcome::Handled,
         }
@@ -144,7 +132,6 @@ impl SettingsOverlay {
         let rows = [
             ("Color Palette", self.theme.label().to_string()),
             ("Canvas Width", self.width.label().to_string()),
-            ("List Density", self.density.label().to_string()),
             (
                 "Right Inspector (Backlinks)",
                 if self.show_inspector {
@@ -164,10 +151,6 @@ impl SettingsOverlay {
                 .to_string(),
             ),
             ("Image Protocol", self.image_protocol.label().to_string()),
-            (
-                "Desktop Notifications",
-                if self.notify { "Enabled" } else { "Muted" }.to_string(),
-            ),
         ];
 
         for (idx, (label, value)) in rows.iter().enumerate() {
