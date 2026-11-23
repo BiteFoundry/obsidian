@@ -16,7 +16,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    config::{normalize_path_key, write_atomic, AppConfig, VaultProfile},
+    config::{normalize_path_key, strip_verbatim_prefix, write_atomic, AppConfig, VaultProfile},
     models::CodedError,
 };
 
@@ -242,6 +242,38 @@ pub fn resolve_registered_vault(cfg: &AppConfig, spec: &str) -> Result<VaultProf
     );
 }
 
+/// Resolves a vault named by an untrusted request (HTTP `vault=` / MCP `vault` argument).
+///
+/// Only the server's own launch vault (`default_vault`, matched by name, ID, or path) and
+/// registered or auto-discovered vaults are accepted. Every failure returns the same
+/// `vault_not_found` error so a remote caller cannot learn whether an arbitrary directory exists.
+pub fn resolve_request_vault(
+    cfg: &AppConfig,
+    default_vault: &VaultProfile,
+    spec: &str,
+) -> Result<VaultProfile> {
+    let needle = spec.trim();
+    if !needle.is_empty() {
+        let is_default = default_vault.name.eq_ignore_ascii_case(needle)
+            || default_vault.display_name().eq_ignore_ascii_case(needle)
+            || default_vault.id.eq_ignore_ascii_case(needle)
+            || normalize_path_key(&default_vault.path) == normalize_path_key(Path::new(needle));
+        if is_default {
+            return Ok(default_vault.clone());
+        }
+        if let Ok(found) = resolve_registered_vault(cfg, needle) {
+            return Ok(found);
+        }
+    }
+    Err(CodedError::new(
+        "vault_not_found",
+        format!(
+            "Vault '{needle}' is not registered. Use list_vaults / GET /api/v1/vaults, or register it with \"bitefoundry-obsidian vaults add <path>\"."
+        ),
+    )
+    .into())
+}
+
 pub fn vault_from_dir(dir: &Path, custom_name: Option<&str>) -> VaultProfile {
     let canonical = stdfs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     // Strip Windows extended-length prefix (`\\?\`) for clean display paths.
@@ -272,10 +304,11 @@ pub fn vault_from_dir(dir: &Path, custom_name: Option<&str>) -> VaultProfile {
 
 fn strip_windows_verbatim_prefix(path: &Path) -> PathBuf {
     let s = path.to_string_lossy();
-    if let Some(rest) = s.strip_prefix(r"\\?\") {
-        PathBuf::from(rest)
-    } else {
+    let stripped = strip_verbatim_prefix(&s);
+    if stripped.len() == s.len() {
         path.to_path_buf()
+    } else {
+        PathBuf::from(stripped.as_ref())
     }
 }
 
@@ -399,5 +432,74 @@ mod tests {
         assert!(vault_dir.join("Welcome.md").is_file());
         assert!(vault_dir.join("Getting Started.md").is_file());
         assert!(vault_dir.join(".obsidian/daily-notes.json").is_file());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unc_verbatim_prefix_maps_to_unc_path() {
+        let stripped = strip_windows_verbatim_prefix(Path::new(r"\\?\UNC\server\share\vault"));
+        assert_eq!(stripped, PathBuf::from(r"\\server\share\vault"));
+        assert!(stripped.is_absolute());
+        assert_eq!(
+            strip_windows_verbatim_prefix(Path::new(r"\\?\C:\vault")),
+            PathBuf::from(r"C:\vault")
+        );
+        assert_eq!(
+            normalize_path_key(Path::new(r"\\?\UNC\obs-no-such-host\share\vault")),
+            normalize_path_key(Path::new(r"\\obs-no-such-host\share\vault"))
+        );
+    }
+
+    #[test]
+    fn resolve_request_vault_accepts_default_and_registered_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let default_dir = tmp.path().join("launch");
+        let registered_dir = tmp.path().join("registered");
+        let outside_dir = tmp.path().join("outside");
+        for dir in [&default_dir, &registered_dir, &outside_dir] {
+            stdfs::create_dir_all(dir).unwrap();
+        }
+        // The launch vault is deliberately NOT in the config.
+        let default_vault = vault_from_dir(&default_dir, Some("launch-vault"));
+        let registered = vault_from_dir(&registered_dir, Some("registered-vault"));
+        let mut cfg = AppConfig::default();
+        cfg.upsert_vault(registered.clone(), true);
+
+        let default_path = default_dir.to_string_lossy().to_string();
+        for spec in [
+            "launch-vault",
+            "LAUNCH-VAULT",
+            default_vault.id.as_str(),
+            default_path.as_str(),
+        ] {
+            let got = resolve_request_vault(&cfg, &default_vault, spec).unwrap();
+            assert_eq!(got.id, default_vault.id, "{spec}");
+        }
+        let registered_path = registered_dir.to_string_lossy().to_string();
+        for spec in [
+            "registered-vault",
+            registered.id.as_str(),
+            registered_path.as_str(),
+        ] {
+            let got = resolve_request_vault(&cfg, &default_vault, spec).unwrap();
+            assert_eq!(got.id, registered.id, "{spec}");
+        }
+
+        let outside = outside_dir.to_string_lossy().to_string();
+        let missing = tmp.path().join("missing").to_string_lossy().to_string();
+        let mut messages = Vec::new();
+        for spec in [outside.as_str(), missing.as_str()] {
+            let err = resolve_request_vault(&cfg, &default_vault, spec).unwrap_err();
+            let coded = err.downcast_ref::<CodedError>().expect("coded error");
+            assert_eq!(coded.code, "vault_not_found");
+            messages.push(coded.message.replace(spec, "<spec>"));
+        }
+        assert_eq!(messages[0], messages[1]);
+
+        let err = resolve_request_vault(&cfg, &default_vault, "   ").unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<CodedError>().map(|c| c.code),
+            Some("vault_not_found")
+        );
     }
 }

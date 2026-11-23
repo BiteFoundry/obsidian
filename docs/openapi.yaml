@@ -2,13 +2,28 @@ openapi: 3.1.0
 info:
   title: "@bitefoundry/obsidian Local HTTP API"
   version: "0.1.0"
-  description: Local HTTP JSON API for Obsidian vaults, FTS5 search, backlinks, knowledge graph, tasks, and daily notes (`bitefoundry-obsidian serve`, default `:8792`).
+  description: >-
+    Local HTTP JSON API for Obsidian vaults, FTS5 search, backlinks, knowledge graph, tasks, and daily notes
+    (`bitefoundry-obsidian serve`, default `:8792`). Every `/api/v1/*` request needs a Bearer token: the one
+    passed with `--token`, or the random token `serve` prints on stderr at startup (`--allow-keyless` disables
+    it on loopback). Requests with a `Host` header outside the loopback/`--bind`/`--allow-host` set, or with a
+    browser `Origin` that is neither loopback nor listed with `--allow-origin`, get `403`. The `vault` parameter
+    accepts the server's launch vault and registered or auto-discovered vaults only (name, ID, or path);
+    other directories return `404`.
 servers:
   - url: http://127.0.0.1:8792
+security:
+  - bearerAuth: []
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
 paths:
   /health:
     get:
       summary: Service health and active vault status
+      security: []
       responses:
         "200":
           description: Healthy service metadata

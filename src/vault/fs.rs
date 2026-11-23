@@ -8,7 +8,7 @@
 use std::{
     collections::HashMap,
     fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     time::UNIX_EPOCH,
 };
 
@@ -17,7 +17,7 @@ use chrono::Local;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    config::{ensure_parent, write_atomic, VaultProfile},
+    config::{ensure_parent, strip_verbatim_prefix, write_atomic, VaultProfile},
     models::{CodedError, InlineSpan, NoteBlock, NoteImageRef, ParsedNote},
     vault::parser::{
         find_inline_code_end, find_matching_bracket, is_code_fence_opener, is_image_target,
@@ -42,7 +42,7 @@ pub fn is_markdown_file_path(path: &str) -> bool {
 /// Strips Windows verbatim prefix (`\\?\`) and normalizes path separators for root prefix checks.
 fn clean_fs_path_components(path: &Path) -> String {
     let raw = path.to_string_lossy().replace('\\', "/");
-    let stripped = raw.strip_prefix("//?/").unwrap_or(&raw);
+    let stripped = strip_verbatim_prefix(&raw);
     stripped.trim_end_matches('/').to_string()
 }
 
@@ -406,7 +406,37 @@ pub fn safe_vault_path(vault_root: &Path, rel_path: &str) -> Result<PathBuf> {
         if comp == ".." {
             bail!("Path traversal ('..') is not allowed: {rel_path}");
         }
+        // On Windows `PathBuf::push("C:foo")` replaces the whole base, and `name:stream` addresses
+        // an NTFS alternate data stream. On Unix `:` is an ordinary filename character.
+        if cfg!(windows) && comp.contains(':') {
+            return Err(CodedError::new(
+                "invalid_argument",
+                format!(
+                    "Path component '{comp}' is not allowed (drive prefix or stream separator): {rel_path}"
+                ),
+            )
+            .into());
+        }
+        // Structural check: the component must be exactly one plain name.
+        let mut parts = Path::new(comp).components();
+        if !matches!(
+            (parts.next(), parts.next()),
+            (Some(Component::Normal(_)), None)
+        ) {
+            return Err(CodedError::new(
+                "invalid_argument",
+                format!("Path component '{comp}' is not allowed: {rel_path}"),
+            )
+            .into());
+        }
         joined.push(comp);
+    }
+    if !joined.starts_with(vault_root) {
+        return Err(CodedError::new(
+            "invalid_argument",
+            format!("Path escapes the vault root: {rel_path}"),
+        )
+        .into());
     }
     Ok(joined)
 }
@@ -1179,22 +1209,21 @@ pub fn toggle_task_at_line_verified(
         }
     }
 
-    let (marker_rel_pos, new_byte, new_checked) =
-        if let Some(pos) = find_checkbox_marker(line_for_parse, "[ ]") {
-            (pos + 1, b'x', true)
-        } else if let Some(pos) = find_checkbox_marker(line_for_parse, "[x]")
-            .or_else(|| find_checkbox_marker(line_for_parse, "[X]"))
-        {
-            (pos + 1, b' ', false)
-        } else {
-            return Err(CodedError::new(
-                "invalid_argument",
-                format!(
-                    "Line {line_no} does not contain a Markdown task checkbox: {line_for_parse}"
-                ),
-            )
-            .into());
-        };
+    let (marker_rel_pos, new_byte, new_checked) = if let Some(pos) =
+        find_checkbox_marker(line_for_parse, "[ ]")
+    {
+        (pos + 1, b'x', true)
+    } else if let Some(pos) = find_checkbox_marker(line_for_parse, "[x]")
+        .or_else(|| find_checkbox_marker(line_for_parse, "[X]"))
+    {
+        (pos + 1, b' ', false)
+    } else {
+        return Err(CodedError::new(
+            "invalid_argument",
+            format!("Line {line_no} does not contain a Markdown task checkbox: {line_for_parse}"),
+        )
+        .into());
+    };
 
     let mut out_bytes = raw.into_bytes();
     out_bytes[line_start + bom_offset + marker_rel_pos] = new_byte;
@@ -1250,11 +1279,9 @@ pub fn create_note(
 
     let abs_path = safe_vault_path(vault_root, &rel_path)?;
     if abs_path.exists() {
-        return Err(CodedError::new(
-            "already_exists",
-            format!("Note already exists: {rel_path}"),
-        )
-        .into());
+        return Err(
+            CodedError::new("already_exists", format!("Note already exists: {rel_path}")).into(),
+        );
     }
 
     let today = Local::now().format("%Y-%m-%d").to_string();
@@ -2025,7 +2052,9 @@ pub fn resolve_note_identifier(
 ) -> Result<String> {
     let mut candidates = note_identifier_candidates(input, all_rel_paths, aliases_by_path);
     match candidates.len() {
-        0 => Err(CodedError::new("not_found", format!("Note not found in vault: '{input}'")).into()),
+        0 => {
+            Err(CodedError::new("not_found", format!("Note not found in vault: '{input}'")).into())
+        }
         1 => Ok(candidates.remove(0)),
         n => {
             let preview_candidates: Vec<String> = candidates.iter().take(10).cloned().collect();
@@ -2289,5 +2318,48 @@ mod tests {
                 "expected None for {rejected:?}"
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn safe_vault_path_rejects_windows_drive_prefix() {
+        let root = Path::new(r"C:\vaults\main");
+        for bad in [
+            "C:evil.md",
+            "C:obs-esc-test/esc.md",
+            "D:/outside/note.md",
+            r"D:outside\note.md",
+            "sub/C:x.md",
+            "note.md:stream",
+        ] {
+            let err = safe_vault_path(root, bad).expect_err(bad);
+            let coded = err.downcast_ref::<CodedError>().expect("coded error");
+            assert_eq!(coded.code, "invalid_argument", "{bad}");
+        }
+    }
+
+    #[test]
+    fn safe_vault_path_keeps_valid_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for ok in ["a/b.md", "/a/b.md", r"a\b.md", "./a/./b.md", "한글/노트.md"] {
+            let joined = safe_vault_path(root, ok).unwrap_or_else(|e| panic!("{ok}: {e}"));
+            assert!(joined.starts_with(root), "{ok} -> {}", joined.display());
+        }
+        assert_eq!(
+            safe_vault_path(root, "./a/./b.md").unwrap(),
+            root.join("a").join("b.md")
+        );
+        assert!(safe_vault_path(root, "../x.md").is_err());
+        assert!(safe_vault_path(root, "a/../../x.md").is_err());
+        assert!(safe_vault_path(root, "").is_err());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn safe_vault_path_allows_colon_on_unix() {
+        let root = Path::new("/vaults/main");
+        let joined = safe_vault_path(root, "Standup 10:30.md").unwrap();
+        assert_eq!(joined, root.join("Standup 10:30.md"));
     }
 }

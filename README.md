@@ -136,6 +136,8 @@ curl -H "Authorization: Bearer $API_TOKEN" "http://127.0.0.1:8792/api/v1/search?
 curl -H "Authorization: Bearer $API_TOKEN" "http://127.0.0.1:8792/api/v1/graph?note=Q4%20Architecture%20RFC&depth=2"
 ```
 
+Without `--token`, `serve` prints a random token for the run on stderr (`--allow-keyless` turns this off on loopback). Requests from other websites and unknown `Host` names are rejected, a non-loopback `--bind` requires `--token`, and `vault=` accepts registered vaults only. Browser apps on another origin need `--allow-origin <origin>`.
+
 Full endpoint catalog and OpenAPI schema: **[docs/API.md](docs/API.md)** · **[docs/openapi.yaml](docs/openapi.yaml)**.
 
 ### MCP Server (`bitefoundry-obsidian mcp`)

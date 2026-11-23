@@ -16,30 +16,35 @@
 //! - `POST /api/v1/tasks/toggle`
 //! - `POST /api/v1/reindex`
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    net::{IpAddr, Ipv6Addr, SocketAddr},
+    sync::Arc,
+};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use axum::{
-    extract::{Path as AxumPath, Query, State},
-    http::{header, HeaderMap, StatusCode},
+    extract::{Path as AxumPath, Query, Request, State},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
+use rand::RngCore;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::{
     config::{AppConfig, VaultProfile},
-    models::{TaskFilter, VaultSummary},
+    models::{CodedError, TaskFilter, VaultSummary},
     storage::Storage,
     vault::{
         fs::{
             append_to_note, create_note, ensure_daily_note, file_mtime_and_size, safe_vault_path,
             toggle_task_at_line_verified,
         },
-        merged_vaults, resolve_active_vault,
+        merged_vaults, resolve_request_vault,
     },
 };
 
@@ -51,8 +56,181 @@ pub struct ServeState {
     pub token: Option<String>,
 }
 
+/// Request-origin policy of the HTTP API. The default accepts loopback hosts and origins only.
+#[derive(Debug, Clone, Default)]
+pub struct ServePolicy {
+    /// Extra `Host` header names accepted besides `127.0.0.1`, `localhost` and `[::1]`.
+    pub extra_hosts: Vec<String>,
+    /// Exact browser origins (`scheme://host[:port]`) allowed to call the API cross-origin.
+    pub allowed_origins: Vec<String>,
+}
+
+/// Launch options for [`run_http_server_with_options`].
+#[derive(Debug, Clone, Default)]
+pub struct ServeOptions {
+    /// Bearer token required on `/api/v1/*`. Blank counts as unset.
+    pub token: Option<String>,
+    /// Serve a loopback bind without any token instead of generating one.
+    pub allow_keyless: bool,
+    /// Exact browser origins allowed cross-origin (`--allow-origin` / `--cors-origin`).
+    pub allow_origins: Vec<String>,
+    /// Extra `Host` header names to accept (`--allow-host`).
+    pub allow_hosts: Vec<String>,
+}
+
+const LOOPBACK_HOSTS: [&str; 3] = ["127.0.0.1", "localhost", "[::1]"];
+
+struct GuardPolicy {
+    hosts: Vec<String>,
+    origins: Vec<String>,
+}
+
+impl GuardPolicy {
+    fn new(policy: &ServePolicy) -> Self {
+        let mut hosts: Vec<String> = LOOPBACK_HOSTS.iter().map(|h| h.to_string()).collect();
+        for extra in &policy.extra_hosts {
+            if let Some(host) = normalize_host(extra) {
+                if !hosts.contains(&host) {
+                    hosts.push(host);
+                }
+            }
+        }
+        let origins = policy
+            .allowed_origins
+            .iter()
+            .filter_map(|o| normalize_origin(o))
+            .collect();
+        Self { hosts, origins }
+    }
+}
+
+/// Lower-cases a `Host` value and strips its optional port and trailing dot.
+/// IPv6 literals come back bracketed (`[::1]`). Returns `None` for anything malformed.
+fn normalize_host(raw: &str) -> Option<String> {
+    let s = raw.trim().to_ascii_lowercase();
+    if s.is_empty() {
+        return None;
+    }
+    let valid_port = |p: &str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit());
+    if let Some(rest) = s.strip_prefix('[') {
+        let (addr, tail) = rest.split_once(']')?;
+        if !(tail.is_empty() || tail.strip_prefix(':').is_some_and(valid_port)) {
+            return None;
+        }
+        let parsed: Ipv6Addr = addr.parse().ok()?;
+        return Some(format!("[{parsed}]"));
+    }
+    if let Ok(parsed) = s.parse::<Ipv6Addr>() {
+        return Some(format!("[{parsed}]"));
+    }
+    let host = match s.rsplit_once(':') {
+        Some((host, port)) if valid_port(port) => host,
+        Some(_) => return None,
+        None => s.as_str(),
+    };
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.is_empty() || host.contains(['/', '@', ' ']) {
+        return None;
+    }
+    Some(host.to_string())
+}
+
+/// Normalizes an exact origin (`scheme://host[:port]`, no path) to lower case.
+fn normalize_origin(raw: &str) -> Option<String> {
+    let s = raw.trim().trim_end_matches('/').to_ascii_lowercase();
+    let rest = s
+        .strip_prefix("http://")
+        .or_else(|| s.strip_prefix("https://"))?;
+    if rest.is_empty() || rest.contains(['/', '*', ' ', '?', '#']) {
+        return None;
+    }
+    HeaderValue::from_str(&s).ok()?;
+    Some(s)
+}
+
+fn is_loopback_origin(origin: &str) -> bool {
+    let s = origin.trim().to_ascii_lowercase();
+    let Some(rest) = s
+        .strip_prefix("http://")
+        .or_else(|| s.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    normalize_host(rest).is_some_and(|h| LOOPBACK_HOSTS.contains(&h.as_str()))
+}
+
+fn host_allowed(policy: &GuardPolicy, req: &Request) -> bool {
+    let mut seen = 0usize;
+    let mut check = |raw: &str| {
+        seen += 1;
+        normalize_host(raw).is_some_and(|h| policy.hosts.contains(&h))
+    };
+    for value in req.headers().get_all(header::HOST) {
+        let Ok(raw) = value.to_str() else {
+            return false;
+        };
+        if !check(raw) {
+            return false;
+        }
+    }
+    // HTTP/2 and absolute-form requests carry the authority in the URI.
+    if let Some(authority) = req.uri().authority() {
+        if !check(authority.as_str()) {
+            return false;
+        }
+    }
+    seen > 0
+}
+
+fn origin_allowed(policy: &GuardPolicy, origin: &str) -> bool {
+    let candidate = origin.trim().to_ascii_lowercase();
+    policy.origins.contains(&candidate) || is_loopback_origin(&candidate)
+}
+
+/// Rejects requests whose `Host` is not allow-listed (DNS rebinding) or whose `Origin` is a
+/// foreign website, before any handler, body extractor or vault sync runs.
+async fn guard(State(policy): State<Arc<GuardPolicy>>, req: Request, next: Next) -> Response {
+    if !host_allowed(&policy, &req) {
+        return err_resp(StatusCode::FORBIDDEN, "Host not allowed");
+    }
+    for origin in req.headers().get_all(header::ORIGIN) {
+        let allowed = origin
+            .to_str()
+            .ok()
+            .is_some_and(|o| origin_allowed(&policy, o));
+        if !allowed {
+            return err_resp(StatusCode::FORBIDDEN, "Origin not allowed");
+        }
+    }
+    next.run(req).await
+}
+
+fn cors_layer(origins: &[String]) -> Option<CorsLayer> {
+    let values: Vec<HeaderValue> = origins
+        .iter()
+        .filter_map(|o| HeaderValue::from_str(o).ok())
+        .collect();
+    if values.is_empty() {
+        return None;
+    }
+    Some(
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::list(values))
+            .allow_methods([Method::GET, Method::POST])
+            .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]),
+    )
+}
+
+/// Builds the API router with the default loopback-only [`ServePolicy`].
 pub fn build_router(state: Arc<ServeState>) -> Router {
-    Router::new()
+    build_router_with_policy(state, ServePolicy::default())
+}
+
+/// Builds the API router. No CORS headers are sent unless `policy.allowed_origins` lists an
+/// exact origin; every route, including `/health`, sits behind the Host/Origin guard.
+pub fn build_router_with_policy(state: Arc<ServeState>, policy: ServePolicy) -> Router {
+    let guard_policy = Arc::new(GuardPolicy::new(&policy));
+    let mut router = Router::new()
         .route("/health", get(handle_health))
         .route("/api/v1/vaults", get(handle_list_vaults))
         .route("/api/v1/search", get(handle_search))
@@ -71,9 +249,77 @@ pub fn build_router(state: Arc<ServeState>) -> Router {
         .route("/api/v1/tags", get(handle_tags))
         .route("/api/v1/tasks", get(handle_tasks))
         .route("/api/v1/tasks/toggle", post(handle_toggle_task))
-        .route("/api/v1/reindex", post(handle_reindex))
-        .layer(CorsLayer::permissive())
+        .route("/api/v1/reindex", post(handle_reindex));
+    if let Some(cors) = cors_layer(&guard_policy.origins) {
+        router = router.layer(cors);
+    }
+    router
+        .layer(middleware::from_fn_with_state(guard_policy, guard))
         .with_state(state)
+}
+
+/// Generates a 32-byte random Bearer token (64 hex characters) from the OS CSPRNG.
+pub fn generate_serve_token() -> String {
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+/// Decides the Bearer token for a bind address. Returns `(token, generated)`.
+///
+/// - an explicit non-blank token is used as given;
+/// - a non-loopback bind without a token is refused (`--allow-keyless` does not lift this);
+/// - a loopback bind without a token gets a freshly generated one, unless `allow_keyless`.
+pub fn resolve_serve_token(
+    addr: &SocketAddr,
+    token: Option<String>,
+    allow_keyless: bool,
+) -> Result<(Option<String>, bool)> {
+    if let Some(token) = token.filter(|t| !t.trim().is_empty()) {
+        return Ok((Some(token), false));
+    }
+    if !addr.ip().is_loopback() {
+        bail!("Refusing to serve on {addr} without --token. Bind to 127.0.0.1 or pass --token.");
+    }
+    if allow_keyless {
+        return Ok((None, false));
+    }
+    Ok((Some(generate_serve_token()), true))
+}
+
+fn parse_bind_addr(bind: &str, port: u16) -> Result<SocketAddr> {
+    let trimmed = bind.trim();
+    let bare = trimmed
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(trimmed);
+    if let Ok(ip) = bare.parse::<IpAddr>() {
+        return Ok(SocketAddr::new(ip, port));
+    }
+    format!("{bind}:{port}")
+        .parse()
+        .with_context(|| format!("Invalid bind address: {bind}:{port}"))
+}
+
+fn serve_policy(addr: &SocketAddr, opts: &ServeOptions) -> Result<ServePolicy> {
+    let mut extra_hosts = vec![addr.ip().to_string()];
+    for host in &opts.allow_hosts {
+        if normalize_host(host).is_none() {
+            bail!("Invalid --allow-host value '{host}'. Pass a host name or IP address such as 192.168.1.20.");
+        }
+        extra_hosts.push(host.clone());
+    }
+    let mut allowed_origins = Vec::new();
+    for origin in &opts.allow_origins {
+        let Some(normalized) = normalize_origin(origin) else {
+            bail!("Invalid --allow-origin value '{origin}'. Pass one exact origin such as https://app.example.com; wildcards and paths are not supported.");
+        };
+        allowed_origins.push(normalized);
+    }
+    Ok(ServePolicy {
+        extra_hosts,
+        allowed_origins,
+    })
 }
 
 pub async fn run_http_server(
@@ -84,24 +330,54 @@ pub async fn run_http_server(
     port: u16,
     token: Option<String>,
 ) -> Result<()> {
+    let opts = ServeOptions {
+        token,
+        ..ServeOptions::default()
+    };
+    run_http_server_with_options(cfg, vault, storage, bind, port, opts).await
+}
+
+pub async fn run_http_server_with_options(
+    cfg: AppConfig,
+    vault: VaultProfile,
+    storage: Storage,
+    bind: &str,
+    port: u16,
+    opts: ServeOptions,
+) -> Result<()> {
+    // Every refusal happens before the vault is scanned or the socket is bound.
+    let addr = parse_bind_addr(bind, port)?;
+    let policy = serve_policy(&addr, &opts)?;
+    let (token, generated) = resolve_serve_token(&addr, opts.token.clone(), opts.allow_keyless)?;
+
     let _ = storage.sync_vault(&vault);
     let state = Arc::new(ServeState {
         cfg,
         default_vault: vault.clone(),
         storage,
-        token,
+        token: token.clone(),
     });
-    let app = build_router(state);
-    let addr: SocketAddr = format!("{bind}:{port}")
-        .parse()
-        .with_context(|| format!("Invalid bind address: {bind}:{port}"))?;
+    let app = build_router_with_policy(state, policy);
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("Failed to bind HTTP server on {addr}"))?;
+    let local_addr = listener.local_addr().unwrap_or(addr);
     eprintln!(
-        "obsidian HTTP API listening on http://{addr} (vault: {})",
+        "obsidian HTTP API listening on http://{local_addr} (vault: {})",
         vault.display_name()
     );
+    match (&token, generated) {
+        (Some(token), true) => {
+            eprintln!("obsidian HTTP API token (generated for this run): {token}");
+            eprintln!(
+                "  Send it as `Authorization: Bearer <token>` on /api/v1/* requests. Pass --token to choose your own, or --allow-keyless to serve loopback without a token."
+            );
+        }
+        (None, _) => eprintln!(
+            "warning: serving without a token (--allow-keyless): any local process can read and write this vault."
+        ),
+        _ => {}
+    }
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -131,7 +407,7 @@ fn resolve_req_vault_unsynced(
 ) -> Result<VaultProfile, Box<Response>> {
     match vault_param.map(str::trim).filter(|s| !s.is_empty()) {
         None => Ok(state.default_vault.clone()),
-        Some(spec) => resolve_active_vault(&state.cfg, Some(spec))
+        Some(spec) => resolve_request_vault(&state.cfg, &state.default_vault, spec)
             .map_err(|e| Box::new(err_resp(StatusCode::NOT_FOUND, &e.to_string()))),
     }
 }
@@ -407,7 +683,17 @@ async fn handle_daily_note(
             }))
             .into_response()
         }
-        Err(e) => err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => {
+            let invalid = e
+                .downcast_ref::<CodedError>()
+                .is_some_and(|c| c.code == "invalid_argument");
+            let status = if invalid {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            err_resp(status, &e.to_string())
+        }
     }
 }
 
@@ -652,5 +938,135 @@ async fn handle_reindex(
     match state.storage.reindex_vault(&vault) {
         Ok(stats) => Json(json!({ "ok": true, "stats": stats })).into_response(),
         Err(e) => err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn obs01_token_is_generated_on_loopback_unless_keyless() {
+        let (first, generated) = resolve_serve_token(&addr("127.0.0.1:8792"), None, false).unwrap();
+        let first = first.unwrap();
+        assert!(generated);
+        assert_eq!(first.len(), 64);
+        assert!(first.bytes().all(|b| b.is_ascii_hexdigit()));
+        let (second, _) = resolve_serve_token(&addr("[::1]:8792"), None, false).unwrap();
+        assert_ne!(Some(first), second);
+
+        assert_eq!(
+            resolve_serve_token(&addr("127.0.0.1:8792"), None, true).unwrap(),
+            (None, false)
+        );
+        assert_eq!(
+            resolve_serve_token(&addr("127.0.0.1:8792"), Some("mine".into()), false).unwrap(),
+            (Some("mine".to_string()), false)
+        );
+        // A blank token counts as unset.
+        let (blank, generated) =
+            resolve_serve_token(&addr("127.0.0.1:8792"), Some("  ".into()), false).unwrap();
+        assert!(generated && blank.is_some());
+    }
+
+    #[test]
+    fn obs01_non_loopback_bind_requires_token() {
+        for bind in ["0.0.0.0:8792", "192.168.1.20:8792", "[::]:8792"] {
+            assert!(
+                resolve_serve_token(&addr(bind), None, false).is_err(),
+                "{bind}"
+            );
+            assert!(
+                resolve_serve_token(&addr(bind), None, true).is_err(),
+                "{bind}"
+            );
+            assert!(
+                resolve_serve_token(&addr(bind), Some(" ".into()), true).is_err(),
+                "{bind}"
+            );
+            assert_eq!(
+                resolve_serve_token(&addr(bind), Some("t".into()), false).unwrap(),
+                (Some("t".to_string()), false),
+                "{bind}"
+            );
+        }
+    }
+
+    #[test]
+    fn obs01_host_normalization() {
+        assert_eq!(normalize_host("localhost").as_deref(), Some("localhost"));
+        assert_eq!(
+            normalize_host("LOCALHOST:8792").as_deref(),
+            Some("localhost")
+        );
+        assert_eq!(normalize_host("localhost.").as_deref(), Some("localhost"));
+        assert_eq!(
+            normalize_host("localhost.:8792").as_deref(),
+            Some("localhost")
+        );
+        assert_eq!(
+            normalize_host("127.0.0.1:8792").as_deref(),
+            Some("127.0.0.1")
+        );
+        assert_eq!(normalize_host("[::1]:8792").as_deref(), Some("[::1]"));
+        assert_eq!(
+            normalize_host("[0:0:0:0:0:0:0:1]").as_deref(),
+            Some("[::1]")
+        );
+        assert_eq!(normalize_host("::1").as_deref(), Some("[::1]"));
+        for bad in [
+            "",
+            "  ",
+            "localhost:",
+            "localhost:abc",
+            "[::1",
+            "[::1]x",
+            "a/b",
+            "u@localhost",
+        ] {
+            assert_eq!(normalize_host(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn obs01_origin_policy() {
+        let policy = GuardPolicy::new(&ServePolicy {
+            extra_hosts: vec!["192.168.1.20".into(), "bad host/".into()],
+            allowed_origins: vec!["https://App.Example.com/".into(), "*".into()],
+        });
+        assert!(policy.hosts.contains(&"192.168.1.20".to_string()));
+        assert_eq!(policy.hosts.len(), 4);
+        assert_eq!(policy.origins, vec!["https://app.example.com".to_string()]);
+
+        assert!(origin_allowed(&policy, "https://app.example.com"));
+        assert!(origin_allowed(&policy, "http://localhost:3000"));
+        assert!(origin_allowed(&policy, "http://127.0.0.1"));
+        assert!(origin_allowed(&policy, "http://[::1]:5173"));
+        for bad in [
+            "null",
+            "https://evil.example",
+            "http://app.example.com",
+            "https://app.example.com:8443",
+            "http://localhost.evil.example",
+            "file://localhost",
+            "http://192.168.1.20",
+        ] {
+            assert!(!origin_allowed(&policy, bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn obs01_bind_address_parsing() {
+        assert_eq!(
+            parse_bind_addr("127.0.0.1", 8792).unwrap(),
+            addr("127.0.0.1:8792")
+        );
+        assert_eq!(parse_bind_addr("::1", 8792).unwrap(), addr("[::1]:8792"));
+        assert_eq!(parse_bind_addr("[::1]", 8792).unwrap(), addr("[::1]:8792"));
+        assert!(parse_bind_addr("not-an-ip", 8792).is_err());
     }
 }

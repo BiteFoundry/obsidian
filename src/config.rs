@@ -1,6 +1,7 @@
 //! Application configuration, multi-vault registry (`config.toml`), local paths, and atomic I/O.
 
 use std::{
+    borrow::Cow,
     collections::HashMap,
     fs,
     io::Write,
@@ -416,10 +417,31 @@ impl AppConfig {
     }
 }
 
+/// Strips the Windows verbatim prefix (`\\?\` or `//?/`) from a path string, in either
+/// separator form. The UNC verbatim form (`\\?\UNC\server\share`) maps back to the plain UNC
+/// path (`\\server\share`) instead of the relative-looking `UNC\server\share`.
+pub fn strip_verbatim_prefix(s: &str) -> Cow<'_, str> {
+    let (rest, sep) = if let Some(rest) = s.strip_prefix(r"\\?\") {
+        (rest, '\\')
+    } else if let Some(rest) = s.strip_prefix("//?/") {
+        (rest, '/')
+    } else {
+        return Cow::Borrowed(s);
+    };
+    let is_unc = rest
+        .get(..3)
+        .is_some_and(|head| head.eq_ignore_ascii_case("UNC"))
+        && matches!(rest.as_bytes().get(3), Some(b'\\') | Some(b'/'));
+    if is_unc {
+        return Cow::Owned(format!("{sep}{sep}{}", &rest[4..]));
+    }
+    Cow::Borrowed(rest)
+}
+
 pub fn normalize_path_key(path: &Path) -> String {
     let resolved = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let s = resolved.to_string_lossy().replace('\\', "/");
-    let stripped = s.strip_prefix("//?/").unwrap_or(&s);
+    let stripped = strip_verbatim_prefix(&s);
     if cfg!(windows) {
         stripped.trim_end_matches('/').to_ascii_lowercase()
     } else {
@@ -724,5 +746,33 @@ mod tests {
         let _guard = EnvVarGuard::set(&[("OBSIDIAN_VAULT", Some("EnvVault"))]);
         let cfg = AppConfig::default();
         assert_eq!(cfg.active_vault, "EnvVault");
+    }
+
+    #[test]
+    fn strip_verbatim_prefix_handles_unc_and_drive() {
+        assert_eq!(
+            strip_verbatim_prefix(r"\\?\UNC\server\share\v"),
+            r"\\server\share\v"
+        );
+        assert_eq!(
+            strip_verbatim_prefix(r"\\?\unc\server\share\v"),
+            r"\\server\share\v"
+        );
+        assert_eq!(
+            strip_verbatim_prefix("//?/UNC/server/share/v"),
+            "//server/share/v"
+        );
+        assert_eq!(strip_verbatim_prefix(r"\\?\C:\v"), r"C:\v");
+        assert_eq!(strip_verbatim_prefix("//?/C:/v"), "C:/v");
+        assert_eq!(
+            strip_verbatim_prefix(r"\\server\share\v"),
+            r"\\server\share\v"
+        );
+        assert_eq!(
+            strip_verbatim_prefix("/home/user/vault"),
+            "/home/user/vault"
+        );
+        assert_eq!(strip_verbatim_prefix(r"\\?\UNCLE\v"), r"UNCLE\v");
+        assert_eq!(strip_verbatim_prefix(r"\\?\한글"), "한글");
     }
 }

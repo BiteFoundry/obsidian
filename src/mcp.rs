@@ -41,7 +41,7 @@ use crate::{
             move_note_to_trash, safe_vault_path, toggle_task_at_line_verified,
             update_note_frontmatter,
         },
-        merged_vaults, resolve_active_vault,
+        merged_vaults, resolve_request_vault,
     },
 };
 
@@ -133,8 +133,8 @@ impl McpServer {
                     .unwrap_or_else(|| json!({}));
                 match self.dispatch_tool(name, &args) {
                     Ok(payload) => {
-                        let text = serde_json::to_string(&payload)
-                            .unwrap_or_else(|_| payload.to_string());
+                        let text =
+                            serde_json::to_string(&payload).unwrap_or_else(|_| payload.to_string());
                         Some(json!({
                             "jsonrpc": "2.0",
                             "id": resp_id,
@@ -170,7 +170,7 @@ impl McpServer {
             .filter(|s| !s.is_empty())
         {
             None => Ok(self.default_vault.clone()),
-            Some(spec) => resolve_active_vault(&self.cfg, Some(spec)),
+            Some(spec) => resolve_request_vault(&self.cfg, &self.default_vault, spec),
         }
     }
 
@@ -291,9 +291,9 @@ impl McpServer {
                 let tags: Vec<String> = match args.get("tags") {
                     None => Vec::new(),
                     Some(v) => {
-                        let arr = v
-                            .as_array()
-                            .ok_or_else(|| anyhow!("Invalid 'tags': expected an array of strings"))?;
+                        let arr = v.as_array().ok_or_else(|| {
+                            anyhow!("Invalid 'tags': expected an array of strings")
+                        })?;
                         let mut out = Vec::with_capacity(arr.len());
                         for item in arr {
                             let s = item.as_str().ok_or_else(|| {
@@ -619,7 +619,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 "properties": {
                     "query": { "type": "string", "description": "Search query string." },
                     "limit": { "type": "integer", "description": "Maximum results 1..200 (default 20). Out-of-range values are clamped; the response reports the limit used and has_more." },
-                    "vault": { "type": "string", "description": "Optional vault name, ID, or path." }
+                    "vault": { "type": "string", "description": "Optional registered vault name, ID, or path (see list_vaults). Unregistered directories are rejected." }
                 },
                 "required": ["query"]
             }),
@@ -632,7 +632,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 "properties": {
                     "note": { "type": "string", "description": "Relative path, note title, or alias." },
                     "compact": { "type": "boolean", "description": "Default true: return rel_path, title, raw_markdown, mtime_ms, omitted, and hint. Set false for frontmatter, tags, headings, tasks, backlinks, and outgoing links." },
-                    "vault": { "type": "string", "description": "Optional vault name, ID, or path." }
+                    "vault": { "type": "string", "description": "Optional registered vault name, ID, or path (see list_vaults). Unregistered directories are rejected." }
                 },
                 "required": ["note"]
             }),
@@ -646,7 +646,7 @@ pub fn tool_definitions() -> Vec<Value> {
                     "folder": { "type": "string", "description": "Optional folder prefix filter." },
                     "limit": { "type": "integer", "description": "Page size 1..500 (default 50)." },
                     "cursor": { "type": "string", "description": "next_cursor from the previous page." },
-                    "vault": { "type": "string", "description": "Optional vault name, ID, or path." }
+                    "vault": { "type": "string", "description": "Optional registered vault name, ID, or path (see list_vaults). Unregistered directories are rejected." }
                 }
             }),
         ),
@@ -660,7 +660,7 @@ pub fn tool_definitions() -> Vec<Value> {
                     "folder": { "type": "string", "description": "Optional target folder relative to vault root." },
                     "content": { "type": "string", "description": "Optional Markdown content." },
                     "tags": { "type": "array", "items": { "type": "string" }, "description": "Optional frontmatter tags." },
-                    "vault": { "type": "string", "description": "Optional vault name, ID, or path." }
+                    "vault": { "type": "string", "description": "Optional registered vault name, ID, or path (see list_vaults). Unregistered directories are rejected." }
                 },
                 "required": ["title"]
             }),
@@ -673,7 +673,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 "properties": {
                     "note": { "type": "string", "description": "Relative path, note title, or alias." },
                     "text": { "type": "string", "description": "Markdown text to append." },
-                    "vault": { "type": "string", "description": "Optional vault name, ID, or path." }
+                    "vault": { "type": "string", "description": "Optional registered vault name, ID, or path (see list_vaults). Unregistered directories are rejected." }
                 },
                 "required": ["note", "text"]
             }),
@@ -687,7 +687,7 @@ pub fn tool_definitions() -> Vec<Value> {
                     "note": { "type": "string", "description": "Relative path, note title, or alias." },
                     "find": { "type": "string", "minLength": 1, "description": "Exact text to find, including spacing and line endings." },
                     "replace": { "type": "string", "description": "Replacement text. Use an empty string to delete the match." },
-                    "vault": { "type": "string", "description": "Optional vault name, ID, or path." }
+                    "vault": { "type": "string", "description": "Optional registered vault name, ID, or path (see list_vaults). Unregistered directories are rejected." }
                 },
                 "required": ["note", "find", "replace"]
             }),
@@ -700,7 +700,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 "properties": {
                     "note": { "type": "string", "description": "Relative path, note title, or alias." },
                     "properties": { "type": "object", "description": "Key-value pairs to merge into YAML frontmatter (null removes key)." },
-                    "vault": { "type": "string", "description": "Optional vault name, ID, or path." }
+                    "vault": { "type": "string", "description": "Optional registered vault name, ID, or path (see list_vaults). Unregistered directories are rejected." }
                 },
                 "required": ["note", "properties"]
             }),
@@ -713,7 +713,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 "properties": {
                     "note": { "type": "string", "description": "Relative path, note title, or alias." },
                     "confirm": { "type": "boolean", "description": "Must be true to execute deletion to .trash/." },
-                    "vault": { "type": "string", "description": "Optional vault name, ID, or path." }
+                    "vault": { "type": "string", "description": "Optional registered vault name, ID, or path (see list_vaults). Unregistered directories are rejected." }
                 },
                 "required": ["note", "confirm"]
             }),
@@ -726,7 +726,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 "properties": {
                     "date": { "type": "string", "description": "Optional date string (e.g. 2026-11-20)." },
                     "append": { "type": "string", "description": "Optional text to append to the daily note." },
-                    "vault": { "type": "string", "description": "Optional vault name, ID, or path." }
+                    "vault": { "type": "string", "description": "Optional registered vault name, ID, or path (see list_vaults). Unregistered directories are rejected." }
                 }
             }),
         ),
@@ -737,7 +737,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "note": { "type": "string", "description": "Target note path, title, or alias." },
-                    "vault": { "type": "string", "description": "Optional vault name, ID, or path." }
+                    "vault": { "type": "string", "description": "Optional registered vault name, ID, or path (see list_vaults). Unregistered directories are rejected." }
                 },
                 "required": ["note"]
             }),
@@ -749,7 +749,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "note": { "type": "string", "description": "Source note path, title, or alias." },
-                    "vault": { "type": "string", "description": "Optional vault name, ID, or path." }
+                    "vault": { "type": "string", "description": "Optional registered vault name, ID, or path (see list_vaults). Unregistered directories are rejected." }
                 },
                 "required": ["note"]
             }),
@@ -762,7 +762,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 "properties": {
                     "note": { "type": "string", "description": "Optional center note path, title, or alias." },
                     "depth": { "type": "integer", "description": "Neighborhood hop depth 1..5 (default 2; other values are clamped and the result reports the depth used)." },
-                    "vault": { "type": "string", "description": "Optional vault name, ID, or path." }
+                    "vault": { "type": "string", "description": "Optional registered vault name, ID, or path (see list_vaults). Unregistered directories are rejected." }
                 }
             }),
         ),
@@ -772,7 +772,7 @@ pub fn tool_definitions() -> Vec<Value> {
             json!({
                 "type": "object",
                 "properties": {
-                    "vault": { "type": "string", "description": "Optional vault name, ID, or path." }
+                    "vault": { "type": "string", "description": "Optional registered vault name, ID, or path (see list_vaults). Unregistered directories are rejected." }
                 }
             }),
         ),
@@ -783,7 +783,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "tag": { "type": "string", "description": "Tag name with or without leading #." },
-                    "vault": { "type": "string", "description": "Optional vault name, ID, or path." }
+                    "vault": { "type": "string", "description": "Optional registered vault name, ID, or path (see list_vaults). Unregistered directories are rejected." }
                 },
                 "required": ["tag"]
             }),
@@ -798,7 +798,7 @@ pub fn tool_definitions() -> Vec<Value> {
                     "note": { "type": "string", "description": "Optional note filter." },
                     "limit": { "type": "integer", "description": "Page size 1..500 (default 50)." },
                     "cursor": { "type": "string", "description": "next_cursor from the previous page." },
-                    "vault": { "type": "string", "description": "Optional vault name, ID, or path." }
+                    "vault": { "type": "string", "description": "Optional registered vault name, ID, or path (see list_vaults). Unregistered directories are rejected." }
                 }
             }),
         ),
@@ -813,7 +813,7 @@ pub fn tool_definitions() -> Vec<Value> {
                     "expected_text": { "type": "string", "description": "Optional expected task text at this line; refuses toggle on mismatch." },
                     "expected_checked": { "type": "boolean", "description": "Optional expected current checked state; refuses toggle on mismatch." },
                     "expected_mtime_ms": { "type": "integer", "description": "Optional expected note mtime_ms; refuses toggle if file changed." },
-                    "vault": { "type": "string", "description": "Optional vault name, ID, or path." }
+                    "vault": { "type": "string", "description": "Optional registered vault name, ID, or path (see list_vaults). Unregistered directories are rejected." }
                 },
                 "required": ["note", "line"]
             }),
@@ -824,7 +824,7 @@ pub fn tool_definitions() -> Vec<Value> {
             json!({
                 "type": "object",
                 "properties": {
-                    "vault": { "type": "string", "description": "Optional vault name, ID, or path." }
+                    "vault": { "type": "string", "description": "Optional registered vault name, ID, or path (see list_vaults). Unregistered directories are rejected." }
                 }
             }),
         ),
@@ -834,7 +834,7 @@ pub fn tool_definitions() -> Vec<Value> {
             json!({
                 "type": "object",
                 "properties": {
-                    "vault": { "type": "string", "description": "Optional vault name, ID, or path." }
+                    "vault": { "type": "string", "description": "Optional registered vault name, ID, or path (see list_vaults). Unregistered directories are rejected." }
                 }
             }),
         ),
@@ -846,7 +846,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 "properties": {
                     "src": { "type": "string", "description": "Source note path relative to the vault, title, or alias." },
                     "dst": { "type": "string", "description": "Destination path relative to the same vault, including the new filename. The .md extension is optional." },
-                    "vault": { "type": "string", "description": "Optional vault name, ID, or path." }
+                    "vault": { "type": "string", "description": "Optional registered vault name, ID, or path (see list_vaults). Unregistered directories are rejected." }
                 },
                 "required": ["src", "dst"]
             }),

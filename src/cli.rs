@@ -147,13 +147,30 @@ pub enum Commands {
         action: DaemonCmd,
     },
     /// Start the local HTTP JSON API server (default: 127.0.0.1:8792).
+    ///
+    /// Requests need `Authorization: Bearer <token>`. Without --token a random token is generated
+    /// for the run and printed once to stderr.
     Serve {
         #[arg(long, default_value = "127.0.0.1")]
         bind: String,
         #[arg(long, default_value_t = DEFAULT_SERVE_PORT)]
         port: u16,
+        /// Bearer token required on /api/v1/* (required for a non-loopback --bind).
         #[arg(long)]
         token: Option<String>,
+        /// Serve a loopback bind without any token instead of generating one.
+        #[arg(long)]
+        allow_keyless: bool,
+        /// Exact browser origin allowed to call the API cross-origin (repeatable), e.g. https://app.example.com.
+        #[arg(
+            long = "allow-origin",
+            visible_alias = "cors-origin",
+            value_name = "ORIGIN"
+        )]
+        allow_origin: Vec<String>,
+        /// Extra Host header name to accept besides loopback and the --bind address (repeatable).
+        #[arg(long = "allow-host", value_name = "HOST")]
+        allow_host: Vec<String>,
     },
     /// Start the stdio JSON-RPC 2.0 MCP server (20 typed tools).
     Mcp,
@@ -1328,10 +1345,23 @@ pub async fn run(cli: Cli) -> Result<()> {
             DaemonCmd::Run => daemon::run_daemon_foreground(cfg, cli.vault).await,
         },
 
-        Some(Commands::Serve { bind, port, token }) => {
+        Some(Commands::Serve {
+            bind,
+            port,
+            token,
+            allow_keyless,
+            allow_origin,
+            allow_host,
+        }) => {
             let vault = resolve_active_vault(&cfg, cli.vault.as_deref())?;
             let storage = Storage::open_default()?;
-            serve::run_http_server(cfg, vault, storage, &bind, port, token).await
+            let opts = serve::ServeOptions {
+                token,
+                allow_keyless,
+                allow_origins: allow_origin,
+                allow_hosts: allow_host,
+            };
+            serve::run_http_server_with_options(cfg, vault, storage, &bind, port, opts).await
         }
 
         Some(Commands::Mcp) => {

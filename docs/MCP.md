@@ -19,6 +19,8 @@ Add to Claude Desktop, Cursor, Windsurf, or any MCP-compatible host:
 
 Optionally pin a specific vault via `"args": ["--vault", "My Vault", "mcp"]` or `"env": { "OBSIDIAN_VAULT": "My Vault" }`.
 
+The optional `vault` argument of each tool accepts the vault the server was started with and registered or auto-discovered vaults (name, ID, or path; see `list_vaults`). Any other directory is rejected and never scanned; register it first with `bitefoundry-obsidian vaults add <path>`.
+
 Existing 0.1.x settings use `"command": "obsidian"` or `"command": "obs"`. Set `"command": "bitefoundry-obsidian"` to upgrade.
 
 ## Tool Catalog

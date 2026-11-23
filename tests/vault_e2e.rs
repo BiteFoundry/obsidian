@@ -34,7 +34,6 @@ use obsidian_cli::{
 use ratatui::{backend::TestBackend, Terminal};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, watch};
-use tower_http::cors::CorsLayer;
 
 fn seed_vault(root: &std::path::Path) {
     fs::create_dir_all(root.join("Projects")).unwrap();
@@ -208,7 +207,7 @@ async fn test_http_api_8792_endpoints() {
         storage,
         token: None,
     });
-    let app = build_router(state).layer(CorsLayer::permissive());
+    let app = build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
@@ -3045,7 +3044,7 @@ async fn test_http_serve_and_mcp_live_external_sync_and_stale_task_guard() {
         storage: storage_http,
         token: None,
     });
-    let app_router = build_router(state).layer(CorsLayer::permissive());
+    let app_router = build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
@@ -3777,7 +3776,7 @@ async fn regression_obsidian_obs_01_mcp_and_http_hash_filenames() {
         storage,
         token: None,
     });
-    let router = build_router(state).layer(CorsLayer::permissive());
+    let router = build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
@@ -5063,7 +5062,7 @@ async fn regression_obsidian_obs_12_http_get_append_note_and_literal_percent_fil
         storage,
         token: None,
     });
-    let app = build_router(state).layer(CorsLayer::permissive());
+    let app = build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
@@ -5334,7 +5333,10 @@ fn regression_obsidian_obs_14_hyphen_titles_and_toggle_task_expected_text() {
         "expected Task conflict for empty expected-text, got: {}",
         String::from_utf8_lossy(&tog_empty.stderr)
     );
-    assert_eq!(fs::read(root.join("Tasks.md")).unwrap(), before_empty_expected);
+    assert_eq!(
+        fs::read(root.join("Tasks.md")).unwrap(),
+        before_empty_expected
+    );
 
     // 3. Controls: --help, --json, missing values, and option typo diagnostics remain intact
     let help_read = isolated_cli(tmp.path(), &root)
@@ -6935,10 +6937,7 @@ fn move_destination_spelling_does_not_change_link_rewrites() {
         fs::write(root.join("ToVanish.md"), "# Vanish\n").unwrap();
         fs::write(root.join("ToDotDir.md"), "# DotDir\n").unwrap();
 
-        for (src, bad_dst) in [
-            ("ToVanish.md", ".md"),
-            ("ToDotDir.md", ".hidden/Lost.md"),
-        ] {
+        for (src, bad_dst) in [("ToVanish.md", ".md"), ("ToDotDir.md", ".hidden/Lost.md")] {
             if use_mcp {
                 let mcp = plan_mcp_server(&root);
                 assert!(
@@ -7100,7 +7099,10 @@ fn create_note_keeps_tags_and_reports_real_path() {
     assert!(hr_disk.contains("created: "), "got:\n{hr_disk}");
     assert!(hr_disk.contains("tags: [hrtag]\n"), "got:\n{hr_disk}");
     assert!(hr_disk.contains("# HRWithTags\n"), "got:\n{hr_disk}");
-    assert!(hr_disk.contains("---\nParagraph under HR\n"), "got:\n{hr_disk}");
+    assert!(
+        hr_disk.contains("---\nParagraph under HR\n"),
+        "got:\n{hr_disk}"
+    );
 
     // 3. Leading slash in title returns normalized rel_path matching disk/index
     let slash_out = run_cli(&[
@@ -7307,4 +7309,862 @@ fn search_like_fallback_treats_percent_and_underscore_literally() {
 
     assert_eq!(run_search("a_b"), vec!["Literal.md".to_string()]);
     assert_eq!(run_search("%"), vec!["Literal.md".to_string()]);
+}
+
+// ===========================================================================
+// v0.4.1 regression tests
+// ===========================================================================
+
+struct ObsServer {
+    base: String,
+    port: u16,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ObsServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn obs_serve(
+    cfg: AppConfig,
+    vault: &obsidian_cli::config::VaultProfile,
+    storage: Storage,
+    policy: Option<obsidian_cli::serve::ServePolicy>,
+) -> ObsServer {
+    let state = Arc::new(ServeState {
+        cfg,
+        default_vault: vault.clone(),
+        storage,
+        token: None,
+    });
+    let app = match policy {
+        Some(policy) => obsidian_cli::serve::build_router_with_policy(state, policy),
+        None => build_router(state),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    ObsServer {
+        base: format!("http://{addr}"),
+        port: addr.port(),
+        task,
+    }
+}
+
+fn obs_count_files(dir: &std::path::Path) -> usize {
+    let mut count = 0;
+    for entry in fs::read_dir(dir).unwrap().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            count += obs_count_files(&path);
+        } else {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Registered vault `vault` plus an unregistered sibling directory `outside` holding `secret.md`.
+fn obs01_fixture(tmp: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let root = tmp.join("vault");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("Home.md"), "# Home\n\nRegistered note.\n").unwrap();
+    let outside = tmp.join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("secret.md"), "# Secret\n\nTOPSECRET-PAYLOAD\n").unwrap();
+    (root, outside)
+}
+
+#[tokio::test]
+async fn obs01_http_rejects_unregistered_vault_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (root, outside) = obs01_fixture(tmp.path());
+    let vault = vault_from_dir(&root, Some("fixture"));
+    let mut cfg = AppConfig::default();
+    cfg.upsert_vault(vault.clone(), true);
+    let storage = Storage::open_in_memory().unwrap();
+    let server = obs_serve(cfg, &vault, storage.clone(), None).await;
+    let client = reqwest::Client::new();
+    let outside_spec = outside.to_string_lossy().to_string();
+    let outside_id = vault_from_dir(&outside, None).id;
+
+    let read = client
+        .get(format!("{}/api/v1/notes/secret.md", server.base))
+        .query(&[("vault", outside_spec.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(read.status(), StatusCode::NOT_FOUND);
+    let body = read.text().await.unwrap();
+    assert!(!body.contains("raw_markdown"), "{body}");
+    assert!(!body.contains("TOPSECRET-PAYLOAD"), "{body}");
+
+    for path in [
+        "/api/v1/notes",
+        "/api/v1/search?q=secret",
+        "/api/v1/tags",
+        "/api/v1/tasks",
+    ] {
+        let resp = client
+            .get(format!("{}{path}", server.base))
+            .query(&[("vault", outside_spec.as_str())])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+    assert_eq!(storage.note_count(&outside_id).unwrap(), 0);
+
+    let before = obs_count_files(&outside);
+    let create = client
+        .post(format!("{}/api/v1/notes", server.base))
+        .json(&json!({ "title": "pwn", "content": "x", "vault": outside_spec }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::NOT_FOUND);
+    let daily = client
+        .post(format!("{}/api/v1/daily", server.base))
+        .json(&json!({ "vault": outside_spec }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(daily.status(), StatusCode::NOT_FOUND);
+    let reindex = client
+        .post(format!("{}/api/v1/reindex", server.base))
+        .json(&json!({ "vault": outside_spec }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reindex.status(), StatusCode::NOT_FOUND);
+    assert_eq!(obs_count_files(&outside), before);
+    assert!(!outside.join("pwn.md").exists());
+    assert_eq!(storage.note_count(&outside_id).unwrap(), 0);
+}
+
+#[tokio::test]
+async fn obs01_http_unregistered_error_is_uniform() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (root, outside) = obs01_fixture(tmp.path());
+    let vault = vault_from_dir(&root, Some("fixture"));
+    let mut cfg = AppConfig::default();
+    cfg.upsert_vault(vault.clone(), true);
+    let server = obs_serve(cfg, &vault, Storage::open_in_memory().unwrap(), None).await;
+    let client = reqwest::Client::new();
+
+    let existing = outside.to_string_lossy().to_string();
+    let missing = tmp.path().join("no-such-dir").to_string_lossy().to_string();
+    let mut messages = Vec::new();
+    for spec in [&existing, &missing] {
+        let resp = client
+            .get(format!("{}/api/v1/notes", server.base))
+            .query(&[("vault", spec.as_str())])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body: Value = resp.json().await.unwrap();
+        let message = body["error"].as_str().unwrap().to_string();
+        assert!(message.contains(spec.as_str()), "{message}");
+        messages.push(message.replace(spec.as_str(), "<spec>"));
+    }
+    assert_eq!(messages[0], messages[1]);
+}
+
+#[tokio::test]
+async fn obs01_http_default_unregistered_vault_still_served() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (root, _outside) = obs01_fixture(tmp.path());
+    // Launch vault is NOT registered in the config (`--vault <dir> serve`).
+    let vault = vault_from_dir(&root, None);
+    let server = obs_serve(
+        AppConfig::default(),
+        &vault,
+        Storage::open_in_memory().unwrap(),
+        None,
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let path_spec = root.to_string_lossy().to_string();
+    let specs: [Option<&str>; 4] = [
+        None,
+        Some(vault.id.as_str()),
+        Some(path_spec.as_str()),
+        Some(vault.name.as_str()),
+    ];
+    for spec in specs {
+        let mut req = client.get(format!("{}/api/v1/notes", server.base));
+        if let Some(spec) = spec {
+            req = req.query(&[("vault", spec)]);
+        }
+        let resp = req.send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{spec:?}");
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["count"], 1, "{spec:?}");
+    }
+}
+
+#[tokio::test]
+async fn obs01_http_registered_second_vault_by_name_id_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (root, _outside) = obs01_fixture(tmp.path());
+    let second_root = tmp.path().join("second");
+    fs::create_dir_all(&second_root).unwrap();
+    fs::write(second_root.join("Only Second.md"), "# Only Second\n").unwrap();
+    let vault = vault_from_dir(&root, Some("obs01-first"));
+    let second = vault_from_dir(&second_root, Some("obs01-second"));
+    let mut cfg = AppConfig::default();
+    cfg.upsert_vault(vault.clone(), true);
+    cfg.upsert_vault(second.clone(), false);
+    let server = obs_serve(cfg, &vault, Storage::open_in_memory().unwrap(), None).await;
+    let client = reqwest::Client::new();
+    let path_spec = second_root.to_string_lossy().to_string();
+    for spec in ["obs01-second", second.id.as_str(), path_spec.as_str()] {
+        let resp = client
+            .get(format!("{}/api/v1/notes", server.base))
+            .query(&[("vault", spec)])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{spec}");
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["count"], 1, "{spec}");
+        assert_eq!(body["notes"][0]["rel_path"], "Only Second.md", "{spec}");
+    }
+}
+
+fn obs_has_cors_headers(resp: &reqwest::Response) -> bool {
+    resp.headers()
+        .keys()
+        .any(|name| name.as_str().starts_with("access-control-allow"))
+}
+
+#[tokio::test]
+async fn obs01_http_cross_origin_blocked() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("vault");
+    fs::create_dir_all(&root).unwrap();
+    seed_vault(&root);
+    let vault = vault_from_dir(&root, Some("fixture"));
+    let mut cfg = AppConfig::default();
+    cfg.upsert_vault(vault.clone(), true);
+    let server = obs_serve(cfg, &vault, Storage::open_in_memory().unwrap(), None).await;
+    let client = reqwest::Client::new();
+
+    for origin in [
+        "https://evil.example",
+        "null",
+        "http://localhost.evil.example",
+    ] {
+        for path in ["/health", "/api/v1/vaults"] {
+            let resp = client
+                .get(format!("{}{path}", server.base))
+                .header("Origin", origin)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{origin} {path}");
+            assert!(!obs_has_cors_headers(&resp), "{origin} {path}");
+        }
+    }
+
+    // Preflight: no CORS grant for a foreign origin, nor for a loopback origin by default.
+    for origin in ["https://evil.example", "http://localhost:3000"] {
+        let preflight = client
+            .request(
+                reqwest::Method::OPTIONS,
+                format!("{}/api/v1/notes", server.base),
+            )
+            .header("Origin", origin)
+            .header("Access-Control-Request-Method", "POST")
+            .header("Access-Control-Request-Headers", "content-type")
+            .send()
+            .await
+            .unwrap();
+        assert!(!obs_has_cors_headers(&preflight), "{origin}");
+        assert!(!preflight.status().is_success(), "{origin}");
+    }
+
+    // A bodyless cross-site form POST is a "simple request" (no preflight): it must not write.
+    let daily_before = obs_count_files(&root.join("Daily Notes"));
+    let daily = client
+        .post(format!("{}/api/v1/daily", server.base))
+        .header("Origin", "https://evil.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(daily.status(), StatusCode::FORBIDDEN);
+    assert_eq!(obs_count_files(&root.join("Daily Notes")), daily_before);
+}
+
+#[tokio::test]
+async fn obs01_http_loopback_origin_and_no_origin_allowed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (root, _outside) = obs01_fixture(tmp.path());
+    let vault = vault_from_dir(&root, Some("fixture"));
+    let mut cfg = AppConfig::default();
+    cfg.upsert_vault(vault.clone(), true);
+    let server = obs_serve(cfg, &vault, Storage::open_in_memory().unwrap(), None).await;
+    let client = reqwest::Client::new();
+
+    let plain = client
+        .get(format!("{}/api/v1/notes", server.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(plain.status(), StatusCode::OK);
+    for origin in [
+        "http://localhost:3000",
+        "http://127.0.0.1:5173",
+        "http://[::1]:8080",
+        "http://localhost",
+    ] {
+        let resp = client
+            .get(format!("{}/api/v1/notes", server.base))
+            .header("Origin", origin)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{origin}");
+        assert!(!obs_has_cors_headers(&resp), "{origin}");
+    }
+}
+
+#[tokio::test]
+async fn obs01_http_host_allowlist() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (root, _outside) = obs01_fixture(tmp.path());
+    let vault = vault_from_dir(&root, Some("fixture"));
+    let mut cfg = AppConfig::default();
+    cfg.upsert_vault(vault.clone(), true);
+    let server = obs_serve(
+        cfg.clone(),
+        &vault,
+        Storage::open_in_memory().unwrap(),
+        None,
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let port = server.port;
+
+    let get_with_host = |base: String, host: String| {
+        let client = client.clone();
+        async move {
+            client
+                .get(format!("{base}/health"))
+                .header("Host", host)
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+
+    for host in [
+        format!("localhost:{port}"),
+        format!("127.0.0.1:{port}"),
+        format!("[::1]:{port}"),
+        "LOCALHOST".to_string(),
+        format!("localhost.:{port}"),
+    ] {
+        assert_eq!(
+            get_with_host(server.base.clone(), host.clone()).await,
+            StatusCode::OK,
+            "{host}"
+        );
+    }
+    for host in [
+        "evil.example:18792".to_string(),
+        "evil.example".to_string(),
+        format!("127.0.0.1.evil.example:{port}"),
+        format!("localhost@evil.example:{port}"),
+        "nas.local".to_string(),
+    ] {
+        assert_eq!(
+            get_with_host(server.base.clone(), host.clone()).await,
+            StatusCode::FORBIDDEN,
+            "{host}"
+        );
+    }
+
+    // Extra hosts are opt-in through the policy (`--allow-host` / the non-loopback bind address).
+    let policy = obsidian_cli::serve::ServePolicy {
+        extra_hosts: vec!["NAS.local".to_string()],
+        allowed_origins: Vec::new(),
+    };
+    let extra = obs_serve(
+        cfg,
+        &vault,
+        Storage::open_in_memory().unwrap(),
+        Some(policy),
+    )
+    .await;
+    assert_eq!(
+        get_with_host(extra.base.clone(), format!("nas.local:{}", extra.port)).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        get_with_host(extra.base.clone(), "evil.example".to_string()).await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn obs01_serve_refuses_non_loopback_bind_without_token() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (root, _outside) = obs01_fixture(tmp.path());
+    let vault = vault_from_dir(&root, Some("fixture"));
+
+    // Returns before binding, so no socket is ever opened on 0.0.0.0.
+    let err = obsidian_cli::serve::run_http_server(
+        AppConfig::default(),
+        vault.clone(),
+        Storage::open_in_memory().unwrap(),
+        "0.0.0.0",
+        0,
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("--token"), "{err}");
+
+    // `--allow-keyless` does not lift the refusal, and a blank token counts as no token.
+    let opts = obsidian_cli::serve::ServeOptions {
+        token: Some("   ".to_string()),
+        allow_keyless: true,
+        ..Default::default()
+    };
+    let err = obsidian_cli::serve::run_http_server_with_options(
+        AppConfig::default(),
+        vault.clone(),
+        Storage::open_in_memory().unwrap(),
+        "0.0.0.0",
+        0,
+        opts,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("--token"), "{err}");
+
+    // A wildcard origin is refused at startup.
+    let opts = obsidian_cli::serve::ServeOptions {
+        allow_origins: vec!["*".to_string()],
+        ..Default::default()
+    };
+    let err = obsidian_cli::serve::run_http_server_with_options(
+        AppConfig::default(),
+        vault,
+        Storage::open_in_memory().unwrap(),
+        "127.0.0.1",
+        0,
+        opts,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("--allow-origin"), "{err}");
+}
+
+#[tokio::test]
+async fn obs01_allow_origin_opt_in() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (root, _outside) = obs01_fixture(tmp.path());
+    let vault = vault_from_dir(&root, Some("fixture"));
+    let mut cfg = AppConfig::default();
+    cfg.upsert_vault(vault.clone(), true);
+    let policy = obsidian_cli::serve::ServePolicy {
+        extra_hosts: Vec::new(),
+        allowed_origins: vec!["https://app.example.com".to_string()],
+    };
+    let server = obs_serve(
+        cfg,
+        &vault,
+        Storage::open_in_memory().unwrap(),
+        Some(policy),
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    let allowed = client
+        .get(format!("{}/api/v1/notes", server.base))
+        .header("Origin", "https://app.example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(allowed.status(), StatusCode::OK);
+    assert_eq!(
+        allowed.headers()["access-control-allow-origin"],
+        "https://app.example.com"
+    );
+
+    let preflight = client
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("{}/api/v1/notes", server.base),
+        )
+        .header("Origin", "https://app.example.com")
+        .header("Access-Control-Request-Method", "POST")
+        .header(
+            "Access-Control-Request-Headers",
+            "authorization,content-type",
+        )
+        .send()
+        .await
+        .unwrap();
+    assert!(preflight.status().is_success());
+    assert_eq!(
+        preflight.headers()["access-control-allow-origin"],
+        "https://app.example.com"
+    );
+    let methods = preflight.headers()["access-control-allow-methods"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(methods.contains("POST"), "{methods}");
+
+    for origin in [
+        "https://evil.example",
+        "https://app.example.com.evil.example",
+    ] {
+        let other = client
+            .get(format!("{}/api/v1/notes", server.base))
+            .header("Origin", origin)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(other.status(), StatusCode::FORBIDDEN, "{origin}");
+        assert!(!obs_has_cors_headers(&other), "{origin}");
+    }
+}
+
+#[test]
+fn obs01_mcp_rejects_unregistered_vault_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (root, outside) = obs01_fixture(tmp.path());
+    let vault = vault_from_dir(&root, Some("fixture"));
+    let mut cfg = AppConfig::default();
+    cfg.upsert_vault(vault.clone(), true);
+    let storage = Storage::open_in_memory().unwrap();
+    let mcp = McpServer::new(cfg, vault.clone(), storage.clone());
+    let outside_spec = outside.to_string_lossy().to_string();
+    let outside_id = vault_from_dir(&outside, None).id;
+
+    let err = mcp
+        .dispatch_tool(
+            "read_note",
+            &json!({ "note": "secret", "vault": outside_spec }),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("is not registered"), "{err}");
+    assert!(!err.to_string().contains("TOPSECRET-PAYLOAD"));
+
+    let before = obs_count_files(&outside);
+    assert!(mcp
+        .dispatch_tool(
+            "create_note",
+            &json!({ "title": "pwn", "content": "x", "vault": outside_spec })
+        )
+        .is_err());
+    assert!(mcp
+        .dispatch_tool("daily_note", &json!({ "vault": outside_spec }))
+        .is_err());
+    assert!(mcp
+        .dispatch_tool("reindex_vault", &json!({ "vault": outside_spec }))
+        .is_err());
+    assert_eq!(obs_count_files(&outside), before);
+    assert_eq!(storage.note_count(&outside_id).unwrap(), 0);
+
+    // The launch vault and registered vaults keep working by name, ID, and path.
+    let path_spec = root.to_string_lossy().to_string();
+    for spec in ["fixture", vault.id.as_str(), path_spec.as_str()] {
+        let ok = mcp
+            .dispatch_tool("read_note", &json!({ "note": "Home", "vault": spec }))
+            .unwrap_or_else(|e| panic!("{spec}: {e}"));
+        assert_eq!(ok["rel_path"], "Home.md", "{spec}");
+    }
+}
+
+/// Spawns `bitefoundry-obsidian serve --port 0` and collects its stderr until the listen line.
+struct ObsServeProcess {
+    child: std::process::Child,
+    base: String,
+    token: Option<String>,
+}
+
+impl Drop for ObsServeProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn obs_spawn_serve(
+    tmp: &std::path::Path,
+    root: &std::path::Path,
+    extra: &[&str],
+) -> ObsServeProcess {
+    use std::io::BufRead;
+    let mut child = isolated_cli(tmp, root)
+        .args(["serve", "--port", "0"])
+        .args(extra)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut base = None;
+    let mut token = None;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    // The listen line comes first; the token or keyless notice follows immediately.
+    let mut lines_after_listen = 0;
+    while std::time::Instant::now() < deadline {
+        let Ok(line) = rx.recv_timeout(std::time::Duration::from_millis(500)) else {
+            if base.is_some() {
+                break;
+            }
+            continue;
+        };
+        if let Some(rest) = line.strip_prefix("obsidian HTTP API listening on ") {
+            base = rest.split_whitespace().next().map(str::to_string);
+        } else if let Some(rest) =
+            line.strip_prefix("obsidian HTTP API token (generated for this run): ")
+        {
+            token = Some(rest.trim().to_string());
+        }
+        if base.is_some() {
+            lines_after_listen += 1;
+            if lines_after_listen >= 2 {
+                break;
+            }
+        }
+    }
+    ObsServeProcess {
+        child,
+        base: base.expect("serve did not print its listen address"),
+        token,
+    }
+}
+
+#[tokio::test]
+async fn obs01_serve_generates_token_on_loopback() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (root, _outside) = obs01_fixture(tmp.path());
+    let client = reqwest::Client::new();
+
+    let first = obs_spawn_serve(tmp.path(), &root, &[]);
+    let token = first.token.clone().expect("a generated token on stderr");
+    assert_eq!(token.len(), 64, "32 random bytes as hex: {token}");
+    assert!(token.bytes().all(|b| b.is_ascii_hexdigit()));
+
+    let health = client
+        .get(format!("{}/health", first.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(health.status(), StatusCode::OK);
+    let anonymous = client
+        .get(format!("{}/api/v1/notes", first.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+    let wrong = client
+        .get(format!("{}/api/v1/notes", first.base))
+        .bearer_auth("0".repeat(64))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+    let authed = client
+        .get(format!("{}/api/v1/notes", first.base))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(authed.status(), StatusCode::OK);
+    drop(first);
+
+    // A second run gets a different token.
+    let second = obs_spawn_serve(tmp.path(), &root, &[]);
+    assert_ne!(second.token.as_deref(), Some(token.as_str()));
+    drop(second);
+
+    // An explicit --token is used as given and never echoed.
+    let explicit = obs_spawn_serve(tmp.path(), &root, &["--token", "my-local-secret"]);
+    assert!(explicit.token.is_none());
+    let authed = client
+        .get(format!("{}/api/v1/notes", explicit.base))
+        .bearer_auth("my-local-secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(authed.status(), StatusCode::OK);
+    drop(explicit);
+
+    // --allow-keyless opts out on loopback.
+    let keyless = obs_spawn_serve(tmp.path(), &root, &["--allow-keyless"]);
+    assert!(keyless.token.is_none());
+    let anonymous = client
+        .get(format!("{}/api/v1/notes", keyless.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), StatusCode::OK);
+}
+
+#[test]
+fn obs01_serve_cli_refuses_non_loopback_bind_without_token() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (root, _outside) = obs01_fixture(tmp.path());
+    for extra in [&[][..], &["--allow-keyless"][..]] {
+        let out = isolated_cli(tmp.path(), &root)
+            .args(["serve", "--bind", "0.0.0.0", "--port", "0"])
+            .args(extra)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{extra:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("without --token"), "{stderr}");
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn obs02_http_drive_prefix_cannot_escape_vault() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("vault");
+    fs::create_dir_all(&root).unwrap();
+    seed_vault(&root);
+    let vault = vault_from_dir(&root, Some("fixture"));
+    let mut cfg = AppConfig::default();
+    cfg.upsert_vault(vault.clone(), true);
+    let server = obs_serve(cfg, &vault, Storage::open_in_memory().unwrap(), None).await;
+    let client = reqwest::Client::new();
+    let cwd = std::env::current_dir().unwrap();
+    let before = obs_count_files(&root);
+
+    let cases = [
+        (
+            "/api/v1/notes",
+            json!({ "title": "esc", "folder": "C:obs-esc-test", "content": "pwn" }),
+        ),
+        (
+            "/api/v1/notes",
+            json!({ "title": "esc", "folder": "D:outside", "content": "pwn" }),
+        ),
+        (
+            "/api/v1/notes",
+            json!({ "title": "esc", "folder": "sub/C:obs-esc-test", "content": "pwn" }),
+        ),
+        ("/api/v1/daily", json!({ "date": "C:daily-esc" })),
+        ("/api/v1/daily", json!({ "date": "2026-11-23:stream" })),
+    ];
+    for (path, body) in cases {
+        let resp = client
+            .post(format!("{}{path}", server.base))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{path} {body}");
+        assert!(!cwd.join("obs-esc-test").exists(), "{body}");
+        assert!(!cwd.join("daily-esc.md").exists(), "{body}");
+        assert_eq!(obs_count_files(&root), before, "{body}");
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn obs02_mcp_drive_prefix_cannot_escape_vault() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("vault");
+    fs::create_dir_all(&root).unwrap();
+    seed_vault(&root);
+    let vault = vault_from_dir(&root, Some("fixture"));
+    let mut cfg = AppConfig::default();
+    cfg.upsert_vault(vault.clone(), true);
+    let mcp = McpServer::new(cfg, vault, Storage::open_in_memory().unwrap());
+    let cwd = std::env::current_dir().unwrap();
+    let before = obs_count_files(&root);
+
+    let cases = [
+        (
+            "create_note",
+            json!({ "title": "esc", "folder": "C:obs-esc-test", "content": "pwn" }),
+        ),
+        (
+            "create_note",
+            json!({ "title": "esc", "folder": "D:outside", "content": "pwn" }),
+        ),
+        ("daily_note", json!({ "date": "C:daily-esc" })),
+    ];
+    for (tool, args) in cases {
+        assert!(mcp.dispatch_tool(tool, &args).is_err(), "{tool} {args}");
+        assert!(!cwd.join("obs-esc-test").exists(), "{args}");
+        assert!(!cwd.join("daily-esc.md").exists(), "{args}");
+        assert_eq!(obs_count_files(&root), before, "{args}");
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn obs15_unc_vault_opens() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("vault");
+    fs::create_dir_all(&root).unwrap();
+    seed_vault(&root);
+
+    // C:\path\to\vault -> \\localhost\C$\path\to\vault (the administrative share).
+    let local = vault_from_dir(&root, None)
+        .path
+        .to_string_lossy()
+        .to_string();
+    let Some((drive, rest)) = local.split_once(':') else {
+        eprintln!("obs15_unc_vault_opens: skipped (no drive letter in {local})");
+        return;
+    };
+    let unc = std::path::PathBuf::from(format!(r"\\localhost\{drive}{}{rest}", '$'));
+    if !unc.is_dir() {
+        eprintln!(
+            "obs15_unc_vault_opens: skipped (admin share not reachable: {})",
+            unc.display()
+        );
+        return;
+    }
+
+    let vault = vault_from_dir(&unc, Some("unc-fixture"));
+    let vault_path = vault.path.to_string_lossy().to_string();
+    assert!(
+        vault_path.to_ascii_lowercase().starts_with(r"\\localhost\"),
+        "{vault_path}"
+    );
+    assert!(vault.path.is_absolute());
+
+    let storage = Storage::open_in_memory().unwrap();
+    let stats = storage.sync_vault(&vault).unwrap();
+    assert_eq!(stats.total_notes, 3);
+
+    let note_abs = fs::canonicalize(unc.join("Projects").join("Q4 Architecture RFC.md")).unwrap();
+    let canonical_root = fs::canonicalize(&unc).unwrap();
+    assert_eq!(
+        obsidian_cli::vault::fs::rel_path_in_vault(&vault.path, Some(&canonical_root), &note_abs)
+            .as_deref(),
+        Some("Projects/Q4 Architecture RFC.md")
+    );
 }
