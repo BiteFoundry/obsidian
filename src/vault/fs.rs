@@ -13,7 +13,7 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use chrono::Local;
+use chrono::{Datelike, Local, NaiveDate};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -1987,10 +1987,10 @@ pub fn daily_note_settings(vault: &VaultProfile) -> (String, String) {
     if let Ok(raw) = fs::read_to_string(cfg_path) {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) {
             if vault.daily_folder.is_none() {
+                // A present `folder` is used even when empty: in Obsidian `""` (or `/`) means
+                // the vault root. Only a missing key keeps the `Daily Notes` default.
                 if let Some(f) = val.get("folder").and_then(|v| v.as_str()) {
-                    if !f.trim().is_empty() {
-                        folder = f.trim().trim_matches('/').to_string();
-                    }
+                    folder = f.trim().trim_matches('/').trim().to_string();
                 }
             }
             if vault.daily_format.is_none() {
@@ -2006,6 +2006,9 @@ pub fn daily_note_settings(vault: &VaultProfile) -> (String, String) {
 }
 
 /// Converts Obsidian Moment.js date format (e.g. `YYYY-MM-DD`) to `chrono` strftime format.
+///
+/// Handles only `YYYY`, `YY`, `MM` and `DD`, and mangles formats such as `MMM`.
+#[deprecated(note = "use format_moment_date, which understands the Moment tokens Obsidian uses")]
 pub fn obsidian_date_format_to_chrono(fmt: &str) -> String {
     fmt.replace("YYYY", "%Y")
         .replace("YY", "%y")
@@ -2013,18 +2016,137 @@ pub fn obsidian_date_format_to_chrono(fmt: &str) -> String {
         .replace("DD", "%d")
 }
 
-/// Opens or creates today's Daily Note, returning `(rel_path, abs_path, created)`.
+const MOMENT_MONTHS: [&str; 12] = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+];
+const MOMENT_WEEKDAYS: [&str; 7] = [
+    "Sunday",
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+];
+/// Moment date tokens this formatter understands, longest first within each letter.
+const MOMENT_TOKENS: [&str; 19] = [
+    "YYYY", "YY", "MMMM", "MMM", "MM", "M", "DDDD", "DDD", "DD", "Do", "D", "dddd", "ddd", "dd",
+    "d", "Q", "WW", "W", "GGGG",
+];
+
+fn ordinal_suffix(n: u32) -> &'static str {
+    match (n % 10, n % 100) {
+        (_, 11..=13) => "th",
+        (1, _) => "st",
+        (2, _) => "nd",
+        (3, _) => "rd",
+        _ => "th",
+    }
+}
+
+/// Formats `date` with an Obsidian (Moment.js) date format such as `YYYY-MM-DD dddd`.
+///
+/// Supported tokens: `YYYY` `YY` `MMMM` `MMM` `MM` `M` `DDDD` `DDD` `DD` `Do` `D` `dddd` `ddd`
+/// `dd` `d` `Q` `WW` `W` `GGGG`, plus `[literal text]`. Everything else is copied as is, so no
+/// input can fail. Month and weekday names are English (Obsidian uses the app locale).
+pub fn format_moment_date(fmt: &str, date: NaiveDate) -> String {
+    let month = MOMENT_MONTHS[date.month0() as usize];
+    let weekday_index = date.weekday().num_days_from_sunday();
+    let weekday = MOMENT_WEEKDAYS[weekday_index as usize];
+    let iso = date.iso_week();
+
+    let mut out = String::with_capacity(fmt.len() + 8);
+    let mut rest = fmt;
+    while let Some(ch) = rest.chars().next() {
+        if ch == '[' {
+            if let Some(end) = rest.find(']') {
+                out.push_str(&rest[1..end]);
+                rest = &rest[end + 1..];
+                continue;
+            }
+        }
+        let Some(token) = MOMENT_TOKENS.iter().find(|t| rest.starts_with(**t)) else {
+            out.push(ch);
+            rest = &rest[ch.len_utf8()..];
+            continue;
+        };
+        match *token {
+            "YYYY" => out.push_str(&format!("{:04}", date.year())),
+            "YY" => out.push_str(&format!("{:02}", date.year().rem_euclid(100))),
+            "MMMM" => out.push_str(month),
+            "MMM" => out.push_str(&month[..3]),
+            "MM" => out.push_str(&format!("{:02}", date.month())),
+            "M" => out.push_str(&date.month().to_string()),
+            "DDDD" => out.push_str(&format!("{:03}", date.ordinal())),
+            "DDD" => out.push_str(&date.ordinal().to_string()),
+            "DD" => out.push_str(&format!("{:02}", date.day())),
+            "Do" => out.push_str(&format!("{}{}", date.day(), ordinal_suffix(date.day()))),
+            "D" => out.push_str(&date.day().to_string()),
+            "dddd" => out.push_str(weekday),
+            "ddd" => out.push_str(&weekday[..3]),
+            "dd" => out.push_str(&weekday[..2]),
+            "d" => out.push_str(&weekday_index.to_string()),
+            "Q" => out.push_str(&(date.month0() / 3 + 1).to_string()),
+            "WW" => out.push_str(&format!("{:02}", iso.week())),
+            "W" => out.push_str(&iso.week().to_string()),
+            _ => out.push_str(&format!("{:04}", iso.year())),
+        }
+        rest = &rest[token.len()..];
+    }
+    out
+}
+
+/// `Some` for a strict `YYYY-MM-DD` calendar date, `None` for any other string.
+fn parse_iso_date(s: &str) -> Option<NaiveDate> {
+    let bytes = s.as_bytes();
+    let shape_ok = bytes.len() == 10
+        && bytes.iter().enumerate().all(|(i, b)| {
+            if i == 4 || i == 7 {
+                *b == b'-'
+            } else {
+                b.is_ascii_digit()
+            }
+        });
+    if !shape_ok {
+        return None;
+    }
+    NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
+}
+
+/// Opens or creates a Daily Note, returning `(rel_path, abs_path, created)`.
+///
+/// The file name follows the vault's Moment date format. `date_override` picks the day when it
+/// is a `YYYY-MM-DD` date; any other non-empty override is used as the file name as given.
 pub fn ensure_daily_note(
     vault: &VaultProfile,
     date_override: Option<&str>,
 ) -> Result<(String, PathBuf, bool)> {
     let (folder, fmt) = daily_note_settings(vault);
-    let date_str = match date_override.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(d) => d.to_string(),
-        None => {
-            let chrono_fmt = obsidian_date_format_to_chrono(&fmt);
-            Local::now().format(&chrono_fmt).to_string()
+    let format_date = |date: NaiveDate| {
+        let name = format_moment_date(&fmt, date);
+        if name.trim().is_empty() {
+            format_moment_date("YYYY-MM-DD", date)
+        } else {
+            name
         }
+    };
+    let date_str = match date_override.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(d) => match parse_iso_date(d) {
+            Some(date) => format_date(date),
+            None => d.to_string(),
+        },
+        None => format_date(Local::now().date_naive()),
     };
     let rel_path = if folder.is_empty() {
         format!("{date_str}.md")
@@ -2036,6 +2158,14 @@ pub fn ensure_daily_note(
         return Ok((rel_path, abs_path, false));
     }
 
+    // A format such as `YYYY/MM/YYYY-MM-DD` puts the note in nested folders; the note itself is
+    // named by the last segment.
+    let date_str = date_str
+        .replace('\\', "/")
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .to_string();
     let body = format!(
         "---\ncreated: {date_str}\ntags: [daily]\n---\n\n# {date_str}\n\n## Focus\n\n- [ ] Review priorities and notes\n\n## Notes\n\n"
     );
@@ -2405,5 +2535,196 @@ mod tests {
         let root = Path::new("/vaults/main");
         let joined = safe_vault_path(root, "Standup 10:30.md").unwrap();
         assert_eq!(joined, root.join("Standup 10:30.md"));
+    }
+
+    fn obs09_vault(daily_json: Option<&str>) -> (tempfile::TempDir, VaultProfile) {
+        let tmp = tempfile::tempdir().unwrap();
+        if let Some(json) = daily_json {
+            fs::create_dir_all(tmp.path().join(".obsidian")).unwrap();
+            fs::write(tmp.path().join(".obsidian/daily-notes.json"), json).unwrap();
+        }
+        let vault = crate::vault::vault_from_dir(tmp.path(), Some("obs09"));
+        (tmp, vault)
+    }
+
+    #[test]
+    fn obs09_moment_tokens() {
+        let monday = NaiveDate::from_ymd_opt(2026, 11, 23).unwrap();
+        let cases = [
+            ("YYYY-MM-DD", "2026-11-23"),
+            ("YYYY-MM-DD dddd", "2026-11-23 Monday"),
+            ("YYYY-MMM-DD", "2026-Nov-23"),
+            ("YYYY/MMMM/YYYY-MM-DD", "2026/November/2026-11-23"),
+            ("YY.M.D", "26.11.23"),
+            ("ddd Do MMM", "Mon 23rd Nov"),
+            ("[Daily] YYYY-MM-DD", "Daily 2026-11-23"),
+            ("[YYYY]", "YYYY"),
+            ("dd d", "Mo 1"),
+            ("DDDD DDD", "327 327"),
+            ("[Q]Q GGGG-[W]WW W", "Q4 2026-W48 48"),
+            ("100% YYYY", "100% 2026"),
+            ("[open YYYY", "[open 2026"),
+            ("YYYY년 M월 D일", "2026년 11월 23일"),
+            ("", ""),
+        ];
+        for (fmt, expected) in cases {
+            assert_eq!(format_moment_date(fmt, monday), expected, "{fmt}");
+        }
+
+        let march = NaiveDate::from_ymd_opt(2026, 3, 5).unwrap();
+        assert_eq!(format_moment_date("M/D", march), "3/5");
+        assert_eq!(format_moment_date("MM/DD", march), "03/05");
+        assert_eq!(format_moment_date("DDDD", march), "064");
+        assert_eq!(format_moment_date("Q", march), "1");
+        // ISO week-year differs from the calendar year around New Year.
+        let new_year = NaiveDate::from_ymd_opt(2027, 1, 1).unwrap();
+        assert_eq!(format_moment_date("GGGG-[W]WW", new_year), "2026-W53");
+        assert_eq!(
+            format_moment_date("d dddd", NaiveDate::from_ymd_opt(2026, 11, 22).unwrap()),
+            "0 Sunday"
+        );
+
+        for (day, expected) in [
+            (1, "1st"),
+            (2, "2nd"),
+            (3, "3rd"),
+            (4, "4th"),
+            (11, "11th"),
+            (12, "12th"),
+            (13, "13th"),
+            (21, "21st"),
+            (22, "22nd"),
+            (30, "30th"),
+            (31, "31st"),
+        ] {
+            let date = NaiveDate::from_ymd_opt(2026, 10, day).unwrap();
+            assert_eq!(format_moment_date("Do", date), expected);
+        }
+
+        // No input panics, whatever it contains.
+        for junk in [
+            "%",
+            "%Y-%m-%d %!",
+            "[[]]",
+            "]",
+            "[",
+            "\\\\YYYY",
+            "{}{:?}",
+            "dddddddddd",
+            "MMMMMMMMM",
+            "한글 [메모] ✅",
+            "\u{0}\t\n",
+        ] {
+            let _ = format_moment_date(junk, monday);
+        }
+        // A stray `%` is copied, never read as a strftime specifier.
+        assert_eq!(format_moment_date("%Y-%m", monday), "%Y-%m");
+    }
+
+    #[test]
+    fn obs09_daily_folder_empty_means_root() {
+        for folder in ["", "/", "  "] {
+            let json = format!("{{\"folder\":\"{folder}\",\"format\":\"YYYY-MM-DD\"}}");
+            let (tmp, vault) = obs09_vault(Some(&json));
+            let (rel_path, abs_path, created) =
+                ensure_daily_note(&vault, Some("2026-11-23")).unwrap();
+            assert_eq!(rel_path, "2026-11-23.md", "folder {folder:?}");
+            assert!(created);
+            assert_eq!(abs_path, tmp.path().join("2026-11-23.md"));
+            assert!(tmp.path().join("2026-11-23.md").is_file());
+            assert!(!tmp.path().join("Daily Notes").exists());
+        }
+    }
+
+    #[test]
+    fn obs09_daily_folder_absent_keeps_default() {
+        for json in [
+            None,
+            Some("{\"format\":\"YYYY-MM-DD\"}"),
+            Some("{}"),
+            Some("not json"),
+        ] {
+            let (tmp, vault) = obs09_vault(json);
+            let (rel_path, _, created) = ensure_daily_note(&vault, Some("2026-11-23")).unwrap();
+            assert_eq!(rel_path, "Daily Notes/2026-11-23.md", "{json:?}");
+            assert!(created);
+            assert_eq!(
+                fs::read_to_string(tmp.path().join("Daily Notes/2026-11-23.md")).unwrap(),
+                "---\ncreated: 2026-11-23\ntags: [daily]\n---\n\n# 2026-11-23\n\n## Focus\n\n- [ ] Review priorities and notes\n\n## Notes\n\n"
+            );
+        }
+
+        // A folder set on the vault profile still wins over daily-notes.json.
+        let (_tmp, mut vault) = obs09_vault(Some("{\"folder\":\"\"}"));
+        vault.daily_folder = Some("Journal".into());
+        let (rel_path, _, _) = ensure_daily_note(&vault, Some("2026-11-23")).unwrap();
+        assert_eq!(rel_path, "Journal/2026-11-23.md");
+    }
+
+    #[test]
+    fn obs09_daily_override_uses_vault_format() {
+        let (_tmp, vault) = obs09_vault(Some("{\"format\":\"YYYY-MM-DD dddd\"}"));
+        let (rel_path, _, _) = ensure_daily_note(&vault, Some("2026-11-23")).unwrap();
+        assert_eq!(rel_path, "Daily Notes/2026-11-23 Monday.md");
+        // The same day resolves to the same note again.
+        let (again, _, created) = ensure_daily_note(&vault, Some(" 2026-11-23 ")).unwrap();
+        assert_eq!(again, rel_path);
+        assert!(!created);
+
+        // Anything that is not a strict YYYY-MM-DD date is used as the file name as given.
+        for verbatim in ["sprint-12", "2026-1-5", "2026-02-30", "20261123"] {
+            let (rel_path, _, _) = ensure_daily_note(&vault, Some(verbatim)).unwrap();
+            assert_eq!(rel_path, format!("Daily Notes/{verbatim}.md"));
+        }
+
+        // With no override the name is today's date in the vault format.
+        let today = format_moment_date("YYYY-MM-DD dddd", Local::now().date_naive());
+        let (rel_path, _, _) = ensure_daily_note(&vault, None).unwrap();
+        // Tolerate a midnight rollover between the two clock reads.
+        let after = format_moment_date("YYYY-MM-DD dddd", Local::now().date_naive());
+        assert!(
+            rel_path == format!("Daily Notes/{today}.md")
+                || rel_path == format!("Daily Notes/{after}.md"),
+            "{rel_path}"
+        );
+    }
+
+    #[test]
+    fn obs09_nested_format_creates_folders_and_names_by_last_segment() {
+        let (tmp, vault) = obs09_vault(Some(
+            "{\"folder\":\"Journal\",\"format\":\"YYYY/MMMM/YYYY-MM-DD\"}",
+        ));
+        let (rel_path, abs_path, created) = ensure_daily_note(&vault, Some("2026-11-23")).unwrap();
+        assert_eq!(rel_path, "Journal/2026/November/2026-11-23.md");
+        assert!(created);
+        assert!(abs_path.starts_with(tmp.path()));
+        let body = fs::read_to_string(&abs_path).unwrap();
+        assert!(body.starts_with("---\ncreated: 2026-11-23\n"), "{body}");
+        assert!(body.contains("\n# 2026-11-23\n"), "{body}");
+
+        // A format that yields nothing falls back to the ISO date instead of ".md".
+        let (_tmp, vault) = obs09_vault(Some("{\"folder\":\"\",\"format\":\"[]\"}"));
+        let (rel_path, _, _) = ensure_daily_note(&vault, Some("2026-11-23")).unwrap();
+        assert_eq!(rel_path, "2026-11-23.md");
+    }
+
+    #[test]
+    fn obs09_format_output_still_goes_through_path_confinement() {
+        let (tmp, vault) = obs09_vault(Some("{\"folder\":\"\",\"format\":\"[../]YYYY-MM-DD\"}"));
+        assert!(ensure_daily_note(&vault, Some("2026-11-23")).is_err());
+        assert!(!tmp.path().parent().unwrap().join("2026-11-23.md").exists());
+
+        let (tmp, vault) = obs09_vault(Some(
+            "{\"folder\":\"\",\"format\":\"YYYY-MM-DD [at] HH:mm\"}",
+        ));
+        let result = ensure_daily_note(&vault, Some("2026-11-23"));
+        if cfg!(windows) {
+            let err = result.unwrap_err();
+            let coded = err.downcast_ref::<crate::models::CodedError>().unwrap();
+            assert_eq!(coded.code, "invalid_argument");
+            assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 1); // only .obsidian
+        } else {
+            assert_eq!(result.unwrap().0, "2026-11-23 at HH:mm.md");
+        }
     }
 }

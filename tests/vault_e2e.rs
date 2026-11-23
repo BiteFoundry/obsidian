@@ -8261,3 +8261,126 @@ fn obs08_missing_config_still_bootstraps() {
     let saved = AppConfig::load_from(&config_path).unwrap();
     assert_eq!(saved.vaults.len(), 2);
 }
+
+fn obs09_daily_vault(
+    root: &std::path::Path,
+    name: &str,
+    format: &str,
+) -> obsidian_cli::config::VaultProfile {
+    fs::create_dir_all(root.join(".obsidian")).unwrap();
+    fs::write(
+        root.join(".obsidian/daily-notes.json"),
+        serde_json::to_string(&json!({ "folder": "", "format": format })).unwrap(),
+    )
+    .unwrap();
+    vault_from_dir(root, Some(name))
+}
+
+#[tokio::test]
+async fn obs09_daily_note_via_mcp_and_http_uses_vault_folder_and_format() {
+    for (format, expected) in [
+        ("YYYY-MM-DD dddd", "2026-11-23 Monday.md"),
+        ("YYYY-MMM-DD", "2026-Nov-23.md"),
+    ] {
+        // MCP `daily_note`
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("McpDaily");
+        let vault = obs09_daily_vault(&root, "McpDaily", format);
+        let mut cfg = AppConfig::default();
+        cfg.upsert_vault(vault.clone(), true);
+        let mcp = McpServer::new(cfg, vault.clone(), Storage::open_in_memory().unwrap());
+        let result = mcp
+            .dispatch_tool("daily_note", &json!({ "date": "2026-11-23" }))
+            .unwrap();
+        assert_eq!(result["rel_path"], expected, "MCP, format {format}");
+        assert_eq!(result["created"], true);
+        assert!(root.join(expected).is_file());
+        assert!(!root.join("Daily Notes").exists());
+        let again = mcp
+            .dispatch_tool(
+                "daily_note",
+                &json!({ "date": "2026-11-23", "append": "- [ ] once" }),
+            )
+            .unwrap();
+        assert_eq!(again["rel_path"], expected);
+        assert_eq!(again["created"], false);
+
+        // HTTP `POST /api/v1/daily`
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("HttpDaily");
+        let vault = obs09_daily_vault(&root, "HttpDaily", format);
+        let mut cfg = AppConfig::default();
+        cfg.upsert_vault(vault.clone(), true);
+        let state = Arc::new(ServeState {
+            cfg,
+            default_vault: vault.clone(),
+            storage: Storage::open_in_memory().unwrap(),
+            token: None,
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = build_router(state);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let daily: Value = reqwest::Client::new()
+            .post(format!("http://{addr}/api/v1/daily"))
+            .json(&json!({ "date": "2026-11-23" }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        server.abort();
+        assert_eq!(daily["ok"], true, "HTTP, format {format}: {daily}");
+        assert_eq!(daily["rel_path"], expected);
+        assert_eq!(daily["created"], true);
+        assert!(root.join(expected).is_file());
+        assert!(!root.join("Daily Notes").exists());
+    }
+}
+
+#[tokio::test]
+async fn obs09_daily_format_with_colon_is_rejected_on_windows_not_written_elsewhere() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("ColonDaily");
+    let vault = obs09_daily_vault(&root, "ColonDaily", "YYYY-MM-DD [T]HH:mm");
+    let mut cfg = AppConfig::default();
+    cfg.upsert_vault(vault.clone(), true);
+    let state = Arc::new(ServeState {
+        cfg,
+        default_vault: vault.clone(),
+        storage: Storage::open_in_memory().unwrap(),
+        token: None,
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = build_router(state);
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/api/v1/daily"))
+        .json(&json!({ "date": "2026-11-23" }))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    server.abort();
+
+    let markdown_files = || {
+        fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "md"))
+            .count()
+    };
+    if cfg!(windows) {
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(markdown_files(), 0);
+    } else {
+        assert_eq!(status, StatusCode::OK);
+        assert!(root.join("2026-11-23 THH:mm.md").is_file());
+    }
+}

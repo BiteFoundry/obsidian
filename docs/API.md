@@ -44,3 +44,13 @@ Every `/api/v1/*` request needs `Authorization: Bearer <token>`. `/health` needs
 HTTP response shapes are unchanged: list endpoints return full arrays and note reads return full `NoteDetail` objects. Shared domain updates are reflected in field values: outgoing links include `status` (and `candidates` when ambiguous), graph responses clamp `depth` to `1..5` and report distinct-source `in_degree` and distinct-target `out_degree` (excluding image embeds and self-links), and ambiguous note references return `404` with the `Ambiguous note reference ...` error message.
 
 See **[openapi.yaml](openapi.yaml)** for the full OpenAPI 3.1 specification.
+
+## Daily notes
+
+`POST /api/v1/daily`, the MCP `daily_note` tool, the CLI `daily` command and the TUI `D` key all name the note the way the vault's `.obsidian/daily-notes.json` says:
+
+- **Folder**: `"folder": ""` (or `"/"`) puts daily notes at the vault root. When the file or the `folder` key is missing, the folder is `Daily Notes`.
+- **Format**: the Moment tokens `YYYY` `YY` `MMMM` `MMM` `MM` `M` `DDDD` `DDD` `DD` `Do` `D` `dddd` `ddd` `dd` `d` `Q` `WW` `W` `GGGG` and `[literal text]` are supported, so `YYYY-MM-DD dddd` gives `2026-11-23 Monday.md`. A format containing `/` (for example `YYYY/MM/YYYY-MM-DD`) creates the folders in between. Other characters, including time tokens such as `HH`, are copied as written.
+- **`date`**: a `YYYY-MM-DD` value selects that day and is formatted with the vault's format. Any other value is used as the file name as given.
+
+Known limitation: month and weekday names are always English. Obsidian writes them in the app language, so a vault whose format uses `MMM`, `MMMM`, `ddd` or `dddd` under a non-English Obsidian gets a differently named file here.
