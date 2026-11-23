@@ -542,6 +542,14 @@ pub struct IndexStats {
     pub total_tags: usize,
     pub total_tasks: usize,
     pub elapsed_ms: u64,
+    /// Directories the scan could not read. Notes indexed under them are kept, not pruned.
+    /// Omitted from JSON when zero.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub unreadable_dirs: usize,
+}
+
+fn is_zero_usize(n: &usize) -> bool {
+    *n == 0
 }
 
 /// Vault summary returned by CLI/HTTP/MCP `vaults`.

@@ -257,19 +257,41 @@ fn walk_html_dir_recursive(root: &Path, dir: &Path, out: &mut Vec<VaultHtmlFile>
     Ok(())
 }
 
+/// Result of a full vault scan: the Markdown files found, plus the directories whose listing
+/// failed and whose notes may therefore still exist on disk.
+#[derive(Default)]
+pub struct VaultScan {
+    pub entries: Vec<DiskNoteEntry>,
+    /// Vault-relative directories (`""` is the vault root) that could not be read completely.
+    pub unreadable_dirs: Vec<String>,
+}
+
 /// Walks a vault directory recursively for `.md` files, skipping hidden/system directories.
 pub fn scan_vault_markdown_files(vault_root: &Path) -> Result<Vec<DiskNoteEntry>> {
+    Ok(scan_vault_markdown_files_report(vault_root)?.entries)
+}
+
+/// Like [`scan_vault_markdown_files`], and also reports the directories that could not be read
+/// so the caller does not mistake their notes for deleted ones.
+pub fn scan_vault_markdown_files_report(vault_root: &Path) -> Result<VaultScan> {
     if !vault_root.is_dir() {
         bail!("Vault directory does not exist: {}", vault_root.display());
     }
-    let mut out = Vec::new();
-    walk_dir_recursive(vault_root, vault_root, &mut out)?;
-    out.sort_by(|a, b| {
+    let mut scan = VaultScan::default();
+    walk_dir_recursive(
+        vault_root,
+        vault_root,
+        &mut scan.entries,
+        &mut scan.unreadable_dirs,
+    )?;
+    scan.entries.sort_by(|a, b| {
         a.rel_path
             .to_ascii_lowercase()
             .cmp(&b.rel_path.to_ascii_lowercase())
     });
-    Ok(out)
+    scan.unreadable_dirs.sort();
+    scan.unreadable_dirs.dedup();
+    Ok(scan)
 }
 
 /// Walks a single subdirectory inside `vault_root` recursively for `.md` files.
@@ -281,7 +303,7 @@ pub fn scan_vault_markdown_subdir(vault_root: &Path, subdir: &Path) -> Result<Ve
         return Ok(Vec::new());
     }
     let mut out = Vec::new();
-    walk_dir_recursive(vault_root, subdir, &mut out)?;
+    walk_dir_recursive(vault_root, subdir, &mut out, &mut Vec::new())?;
     out.sort_by(|a, b| {
         a.rel_path
             .to_ascii_lowercase()
@@ -290,16 +312,38 @@ pub fn scan_vault_markdown_subdir(vault_root: &Path, subdir: &Path) -> Result<Ve
     Ok(out)
 }
 
-fn walk_dir_recursive(root: &Path, dir: &Path, out: &mut Vec<DiskNoteEntry>) -> Result<()> {
+fn walk_dir_recursive(
+    root: &Path,
+    dir: &Path,
+    out: &mut Vec<DiskNoteEntry>,
+    unreadable: &mut Vec<String>,
+) -> Result<()> {
+    let rel_dir = || {
+        dir.strip_prefix(root)
+            .map(normalize_rel_path)
+            .unwrap_or_default()
+    };
     let entries = match fs::read_dir(dir) {
         Ok(rd) => rd,
-        Err(_) => return Ok(()),
+        Err(err) => {
+            // A directory that vanished mid-scan is gone; any other failure (permissions,
+            // I/O) means the notes below it may still exist.
+            if err.kind() != std::io::ErrorKind::NotFound {
+                unreadable.push(rel_dir());
+            }
+            return Ok(());
+        }
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let Ok(entry) = entry else {
+            unreadable.push(rel_dir());
+            continue;
+        };
         let path = entry.path();
         let file_name = entry.file_name();
         let name = file_name.to_string_lossy();
         let Ok(ft) = entry.file_type() else {
+            unreadable.push(rel_dir());
             continue;
         };
         if ft.is_symlink() {
@@ -309,7 +353,7 @@ fn walk_dir_recursive(root: &Path, dir: &Path, out: &mut Vec<DiskNoteEntry>) -> 
             if is_ignored_dir_name(&name) {
                 continue;
             }
-            walk_dir_recursive(root, &path, out)?;
+            walk_dir_recursive(root, &path, out, unreadable)?;
         } else if ft.is_file() {
             if !is_markdown_file_path(&name) {
                 continue;

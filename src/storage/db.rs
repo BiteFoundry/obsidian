@@ -33,7 +33,7 @@ use crate::{
             move_note, normalize_rel_path, replace_note_text, resolve_attachment_staged,
             resolve_markdown_link_from_source, resolve_note_identifier,
             resolve_wikilink_from_source, rewrite_wikilinks_for_move, safe_vault_path,
-            scan_vault_markdown_files, title_from_rel_path, wikilink_candidates_from_source,
+            scan_vault_markdown_files_report, title_from_rel_path, wikilink_candidates_from_source,
         },
         parser::parse_markdown,
     },
@@ -668,9 +668,16 @@ impl Storage {
             if is_new {
                 resolve_unresolved = true;
                 stem_candidates.insert(title.to_ascii_lowercase());
+                insert_alias_names(&mut stem_candidates, &parsed.aliases);
             } else if aliases_changed {
                 resolve_unresolved = true;
                 affected_targets.insert(note.rel_path.clone());
+                let prev: Vec<String> = prev_aliases_json
+                    .as_deref()
+                    .and_then(|json| serde_json::from_str(json).ok())
+                    .unwrap_or_default();
+                insert_alias_names(&mut stem_candidates, &prev);
+                insert_alias_names(&mut stem_candidates, &parsed.aliases);
             }
         }
 
@@ -719,7 +726,8 @@ impl Storage {
         force_hash_check: bool,
     ) -> Result<IndexStats> {
         let start = Instant::now();
-        let disk_entries = scan_vault_markdown_files(&vault.path)?;
+        let scan = scan_vault_markdown_files_report(&vault.path)?;
+        let disk_entries = scan.entries;
         let vault_id = vault.id.as_str();
 
         let mut conn = self
@@ -727,11 +735,11 @@ impl Storage {
             .lock()
             .map_err(|_| anyhow!("Storage lock poisoned"))?;
 
-        // Load existing (rel_path -> (mtime_ms, mtime_ns, size_bytes, content_hash, is_bookmarked))
-        let mut existing: HashMap<String, (i64, i64, i64, String, bool)> = HashMap::new();
+        // Load existing (rel_path -> (mtime_ms, mtime_ns, size_bytes, content_hash, is_bookmarked, aliases_json))
+        let mut existing: HashMap<String, (i64, i64, i64, String, bool, String)> = HashMap::new();
         {
             let mut stmt = conn.prepare(
-                "SELECT rel_path, mtime_ms, mtime_ns, size_bytes, content_hash, is_bookmarked
+                "SELECT rel_path, mtime_ms, mtime_ns, size_bytes, content_hash, is_bookmarked, aliases_json
                  FROM notes WHERE vault_id = ?1",
             )?;
             let rows = stmt.query_map(params![vault_id], |row| {
@@ -742,26 +750,32 @@ impl Storage {
                     row.get::<_, i64>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, i64>(5)? != 0,
+                    row.get::<_, String>(6)?,
                 ))
             })?;
             for r in rows {
-                let (rp, mt_ms, mt_ns, sz, hash, bm) = r?;
-                existing.insert(rp, (mt_ms, mt_ns, sz, hash, bm));
+                let (rp, mt_ms, mt_ns, sz, hash, bm, aliases) = r?;
+                existing.insert(rp, (mt_ms, mt_ns, sz, hash, bm, aliases));
             }
         }
 
         let disk_set: HashSet<String> = disk_entries.iter().map(|e| e.rel_path.clone()).collect();
-        let removed_paths: Vec<String> = existing
-            .keys()
-            .filter(|p| !disk_set.contains(*p))
-            .cloned()
-            .collect();
+        // A directory the scan could not read must not look like a deleted one: rows under it
+        // stay as they are (bookmark included) until a later scan can read it again.
+        let removed_paths =
+            compute_removed_paths(existing.keys(), &disk_set, &scan.unreadable_dirs);
 
-        let mut to_upsert: Vec<(&crate::vault::fs::DiskNoteEntry, String, String, bool)> =
-            Vec::new();
+        // (entry, raw markdown, content hash, is_bookmarked, previous aliases_json or None when new)
+        let mut to_upsert: Vec<(
+            &crate::vault::fs::DiskNoteEntry,
+            String,
+            String,
+            bool,
+            Option<&str>,
+        )> = Vec::new();
         for entry in &disk_entries {
             match existing.get(&entry.rel_path) {
-                Some((mt_ms, mt_ns, sz, stored_hash, is_bm))
+                Some((mt_ms, mt_ns, sz, stored_hash, is_bm, aliases))
                     if *mt_ms == entry.mtime_ms
                         && *mt_ns == entry.mtime_ns
                         && *sz == entry.size_bytes =>
@@ -774,7 +788,7 @@ impl Storage {
                         let disk_hash = content_sha256_hex(&bytes);
                         if stored_hash.is_empty() || *stored_hash != disk_hash {
                             let raw = decode_utf8_lossy(bytes);
-                            to_upsert.push((entry, raw, disk_hash, *is_bm));
+                            to_upsert.push((entry, raw, disk_hash, *is_bm, Some(aliases.as_str())));
                         }
                     }
                 }
@@ -785,8 +799,9 @@ impl Storage {
                     };
                     let disk_hash = content_sha256_hex(&bytes);
                     let is_bm = existing_row.map(|t| t.4).unwrap_or(false);
+                    let prev_aliases = existing_row.map(|t| t.5.as_str());
                     let raw = decode_utf8_lossy(bytes);
-                    to_upsert.push((entry, raw, disk_hash, is_bm));
+                    to_upsert.push((entry, raw, disk_hash, is_bm, prev_aliases));
                 }
             }
         }
@@ -815,13 +830,22 @@ impl Storage {
             )?;
         }
 
+        // Inputs for incremental link resolution (same sets `sync_paths` builds).
+        let mut affected_sources: HashSet<String> = HashSet::new();
+        let mut affected_targets: HashSet<String> = HashSet::new();
+        let mut name_candidates: HashSet<String> = HashSet::new();
+        let mut resolve_unresolved = false;
+
         // Remove deleted notes
         for rel in &removed_paths {
             delete_note_in_tx(&tx, vault_id, rel)?;
+            affected_targets.insert(rel.clone());
+            name_candidates.insert(title_from_rel_path(rel).to_ascii_lowercase());
+            resolve_unresolved = true;
         }
 
         // Upsert added/modified notes (only files that were successfully read from disk)
-        for (entry, raw, disk_hash, is_bookmarked) in &to_upsert {
+        for (entry, raw, disk_hash, is_bookmarked, prev_aliases) in &to_upsert {
             let parsed = parse_markdown(&entry.rel_path, &entry.title, raw);
             upsert_note_in_tx(
                 &tx,
@@ -837,63 +861,53 @@ impl Storage {
                 *is_bookmarked,
                 !first_index,
             )?;
-        }
 
-        // Re-resolve all wikilinks in the vault whenever notes were added/updated/removed
-        if needs_link_resolution {
-            let mut all_paths: Vec<String> = Vec::new();
-            let mut aliases_by_path: HashMap<String, Vec<String>> = HashMap::new();
-            {
-                let mut stmt =
-                    tx.prepare("SELECT rel_path, aliases_json FROM notes WHERE vault_id = ?1")?;
-                let rows = stmt.query_map(params![vault_id], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-                })?;
-                for r in rows {
-                    let (rp, aj) = r?;
-                    let aliases: Vec<String> = serde_json::from_str(&aj).unwrap_or_default();
-                    if !aliases.is_empty() {
-                        aliases_by_path.insert(rp.clone(), aliases);
+            affected_sources.insert(entry.rel_path.clone());
+            match prev_aliases {
+                None => {
+                    resolve_unresolved = true;
+                    name_candidates.insert(entry.title.to_ascii_lowercase());
+                    insert_alias_names(&mut name_candidates, &parsed.aliases);
+                }
+                Some(prev_json) => {
+                    let new_json =
+                        serde_json::to_string(&parsed.aliases).unwrap_or_else(|_| "[]".into());
+                    if *prev_json != new_json {
+                        resolve_unresolved = true;
+                        affected_targets.insert(entry.rel_path.clone());
+                        let prev: Vec<String> = serde_json::from_str(prev_json).unwrap_or_default();
+                        insert_alias_names(&mut name_candidates, &prev);
+                        insert_alias_names(&mut name_candidates, &parsed.aliases);
                     }
-                    all_paths.push(rp);
                 }
-            }
-
-            let mut link_rows: Vec<(i64, String, String, String)> = Vec::new();
-            {
-                let mut stmt = tx.prepare(
-                    "SELECT id, source_path, target_raw, link_kind FROM links WHERE vault_id = ?1",
-                )?;
-                let rows = stmt.query_map(params![vault_id], |r| {
-                    Ok((
-                        r.get::<_, i64>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, String>(3)?,
-                    ))
-                })?;
-                for r in rows {
-                    link_rows.push(r?);
-                }
-            }
-
-            let mut upd = tx.prepare("UPDATE links SET target_resolved_path = ?1 WHERE id = ?2")?;
-            for (id, source_path, target_raw, link_kind) in link_rows {
-                let resolved = if link_kind == "markdown" {
-                    resolve_markdown_link_from_source(&target_raw, &source_path, &all_paths)
-                } else {
-                    resolve_wikilink_from_source(
-                        &target_raw,
-                        &source_path,
-                        &all_paths,
-                        &aliases_by_path,
-                    )
-                };
-                upd.execute(params![resolved, id])?;
             }
         }
 
-        let stats = index_stats_on_conn(
+        if force_hash_check {
+            // Explicit reindex is the full repair path: every link is re-resolved even when no
+            // file changed.
+            resolve_all_links_in_tx(&tx, vault_id)?;
+        } else if needs_link_resolution {
+            // The first index re-resolves every link, and so does a sync that touches more than
+            // a quarter of the vault, where the targeted route has no advantage. Otherwise only
+            // the links that can have changed are redone.
+            let vault_size = disk_entries.len().max(existing.len());
+            let bulk_change = (updated_count + removed_count) * 4 > vault_size;
+            if first_index || bulk_change {
+                resolve_all_links_in_tx(&tx, vault_id)?;
+            } else {
+                resolve_affected_links_in_tx(
+                    &tx,
+                    vault_id,
+                    &affected_sources,
+                    &affected_targets,
+                    resolve_unresolved,
+                    &name_candidates,
+                )?;
+            }
+        }
+
+        let mut stats = index_stats_on_conn(
             &tx,
             vault,
             disk_entries.len(),
@@ -901,6 +915,7 @@ impl Storage {
             removed_count,
             start.elapsed().as_millis() as u64,
         )?;
+        stats.unreadable_dirs = scan.unreadable_dirs.len();
         tx.commit()?;
 
         Ok(stats)
@@ -2374,7 +2389,110 @@ fn index_stats_on_conn(
         total_tags,
         total_tasks,
         elapsed_ms,
+        unreadable_dirs: 0,
     })
+}
+
+/// Adds each alias, trimmed and ASCII-lower-cased as the resolver compares them, to `names`.
+fn insert_alias_names(names: &mut HashSet<String>, aliases: &[String]) {
+    for alias in aliases {
+        let name = alias.trim().to_ascii_lowercase();
+        if !name.is_empty() {
+            names.insert(name);
+        }
+    }
+}
+
+/// Indexed paths that are no longer on disk, minus everything at or below a directory the scan
+/// could not read (`""` protects the whole vault). Prefixes compare case-insensitively on
+/// Windows and macOS.
+fn compute_removed_paths<'a>(
+    existing: impl IntoIterator<Item = &'a String>,
+    disk_set: &HashSet<String>,
+    unreadable_dirs: &[String],
+) -> Vec<String> {
+    let fold = |s: &str| {
+        if cfg!(any(windows, target_os = "macos")) {
+            s.to_lowercase()
+        } else {
+            s.to_string()
+        }
+    };
+    let protected: Vec<String> = unreadable_dirs
+        .iter()
+        .map(|d| fold(d.trim_matches('/')))
+        .collect();
+    let is_protected = |path: &str| {
+        if protected.is_empty() {
+            return false;
+        }
+        let key = fold(path);
+        protected.iter().any(|dir| {
+            dir.is_empty()
+                || key == *dir
+                || key
+                    .strip_prefix(dir.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
+    };
+    let mut removed: Vec<String> = existing
+        .into_iter()
+        .filter(|p| !disk_set.contains(*p) && !is_protected(p))
+        .cloned()
+        .collect();
+    removed.sort();
+    removed
+}
+
+/// Re-resolves every link of the vault against every note path: O(links x notes).
+/// Used for the first index, explicit reindex and bulk changes.
+fn resolve_all_links_in_tx(tx: &rusqlite::Transaction<'_>, vault_id: &str) -> Result<()> {
+    let mut all_paths: Vec<String> = Vec::new();
+    let mut aliases_by_path: HashMap<String, Vec<String>> = HashMap::new();
+    {
+        let mut stmt =
+            tx.prepare("SELECT rel_path, aliases_json FROM notes WHERE vault_id = ?1")?;
+        let rows = stmt.query_map(params![vault_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for r in rows {
+            let (rp, aj) = r?;
+            let aliases: Vec<String> = serde_json::from_str(&aj).unwrap_or_default();
+            if !aliases.is_empty() {
+                aliases_by_path.insert(rp.clone(), aliases);
+            }
+            all_paths.push(rp);
+        }
+    }
+
+    let mut link_rows: Vec<(i64, String, String, String)> = Vec::new();
+    {
+        let mut stmt = tx.prepare(
+            "SELECT id, source_path, target_raw, link_kind FROM links WHERE vault_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![vault_id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        for r in rows {
+            link_rows.push(r?);
+        }
+    }
+
+    let mut upd = tx.prepare("UPDATE links SET target_resolved_path = ?1 WHERE id = ?2")?;
+    for (id, source_path, target_raw, link_kind) in link_rows {
+        let resolved = if link_kind == "markdown" {
+            resolve_markdown_link_from_source(&target_raw, &source_path, &all_paths)
+        } else {
+            resolve_wikilink_from_source(&target_raw, &source_path, &all_paths, &aliases_by_path)
+        };
+        upd.execute(params![resolved, id])?;
+    }
+    Ok(())
 }
 
 fn resolve_affected_links_in_tx(
@@ -2411,10 +2529,22 @@ fn resolve_affected_links_in_tx(
         }
     }
 
+    // A name in `stem_candidates` may now resolve differently, so revisit every link that points
+    // at a note carrying that name, either as its file stem or as one of its aliases. Without
+    // the alias half, `[[Foo]]` resolved through an alias would keep its old target after
+    // `Foo.md` (or a second note with the alias `Foo`) appears.
     let mut target_set = affected_targets.clone();
     if !stem_candidates.is_empty() {
         for rp in &all_paths {
-            if stem_candidates.contains(&title_from_rel_path(rp).to_ascii_lowercase()) {
+            let by_stem = stem_candidates.contains(&title_from_rel_path(rp).to_ascii_lowercase());
+            let by_alias = || {
+                aliases_by_path.get(rp).is_some_and(|aliases| {
+                    aliases
+                        .iter()
+                        .any(|a| stem_candidates.contains(&a.trim().to_ascii_lowercase()))
+                })
+            };
+            if by_stem || by_alias() {
                 target_set.insert(rp.clone());
             }
         }
@@ -3034,5 +3164,472 @@ mod tests {
         assert!(!should_use_short_cjk_like("meeting"));
         assert!(should_use_short_cjk_like("회의"));
         assert!(!should_use_short_cjk_like("회의록"));
+    }
+
+    #[test]
+    fn obs05_compute_removed_paths_protects_unreadable_prefixes() {
+        let existing: Vec<String> = ["A/x.md", "A/B/y.md", "AB/x.md", "C/z.md", "r.md"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let disk: HashSet<String> = ["r.md".to_string()].into_iter().collect();
+        let removed = |unreadable: &[&str]| {
+            let dirs: Vec<String> = unreadable.iter().map(|s| s.to_string()).collect();
+            compute_removed_paths(existing.iter(), &disk, &dirs)
+        };
+
+        // Nothing unreadable: every indexed path missing from disk is removed.
+        assert_eq!(removed(&[]), ["A/B/y.md", "A/x.md", "AB/x.md", "C/z.md"]);
+        // `A` protects `A/...` at any depth, but not the sibling `AB`.
+        assert_eq!(removed(&["A"]), ["AB/x.md", "C/z.md"]);
+        assert_eq!(removed(&["A/B"]), ["A/x.md", "AB/x.md", "C/z.md"]);
+        // An unreadable vault root protects everything.
+        assert!(removed(&[""]).is_empty());
+        if cfg!(any(windows, target_os = "macos")) {
+            assert_eq!(removed(&["a"]), ["AB/x.md", "C/z.md"]);
+        } else {
+            assert_eq!(removed(&["a"]), ["A/B/y.md", "A/x.md", "AB/x.md", "C/z.md"]);
+        }
+    }
+
+    fn obs05_locked_vault() -> (tempfile::TempDir, crate::config::VaultProfile, Storage) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("Locked/Deep")).unwrap();
+        fs::write(root.join("Locked/n.md"), "# n\n\n[[Open]]\n").unwrap();
+        fs::write(root.join("Locked/Deep/d.md"), "# d\n").unwrap();
+        fs::write(root.join("Open.md"), "# Open\n").unwrap();
+        let vault = vault_from_dir(root, Some("obs05"));
+        let storage = Storage::open_in_memory().unwrap();
+        let first = storage.sync_vault(&vault).unwrap();
+        assert_eq!(first.total_notes, 3);
+        assert_eq!(first.unreadable_dirs, 0);
+        assert!(!serde_json::to_string(&first)
+            .unwrap()
+            .contains("unreadable_dirs"));
+        assert!(storage.toggle_bookmark(&vault.id, "Locked/n.md").unwrap());
+        (tmp, vault, storage)
+    }
+
+    fn obs05_assert_rows_survive_unreadable_dir(
+        vault: &crate::config::VaultProfile,
+        storage: &Storage,
+    ) {
+        let stats = storage.sync_vault(vault).unwrap();
+        assert_eq!(stats.unreadable_dirs, 1);
+        assert_eq!(stats.removed, 0);
+        assert_eq!(stats.total_notes, 3);
+        assert!(serde_json::to_string(&stats)
+            .unwrap()
+            .contains("\"unreadable_dirs\":1"));
+        let notes = storage.list_notes(&vault.id, None).unwrap();
+        let locked = notes
+            .iter()
+            .find(|n| n.rel_path == "Locked/n.md")
+            .expect("row under the unreadable directory is kept");
+        assert!(locked.is_bookmarked);
+        assert!(notes.iter().any(|n| n.rel_path == "Locked/Deep/d.md"));
+        // The explicit reindex honours the same protection.
+        let reindexed = storage.reindex_vault(vault).unwrap();
+        assert_eq!(reindexed.removed, 0);
+        assert_eq!(reindexed.total_notes, 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn obs05_permission_denied_dir_keeps_rows_and_bookmark() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct Restore(std::path::PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+            }
+        }
+
+        let (tmp, vault, storage) = obs05_locked_vault();
+        let locked = tmp.path().join("Locked");
+        let _restore = Restore(locked.clone());
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_dir(&locked).is_ok() {
+            eprintln!(
+                "obs05_permission_denied_dir_keeps_rows_and_bookmark: skipped (running as root)"
+            );
+            return;
+        }
+
+        obs05_assert_rows_survive_unreadable_dir(&vault, &storage);
+
+        // Once the directory is readable again, a real deletion is reconciled.
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::remove_file(locked.join("n.md")).unwrap();
+        let stats = storage.sync_vault(&vault).unwrap();
+        assert_eq!(stats.unreadable_dirs, 0);
+        assert_eq!(stats.removed, 1);
+        assert_eq!(stats.total_notes, 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn obs05_access_denied_dir_keeps_rows_and_bookmark() {
+        // Deny "list folder" to Everyone (S-1-1-0) on the directory itself.
+        struct Restore(std::path::PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("icacls")
+                    .arg(&self.0)
+                    .args(["/remove:d", "*S-1-1-0"])
+                    .output();
+            }
+        }
+
+        let (tmp, vault, storage) = obs05_locked_vault();
+        let locked = tmp.path().join("Locked");
+        let _restore = Restore(locked.clone());
+        let denied = std::process::Command::new("icacls")
+            .arg(&locked)
+            .args(["/deny", "*S-1-1-0:(RD)"])
+            .output();
+        if !denied.is_ok_and(|out| out.status.success()) || fs::read_dir(&locked).is_ok() {
+            eprintln!("obs05_access_denied_dir_keeps_rows_and_bookmark: skipped (cannot deny directory listing here)");
+            return;
+        }
+
+        obs05_assert_rows_survive_unreadable_dir(&vault, &storage);
+
+        // Once the directory is readable again, a real deletion is reconciled.
+        drop(_restore);
+        fs::remove_file(locked.join("n.md")).unwrap();
+        let stats = storage.sync_vault(&vault).unwrap();
+        assert_eq!(stats.unreadable_dirs, 0);
+        assert_eq!(stats.removed, 1);
+        assert_eq!(stats.total_notes, 2);
+    }
+
+    #[test]
+    fn obs05_deleted_dir_is_still_pruned() {
+        let (tmp, vault, storage) = obs05_locked_vault();
+        fs::remove_dir_all(tmp.path().join("Locked")).unwrap();
+        let stats = storage.sync_vault(&vault).unwrap();
+        assert_eq!(stats.unreadable_dirs, 0);
+        assert_eq!(stats.removed, 2);
+        assert_eq!(stats.total_notes, 1);
+        let notes = storage.list_notes(&vault.id, None).unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].rel_path, "Open.md");
+    }
+
+    fn obs12_link_snapshot(
+        storage: &Storage,
+        vault_id: &str,
+    ) -> Vec<(String, String, Option<String>)> {
+        let conn = storage.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT source_path, target_raw, target_resolved_path FROM links
+                 WHERE vault_id = ?1 ORDER BY source_path, target_raw, id",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map(params![vault_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get::<_, Option<String>>(2)?))
+            })
+            .unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    }
+
+    #[test]
+    fn obs12_incremental_matches_full_resolution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for dir in ["A", "A/Deep", "B", "C"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        let write = |rel: &str, body: &str| {
+            fs::write(root.join(rel), body).unwrap();
+        };
+        // 48 filler notes spread over four locations, each linking to neighbours in every style.
+        let folders = ["", "A/", "B/", "C/"];
+        for i in 0..48usize {
+            let folder = folders[i % 4];
+            let next = (i + 1) % 48;
+            let far = (i + 7) % 48;
+            let next_folder = folders[next % 4];
+            let mut body = String::new();
+            if i % 6 == 0 {
+                body.push_str(&format!("---\naliases: [alias-{i:02}]\n---\n"));
+            }
+            body.push_str(&format!("# N{i:02}\n\n"));
+            body.push_str(&format!(
+                "Wikilink [[N{next:02}]] and [[{next_folder}N{next:02}|shown]].\n"
+            ));
+            body.push_str(&format!(
+                "Alias [[alias-{:02}]] and far [[N{far:02}#Heading]].\n",
+                (i / 6) * 6
+            ));
+            body.push_str(&format!(
+                "Markdown [rooted](/{next_folder}N{next:02}.md) and [bare](N{far:02}.md).\n"
+            ));
+            body.push_str(
+                "Shared [[Dup]], [[Solo]], [[Foo]], [[Ghost]], [[Renamed]] and [[Deep/Solo]].\n",
+            );
+            write(&format!("{folder}N{i:02}.md"), &body);
+        }
+        write("A/Dup.md", "# Dup A\n");
+        write("B/Dup.md", "# Dup B\n\n[[Dup]] and [[A/Dup]].\n");
+        write("A/Deep/Solo.md", "# Solo\n\n[up](../../N00.md) [[N01]]\n");
+        write(
+            "C/Holder.md",
+            "---\naliases: [Foo, Bar]\n---\n# Holder\n\n[[Bar]]\n",
+        );
+        write("Renamed.md", "# Renamed\n\n[[Holder]]\n");
+
+        let vault = vault_from_dir(root, Some("obs12"));
+        let storage = Storage::open_in_memory().unwrap();
+        storage.sync_vault(&vault).unwrap();
+
+        // Each step changes one or two files (well under a quarter of the vault), syncs
+        // incrementally, then compares against the full re-resolution of a reindex.
+        type Step<'a> = (&'a str, Box<dyn Fn() + 'a>);
+        let steps: Vec<Step> = vec![
+            (
+                "edit a body",
+                Box::new(|| {
+                    write(
+                        "N05.md",
+                        "# N05\n\n[[N06]] [[Ghost]] [[Dup]] [new](B/N02.md)\n",
+                    )
+                }),
+            ),
+            (
+                "add a note that resolves a dangling link",
+                Box::new(|| write("B/Ghost.md", "# Ghost\n")),
+            ),
+            (
+                "add a shorter path for an existing stem",
+                Box::new(|| write("Solo.md", "# Solo root\n")),
+            ),
+            (
+                "add Foo.md while [[Foo]] resolves through an alias",
+                Box::new(|| write("Foo.md", "# Foo\n")),
+            ),
+            (
+                "add a second holder of an alias",
+                Box::new(|| {
+                    write(
+                        "B/Second.md",
+                        "---\naliases: [alias-06, Bar]\n---\n# Second\n",
+                    )
+                }),
+            ),
+            (
+                "remove an alias",
+                Box::new(|| {
+                    write(
+                        "C/Holder.md",
+                        "---\naliases: [Bar]\n---\n# Holder\n\n[[Bar]]\n",
+                    )
+                }),
+            ),
+            (
+                "give an existing note a colliding alias",
+                Box::new(|| {
+                    write(
+                        "N10.md",
+                        "---\naliases: [alias-12, N11]\n---\n# N10\n\n[[N11]] [[alias-12]]\n",
+                    )
+                }),
+            ),
+            (
+                "delete a note",
+                Box::new(|| fs::remove_file(root.join("Foo.md")).unwrap()),
+            ),
+            (
+                "delete one of two same-stem notes",
+                Box::new(|| fs::remove_file(root.join("A/Dup.md")).unwrap()),
+            ),
+            (
+                "rename via delete plus create",
+                Box::new(|| {
+                    fs::remove_file(root.join("Renamed.md")).unwrap();
+                    write("C/Renamed.md", "# Renamed\n\n[[Holder]] [[Solo]]\n");
+                }),
+            ),
+            (
+                "add a same-folder note for a bare link",
+                Box::new(|| write("A/Dup.md", "# Dup A again\n")),
+            ),
+            (
+                "restore the removed alias",
+                Box::new(|| {
+                    write(
+                        "C/Holder.md",
+                        "---\naliases: [Foo, Bar]\n---\n# Holder\n\n[[Bar]] [[Second]]\n",
+                    )
+                }),
+            ),
+            (
+                "delete the second alias holder",
+                Box::new(|| fs::remove_file(root.join("B/Second.md")).unwrap()),
+            ),
+        ];
+        for (label, apply) in &steps {
+            apply();
+            let stats = storage.sync_vault(&vault).unwrap();
+            assert!(
+                stats.updated + stats.removed >= 1,
+                "{label}: change not detected"
+            );
+            assert!(
+                (stats.updated + stats.removed) * 4 <= stats.total_notes,
+                "{label}: step must stay on the incremental route"
+            );
+            let incremental = obs12_link_snapshot(&storage, &vault.id);
+            storage.reindex_vault(&vault).unwrap();
+            let full = obs12_link_snapshot(&storage, &vault.id);
+            assert!(!full.is_empty());
+            let diff: Vec<_> = incremental
+                .iter()
+                .zip(full.iter())
+                .filter(|(a, b)| a != b)
+                .take(5)
+                .collect();
+            assert!(
+                incremental.len() == full.len() && diff.is_empty(),
+                "{label}: incremental resolution differs from full: {diff:?}"
+            );
+        }
+    }
+
+    fn obs12_seed_ring(root: &Path, notes: usize, links: usize) {
+        for i in 0..notes {
+            let mut body = format!("# Ring{i:05}\n\n");
+            for k in 1..=links {
+                body.push_str(&format!("[[Ring{:05}]]\n", (i + k) % notes));
+            }
+            fs::write(root.join(format!("Ring{i:05}.md")), body).unwrap();
+        }
+    }
+
+    #[test]
+    fn obs12_single_edit_resolves_only_its_links() {
+        use rusqlite::ffi;
+        use std::{
+            cell::Cell,
+            ffi::{c_int, c_uint, c_void, CStr},
+            ptr,
+        };
+
+        unsafe extern "C" fn count_link_updates(
+            _: c_uint,
+            context: *mut c_void,
+            statement: *mut c_void,
+            _: *mut c_void,
+        ) -> c_int {
+            // SQLITE_TRACE_STMT supplies a live statement and the registered context.
+            unsafe {
+                let sql = ffi::sqlite3_sql(statement.cast());
+                if !sql.is_null()
+                    && CStr::from_ptr(sql)
+                        .to_bytes()
+                        .starts_with(b"UPDATE links SET target_resolved_path")
+                {
+                    let updates = &*context.cast::<Cell<usize>>();
+                    updates.set(updates.get() + 1);
+                }
+            }
+            0
+        }
+
+        const NOTES: usize = 2000;
+        const LINKS: usize = 10;
+        let tmp = tempfile::tempdir().unwrap();
+        obs12_seed_ring(tmp.path(), NOTES, LINKS);
+        let vault = vault_from_dir(tmp.path(), Some("obs12-ring"));
+        let updates = Cell::new(0usize);
+        let storage = Storage::open_in_memory().unwrap();
+        let first = storage.sync_vault(&vault).unwrap();
+        assert_eq!(first.total_notes, NOTES);
+        assert_eq!(first.total_links, NOTES * LINKS);
+        {
+            let conn = storage.conn.lock().unwrap();
+            // The callback is used synchronously by this connection, which drops before `updates`.
+            assert_eq!(
+                unsafe {
+                    ffi::sqlite3_trace_v2(
+                        conn.handle(),
+                        ffi::SQLITE_TRACE_STMT as c_uint,
+                        Some(count_link_updates),
+                        ptr::from_ref(&updates).cast_mut().cast(),
+                    )
+                },
+                ffi::SQLITE_OK
+            );
+        }
+
+        // Edit one note without touching its aliases or its links.
+        let edited = tmp.path().join("Ring00000.md");
+        let mut body = fs::read_to_string(&edited).unwrap();
+        body.push_str("\nOne more paragraph.\n");
+        fs::write(&edited, body).unwrap();
+        let stats = storage.sync_vault(&vault).unwrap();
+        assert_eq!(stats.updated, 1);
+        assert!(
+            updates.get() >= 1 && updates.get() <= LINKS,
+            "one edit re-resolved {} links (vault has {})",
+            updates.get(),
+            NOTES * LINKS
+        );
+        let unresolved: usize = storage
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM links WHERE vault_id = ?1 AND target_resolved_path IS NULL",
+                params![vault.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unresolved, 0);
+
+        // The explicit reindex stays the full repair path.
+        updates.set(0);
+        storage.reindex_vault(&vault).unwrap();
+        assert_eq!(updates.get(), NOTES * LINKS);
+    }
+
+    /// Run by hand: `cargo test --release obs12_large -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn obs12_large_vault_edit_sync_wall_clock() {
+        let tmp = tempfile::tempdir().unwrap();
+        obs12_seed_ring(tmp.path(), 4000, 10);
+        let vault = vault_from_dir(tmp.path(), Some("obs12-large"));
+        let storage = Storage::open_in_memory().unwrap();
+
+        let started = Instant::now();
+        storage.sync_vault(&vault).unwrap();
+        let first_index = started.elapsed();
+
+        let started = Instant::now();
+        storage.sync_vault(&vault).unwrap();
+        let no_change = started.elapsed();
+
+        let edited = tmp.path().join("Ring00000.md");
+        let mut body = fs::read_to_string(&edited).unwrap();
+        body.push_str("\nOne more paragraph.\n");
+        fs::write(&edited, body).unwrap();
+        let started = Instant::now();
+        let stats = storage.sync_vault(&vault).unwrap();
+        let one_edit = started.elapsed();
+        assert_eq!(stats.updated, 1);
+
+        eprintln!(
+            "obs12 4000x10: first index {first_index:?}, no-change sync {no_change:?}, one-edit sync {one_edit:?}"
+        );
+        assert!(
+            one_edit < no_change * 5 + std::time::Duration::from_millis(250),
+            "one-edit sync {one_edit:?} vs no-change sync {no_change:?}"
+        );
     }
 }
