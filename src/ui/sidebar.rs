@@ -157,6 +157,13 @@ pub fn build_sidebar_entries(app: &AppState, ui: &UiState) -> Vec<SidebarEntry> 
     }
 }
 
+/// Proper ancestor folders of `folder`, outermost first: `A/B/C` yields `A` then `A/B`.
+fn folder_ancestors(folder: &str) -> impl Iterator<Item = &str> {
+    folder
+        .match_indices('/')
+        .map(move |(idx, _)| &folder[..idx])
+}
+
 fn build_file_tree(
     notes: &[NoteSummary],
     html_files: &[crate::vault::fs::VaultHtmlFile],
@@ -173,12 +180,28 @@ fn build_file_tree(
         by_folder.entry(h.folder.clone()).or_default();
     }
 
+    // Every ancestor of a folder gets its own row, so `A/B` never shows without `A` above it.
+    let ancestors: Vec<String> = by_folder
+        .keys()
+        .flat_map(|folder| folder_ancestors(folder).map(str::to_string))
+        .collect();
+    for ancestor in ancestors {
+        by_folder.entry(ancestor).or_default();
+    }
+
+    // Order by path components, not by the raw string: `-` sorts before `/`, so a plain string
+    // order would put `Projects-old` between `Projects` and `Projects/Sub`.
+    let mut folders: Vec<&String> = by_folder.keys().filter(|f| !f.is_empty()).collect();
+    folders.sort_by(|a, b| a.split('/').cmp(b.split('/')));
+
     let mut out = Vec::new();
     // Folders first, then root notes & root HTML files
-    for (folder, items) in &by_folder {
-        if folder.is_empty() {
+    for folder in folders {
+        // A collapsed folder hides its whole subtree, not only its direct items.
+        if folder_ancestors(folder).any(|ancestor| collapsed.contains(ancestor)) {
             continue;
         }
+        let items = &by_folder[folder];
         let html_items = html_by_folder.get(folder).map(Vec::as_slice).unwrap_or(&[]);
         let expanded = !collapsed.contains(folder);
         let depth = folder.matches('/').count();
@@ -545,5 +568,195 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
             row_rect,
         );
         hitmap.add(row_rect, HitTarget::SidebarRow(idx));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn note(rel_path: &str) -> NoteSummary {
+        let (folder, file) = rel_path.rsplit_once('/').unwrap_or(("", rel_path));
+        NoteSummary {
+            rel_path: rel_path.to_string(),
+            title: file.trim_end_matches(".md").to_string(),
+            folder: folder.to_string(),
+            ..NoteSummary::default()
+        }
+    }
+
+    fn html(rel_path: &str) -> crate::vault::fs::VaultHtmlFile {
+        let (folder, file) = rel_path.rsplit_once('/').unwrap_or(("", rel_path));
+        crate::vault::fs::VaultHtmlFile {
+            rel_path: rel_path.to_string(),
+            abs_path: std::path::PathBuf::from(rel_path),
+            title: file.to_string(),
+            folder: folder.to_string(),
+            mtime_ns: 0,
+            size_bytes: 0,
+        }
+    }
+
+    /// One line per entry: `F <path> d<depth> <open|closed> (<count>)`, `N <path> d<depth>` or
+    /// `H <path> d<depth>`.
+    fn tree(notes: &[&str], html_files: &[&str], collapsed: &[&str]) -> Vec<String> {
+        let notes: Vec<NoteSummary> = notes.iter().map(|p| note(p)).collect();
+        let html_files: Vec<_> = html_files.iter().map(|p| html(p)).collect();
+        let collapsed: HashSet<String> = collapsed.iter().map(|c| c.to_string()).collect();
+        build_file_tree(&notes, &html_files, &collapsed)
+            .into_iter()
+            .map(|entry| match entry {
+                SidebarEntry::Folder {
+                    path,
+                    depth,
+                    expanded,
+                    count,
+                    ..
+                } => format!(
+                    "F {path} d{depth} {} ({count})",
+                    if expanded { "open" } else { "closed" }
+                ),
+                SidebarEntry::Note {
+                    rel_path, depth, ..
+                } => format!("N {rel_path} d{depth}"),
+                SidebarEntry::HtmlFile {
+                    rel_path, depth, ..
+                } => format!("H {rel_path} d{depth}"),
+                other => panic!("unexpected entry in the file tree: {other:?}"),
+            })
+            .collect()
+    }
+
+    const OBS11_NOTES: &[&str] = &[
+        "Other/o.md",
+        "Projects/p.md",
+        "Projects/Sub/s.md",
+        "Projects/Sub/Deep/d.md",
+        "root.md",
+    ];
+
+    #[test]
+    fn obs11_collapsed_parent_hides_descendants() {
+        assert_eq!(
+            tree(OBS11_NOTES, &[], &["Projects"]),
+            [
+                "F Other d0 open (1)",
+                "N Other/o.md d1",
+                "F Projects d0 closed (1)",
+                "N root.md d0",
+            ]
+        );
+        // Nothing is collapsed: the whole tree, parents before children.
+        assert_eq!(
+            tree(OBS11_NOTES, &[], &[]),
+            [
+                "F Other d0 open (1)",
+                "N Other/o.md d1",
+                "F Projects d0 open (1)",
+                "N Projects/p.md d1",
+                "F Projects/Sub d1 open (1)",
+                "N Projects/Sub/s.md d2",
+                "F Projects/Sub/Deep d2 open (1)",
+                "N Projects/Sub/Deep/d.md d3",
+                "N root.md d0",
+            ]
+        );
+    }
+
+    #[test]
+    fn obs11_collapsed_child_keeps_parent_notes() {
+        assert_eq!(
+            tree(OBS11_NOTES, &[], &["Projects/Sub"]),
+            [
+                "F Other d0 open (1)",
+                "N Other/o.md d1",
+                "F Projects d0 open (1)",
+                "N Projects/p.md d1",
+                "F Projects/Sub d1 closed (1)",
+                "N root.md d0",
+            ]
+        );
+        // A collapsed descendant stays remembered while its parent is collapsed too.
+        assert_eq!(
+            tree(OBS11_NOTES, &[], &["Projects", "Projects/Sub/Deep"]),
+            tree(OBS11_NOTES, &[], &["Projects"])
+        );
+    }
+
+    #[test]
+    fn obs11_synthesizes_missing_ancestors() {
+        assert_eq!(
+            tree(&["A/B/n.md"], &[], &[]),
+            ["F A d0 open (0)", "F A/B d1 open (1)", "N A/B/n.md d2"]
+        );
+        assert_eq!(tree(&["A/B/n.md"], &[], &["A"]), ["F A d0 closed (0)"]);
+    }
+
+    #[test]
+    fn obs11_sibling_with_dash_sorts_after_subtree() {
+        assert_eq!(
+            tree(
+                &["Projects/p.md", "Projects/Sub/s.md", "Projects-old/x.md"],
+                &[],
+                &[]
+            ),
+            [
+                "F Projects d0 open (1)",
+                "N Projects/p.md d1",
+                "F Projects/Sub d1 open (1)",
+                "N Projects/Sub/s.md d2",
+                "F Projects-old d0 open (1)",
+                "N Projects-old/x.md d1",
+            ]
+        );
+    }
+
+    #[test]
+    fn obs11_html_only_folder_follows_collapse() {
+        let notes = ["Projects/p.md"];
+        let html_files = ["Projects/Site/index.html", "home.html"];
+        assert_eq!(
+            tree(&notes, &html_files, &[]),
+            [
+                "F Projects d0 open (1)",
+                "N Projects/p.md d1",
+                "F Projects/Site d1 open (1)",
+                "H Projects/Site/index.html d2",
+                "H home.html d0",
+            ]
+        );
+        assert_eq!(
+            tree(&notes, &html_files, &["Projects"]),
+            ["F Projects d0 closed (1)", "H home.html d0"]
+        );
+    }
+
+    #[test]
+    fn obs11_flat_vault_renders_as_before() {
+        // One level of folders: same rows and order as the previous string-ordered tree.
+        assert_eq!(
+            tree(
+                &[
+                    "Zeta/z.md",
+                    "Alpha/b.md",
+                    "Alpha/a.md",
+                    "Daily Notes/2026-11-20.md",
+                    "Inbox.md"
+                ],
+                &["Alpha/page.html", "index.html"],
+                &["Zeta"]
+            ),
+            [
+                "F Alpha d0 open (3)",
+                "N Alpha/b.md d1",
+                "N Alpha/a.md d1",
+                "H Alpha/page.html d1",
+                "F Daily Notes d0 open (1)",
+                "N Daily Notes/2026-11-20.md d1",
+                "F Zeta d0 closed (1)",
+                "N Inbox.md d0",
+                "H index.html d0",
+            ]
+        );
     }
 }

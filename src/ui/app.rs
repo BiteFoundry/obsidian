@@ -16,8 +16,8 @@ use crate::{
         RenderedTerminalImage, TerminalGraphicsCaps, TerminalImageProtocol,
     },
     models::{
-        CoreEvent, GraphData, IndexStats, LinkStatus, NoteBlock, NoteDetail, NoteSummary,
-        OutgoingLinkEntry, SidebarTab, TagCount, TaskEntry, TaskFilter,
+        CodedError, CoreEvent, GraphData, IndexStats, LinkStatus, NoteBlock, NoteDetail,
+        NoteSummary, OutgoingLinkEntry, SidebarTab, TagCount, TaskEntry, TaskFilter,
     },
     storage::Storage,
     sync::SyncController,
@@ -58,6 +58,15 @@ use crate::{
         parser::parse_markdown,
     },
 };
+
+/// Why a note is being opened. Decides whether a target that does not exist may be created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenIntent {
+    /// Opening something expected to exist: sidebar, history, quick switcher, backlinks.
+    Navigate,
+    /// Following a wikilink or Markdown link, where a missing target is created on demand.
+    FollowLink,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -634,7 +643,23 @@ impl AppState {
             .info("No HTML blocks or .html files found in active note or vault");
     }
 
+    /// Opens an existing note. A reference that does not resolve is reported, never created,
+    /// unless it is an `unresolved:<name>` graph node (see [`AppState::open_note_with`]).
     pub fn open_note(&mut self, ui: &mut UiState, note_ref: &str, push_history: bool) {
+        self.open_note_with(ui, note_ref, push_history, OpenIntent::Navigate);
+    }
+
+    /// Opens a note, creating it only when that is what the user asked for: the reference is
+    /// not found, `push_history` is set (a forward navigation), and the target is an unresolved
+    /// link, either an `unresolved:<name>` graph node or a link followed with
+    /// [`OpenIntent::FollowLink`]. Ambiguous references and read errors never create a file.
+    pub fn open_note_with(
+        &mut self,
+        ui: &mut UiState,
+        note_ref: &str,
+        push_history: bool,
+        intent: OpenIntent,
+    ) {
         // Route `.html`/`.htm`/`.xhtml` targets directly into `Overlay::HtmlPreview`.
         if is_html_file_path(note_ref) {
             self.open_html_file(ui, note_ref);
@@ -644,22 +669,20 @@ impl AppState {
         if ui.inline_editor.is_some() && !self.finish_inline_edit(ui) {
             return;
         }
-        if push_history {
-            if let Some(cur) = self
-                .active_note
-                .as_ref()
-                .map(|d| d.summary.rel_path.clone())
-            {
-                if !cur.eq_ignore_ascii_case(note_ref) {
-                    self.history.push(cur);
-                    if self.history.len() > 64 {
-                        self.history.remove(0);
-                    }
-                }
-            }
-        }
-        match self.storage.load_note_detail(&self.active_vault, note_ref) {
+        // `unresolved:<name>` is the graph's node ID for a link target that has no note yet.
+        let (target, creation_target) = match note_ref.strip_prefix("unresolved:") {
+            Some(name) => (name, true),
+            None => (note_ref, intent == OpenIntent::FollowLink),
+        };
+        // The note to return to. It joins the history only once something was opened.
+        let previous = self
+            .active_note
+            .as_ref()
+            .map(|d| d.summary.rel_path.clone())
+            .filter(|cur| push_history && !cur.eq_ignore_ascii_case(target));
+        match self.storage.load_note_detail(&self.active_vault, target) {
             Ok(detail) => {
+                self.push_history_entry(previous);
                 self.cache_inline_images(&detail);
                 self.active_note = Some(detail);
                 ui.canvas_mode = CanvasMode::Note;
@@ -669,24 +692,44 @@ impl AppState {
                 ui.inspector_selected = 0;
                 self.refresh_graph(ui);
             }
-            Err(_) => {
-                // Create note on demand if user clicked an unresolved [[wikilink]]
-                let clean = note_ref.strip_prefix("unresolved:").unwrap_or(note_ref);
-                if let Ok((rel_path, _)) =
-                    create_note(&self.active_vault.path, clean, None, None, &[])
-                {
-                    let _ = self.storage.sync_vault(&self.active_vault);
-                    self.reload_from_storage(ui);
-                    if let Ok(detail) = self.storage.load_note_detail(&self.active_vault, &rel_path)
-                    {
-                        self.active_note = Some(detail);
-                        ui.canvas_mode = CanvasMode::Note;
-                        ui.toasts.success(format!("Created note: {rel_path}"));
-                        self.refresh_graph(ui);
+            Err(err) => {
+                let code = err.downcast_ref::<CodedError>().map(|coded| coded.code);
+                match code {
+                    // Create note on demand if user followed an unresolved [[wikilink]]
+                    Some("not_found") if push_history && creation_target => {
+                        match create_note(&self.active_vault.path, target, None, None, &[]) {
+                            Ok((rel_path, _)) => {
+                                let _ = self.storage.sync_vault(&self.active_vault);
+                                self.reload_from_storage(ui);
+                                if let Ok(detail) =
+                                    self.storage.load_note_detail(&self.active_vault, &rel_path)
+                                {
+                                    self.push_history_entry(previous);
+                                    self.active_note = Some(detail);
+                                    ui.canvas_mode = CanvasMode::Note;
+                                    ui.toasts.success(format!("Created note: {rel_path}"));
+                                    self.refresh_graph(ui);
+                                }
+                            }
+                            Err(create_err) => ui.toasts.warning(format!(
+                                "Note not found: {target} (could not create it: {create_err})"
+                            )),
+                        }
                     }
-                } else {
-                    ui.toasts.warning(format!("Note not found: {note_ref}"));
+                    Some("not_found") => ui.toasts.warning(format!("Note not found: {target}")),
+                    // The resolver's message lists the candidates.
+                    Some("ambiguous") => ui.toasts.warning(err.to_string()),
+                    _ => ui.toasts.error(format!("Could not open {target}: {err}")),
                 }
+            }
+        }
+    }
+
+    fn push_history_entry(&mut self, previous: Option<String>) {
+        if let Some(previous) = previous {
+            self.history.push(previous);
+            if self.history.len() > 64 {
+                self.history.remove(0);
             }
         }
     }
@@ -1545,7 +1588,7 @@ impl AppState {
                     if let Some(block) = d.parsed.blocks.get(ui.canvas_selected_block) {
                         if let Some((target, resolved)) = block.first_wikilink() {
                             let dest = resolved.unwrap_or(target);
-                            self.open_note(ui, &dest, true);
+                            self.open_note_with(ui, &dest, true, OpenIntent::FollowLink);
                         } else if let NoteBlock::Task { line_no, .. } = block {
                             let note_path = d.summary.rel_path.clone();
                             let ln = *line_no;
@@ -1991,6 +2034,9 @@ impl AppState {
                 if !ui.collapsed_folders.remove(&path) {
                     ui.collapsed_folders.insert(path);
                 }
+                // Collapsing hides the whole subtree, so keep the selection inside the list.
+                let len = build_sidebar_entries(self, ui).len();
+                ui.sidebar_selected = ui.sidebar_selected.min(len.saturating_sub(1));
             }
             SidebarEntry::Note { rel_path, .. } => {
                 self.open_note(ui, &rel_path, true);
@@ -2036,7 +2082,7 @@ impl AppState {
                 .target_resolved_path
                 .clone()
                 .unwrap_or_else(|| ol.target_raw.clone());
-            self.open_note(ui, &dest, true);
+            self.open_note_with(ui, &dest, true, OpenIntent::FollowLink);
         }
     }
 

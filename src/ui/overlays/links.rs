@@ -121,9 +121,14 @@ impl LinkExtractorOverlay {
                     ExtractedLinkKind::Wikilink {
                         resolved_path: Some(rp),
                     } => OverlayOutcome::CloseAndDispatch(Action::OpenNote(rp.clone())),
+                    // An unresolved link is an explicit creation target, like the graph's
+                    // `unresolved:<name>` nodes.
                     ExtractedLinkKind::Wikilink {
                         resolved_path: None,
-                    } => OverlayOutcome::CloseAndDispatch(Action::OpenNote(link.target.clone())),
+                    } => OverlayOutcome::CloseAndDispatch(Action::OpenNote(format!(
+                        "unresolved:{}",
+                        link.target
+                    ))),
                     ExtractedLinkKind::ExternalUrl => {
                         OverlayOutcome::CloseAndDispatch(Action::OpenUrl(link.target.clone()))
                     }

@@ -8384,3 +8384,189 @@ async fn obs09_daily_format_with_colon_is_rejected_on_windows_not_written_elsewh
         assert!(root.join("2026-11-23 THH:mm.md").is_file());
     }
 }
+
+fn obs13_app(
+    root: &std::path::Path,
+    files: &[(&str, &str)],
+) -> (
+    AppState,
+    UiState,
+    obsidian_cli::config::VaultProfile,
+    Storage,
+) {
+    for (rel, body) in files {
+        let abs = root.join(rel);
+        fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        fs::write(abs, body).unwrap();
+    }
+    let vault = vault_from_dir(root, Some("Obs13Vault"));
+    let mut cfg = AppConfig::default();
+    cfg.upsert_vault(vault.clone(), true);
+    let storage = Storage::open_in_memory().unwrap();
+    storage.sync_vault(&vault).unwrap();
+
+    let (focus_tx, _focus_rx) = watch::channel(FocusTarget::default());
+    let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel::<SyncCommand>();
+    let sync_ctrl = SyncController::from_channels(focus_tx, cmd_tx);
+    let mut app = AppState::new(cfg.clone(), vault.clone(), storage.clone(), sync_ctrl);
+    let mut ui = UiState::from_config(&cfg);
+    app.reload_from_storage(&mut ui);
+    (app, ui, vault, storage)
+}
+
+fn obs13_markdown_files(root: &std::path::Path) -> Vec<String> {
+    fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<String>) {
+        for entry in fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, root, out);
+            } else {
+                let rel = path.strip_prefix(root).unwrap();
+                out.push(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort();
+    out
+}
+
+fn obs13_active(app: &AppState) -> Option<String> {
+    app.active_note.as_ref().map(|d| d.summary.rel_path.clone())
+}
+
+#[test]
+fn obs13_ambiguous_reference_creates_nothing() {
+    use obsidian_cli::ui::{app::OpenIntent, toast::ToastKind};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, mut ui, _vault, _storage) = obs13_app(
+        tmp.path(),
+        &[
+            ("A/Note.md", "# Note A\n"),
+            ("B/Note.md", "# Note B\n"),
+            ("Start.md", "# Start\n\n[[Note]]\n"),
+        ],
+    );
+    app.open_note(&mut ui, "Start.md", false);
+    let before = obs13_markdown_files(tmp.path());
+
+    for intent in [OpenIntent::Navigate, OpenIntent::FollowLink] {
+        ui.toasts.clear();
+        app.open_note_with(&mut ui, "Note", true, intent);
+
+        assert_eq!(obs13_markdown_files(tmp.path()), before, "{intent:?}");
+        assert_eq!(obs13_active(&app).as_deref(), Some("Start.md"));
+        assert!(app.history.is_empty(), "{intent:?}: {:?}", app.history);
+        let toast = ui
+            .toasts
+            .latest()
+            .expect("a toast explains why nothing opened");
+        assert_eq!(toast.kind, ToastKind::Warning);
+        assert!(toast.message.contains("Ambiguous"), "{}", toast.message);
+        assert!(toast.message.contains("A/Note.md"), "{}", toast.message);
+    }
+}
+
+#[test]
+fn obs13_history_back_to_deleted_note_creates_nothing() {
+    use obsidian_cli::ui::toast::ToastKind;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, mut ui, vault, storage) = obs13_app(
+        tmp.path(),
+        &[("A.md", "# A\n"), ("B.md", "# B\n"), ("C.md", "# C\n")],
+    );
+    app.open_note(&mut ui, "A.md", false);
+    app.open_note(&mut ui, "B.md", true);
+    app.open_note(&mut ui, "C.md", true);
+    assert_eq!(app.history, ["A.md", "B.md"]);
+
+    // B is deleted and the index has not caught up yet: the read fails, nothing is recreated.
+    fs::remove_file(tmp.path().join("B.md")).unwrap();
+    app.dispatch(Action::NavigateBack, &mut ui);
+    assert!(!tmp.path().join("B.md").exists());
+    assert_eq!(obs13_active(&app).as_deref(), Some("C.md"));
+    assert_eq!(ui.toasts.latest().unwrap().kind, ToastKind::Error);
+    assert_eq!(app.history, ["A.md"]);
+
+    // A is deleted and the index knows: not found, nothing is recreated, the entry is dropped.
+    fs::remove_file(tmp.path().join("A.md")).unwrap();
+    storage.sync_vault(&vault).unwrap();
+    app.reload_from_storage(&mut ui);
+    ui.toasts.clear();
+    app.dispatch(Action::NavigateBack, &mut ui);
+    assert!(!tmp.path().join("A.md").exists());
+    assert_eq!(obs13_markdown_files(tmp.path()), ["C.md"]);
+    assert_eq!(obs13_active(&app).as_deref(), Some("C.md"));
+    let toast = ui.toasts.latest().unwrap();
+    assert_eq!(toast.kind, ToastKind::Warning);
+    assert!(
+        toast.message.contains("Note not found"),
+        "{}",
+        toast.message
+    );
+    assert!(app.history.is_empty());
+}
+
+#[test]
+fn obs13_plain_missing_reference_creates_nothing() {
+    use obsidian_cli::ui::toast::ToastKind;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, mut ui, _vault, _storage) = obs13_app(tmp.path(), &[("Start.md", "# Start\n")]);
+    app.open_note(&mut ui, "Start.md", false);
+
+    app.open_note(&mut ui, "Nope", true);
+    assert_eq!(obs13_markdown_files(tmp.path()), ["Start.md"]);
+    assert_eq!(obs13_active(&app).as_deref(), Some("Start.md"));
+    assert!(app.history.is_empty());
+    let toast = ui.toasts.latest().unwrap();
+    assert_eq!(toast.kind, ToastKind::Warning);
+    assert_eq!(toast.message, "Note not found: Nope");
+
+    // The quick switcher and the sidebar go through the same action.
+    app.dispatch(Action::OpenNote("Also Missing.md".into()), &mut ui);
+    assert_eq!(obs13_markdown_files(tmp.path()), ["Start.md"]);
+
+    // An unresolved target is not created by a backwards navigation either.
+    app.open_note(&mut ui, "unresolved:Ghost", false);
+    assert_eq!(obs13_markdown_files(tmp.path()), ["Start.md"]);
+}
+
+#[test]
+fn obs13_unresolved_link_still_creates() {
+    use obsidian_cli::ui::{app::OpenIntent, toast::ToastKind};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, mut ui, _vault, _storage) = obs13_app(
+        tmp.path(),
+        &[("Start.md", "# Start\n\n[[New Idea]] and [[Linked Idea]]\n")],
+    );
+    app.open_note(&mut ui, "Start.md", false);
+
+    // The graph's node ID for a link target with no note.
+    app.open_note(&mut ui, "unresolved:New Idea", true);
+    assert!(tmp.path().join("New Idea.md").is_file());
+    assert_eq!(obs13_active(&app).as_deref(), Some("New Idea.md"));
+    assert_eq!(app.history, ["Start.md"]);
+    let toast = ui.toasts.latest().unwrap();
+    assert_eq!(toast.kind, ToastKind::Success);
+    assert_eq!(toast.message, "Created note: New Idea.md");
+
+    // Following a wikilink whose target does not exist.
+    app.open_note_with(&mut ui, "Linked Idea", true, OpenIntent::FollowLink);
+    assert!(tmp.path().join("Linked Idea.md").is_file());
+    assert_eq!(obs13_active(&app).as_deref(), Some("Linked Idea.md"));
+    assert_eq!(app.history, ["Start.md", "New Idea.md"]);
+
+    // Once the note exists, the same reference opens it instead of creating a second file.
+    app.open_note(&mut ui, "Start.md", true);
+    app.open_note(&mut ui, "unresolved:New Idea", true);
+    assert_eq!(obs13_active(&app).as_deref(), Some("New Idea.md"));
+    assert_eq!(
+        obs13_markdown_files(tmp.path()),
+        ["Linked Idea.md", "New Idea.md", "Start.md"]
+    );
+}
