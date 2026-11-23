@@ -608,7 +608,7 @@ pub fn tool_definitions() -> Vec<Value> {
     vec![
         tool(
             "list_vaults",
-            "List all auto-discovered and registered local Obsidian vaults with note counts.",
+            "List registered and auto-discovered vaults with note counts. Scans every vault to refresh counts, so the first call can be slow with many or large vaults.",
             json!({ "type": "object", "properties": {} }),
         ),
         tool(
@@ -756,7 +756,7 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "get_local_graph",
-            "Return the local BFS knowledge graph around a note (or the full vault graph when note is omitted). Omitting note returns every note and edge in the vault; pass note for a bounded neighborhood.",
+            "Return the local BFS knowledge graph around a note (or the full vault graph when note is omitted). Omitting note returns the whole-vault graph, which is large and slow on big vaults; pass note and a small depth when possible.",
             json!({
                 "type": "object",
                 "properties": {
@@ -768,7 +768,7 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "list_tags",
-            "List all inline and frontmatter tags in the vault with note counts.",
+            "List all inline and frontmatter tags in the vault with note counts. Aggregates over the whole vault.",
             json!({
                 "type": "object",
                 "properties": {
@@ -820,7 +820,7 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "find_orphans",
-            "Find orphan notes that have zero incoming backlinks and zero outgoing wikilinks.",
+            "Find orphan notes that have zero incoming backlinks and zero outgoing wikilinks. Reads the whole note index; cost grows with vault size and the result is not paginated.",
             json!({
                 "type": "object",
                 "properties": {
@@ -830,7 +830,7 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "reindex_vault",
-            "Trigger an immediate incremental filesystem scan and SQLite FTS5 + graph index refresh.",
+            "Force a full verification rescan: re-reads and hashes every note and rebuilds link resolution. Slow on large vaults. Rarely needed: every other tool already syncs changed files first.",
             json!({
                 "type": "object",
                 "properties": {

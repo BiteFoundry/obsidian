@@ -8570,3 +8570,48 @@ fn obs13_unresolved_link_still_creates() {
         ["Linked Idea.md", "New Idea.md", "Start.md"]
     );
 }
+
+#[test]
+fn mcp_tool_descriptions_carry_cost_hints() {
+    let tools = tool_definitions();
+    let description = |name: &str| -> String {
+        tools
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("tool {name} is missing"))["description"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+
+    let reindex = description("reindex_vault");
+    assert!(reindex.contains("full"), "{reindex}");
+    assert!(!reindex.to_lowercase().contains("incremental"), "{reindex}");
+    assert!(reindex.contains("Slow on large vaults"), "{reindex}");
+
+    for (name, hint) in [
+        ("list_vaults", "slow"),
+        ("find_orphans", "cost grows with vault size"),
+        ("get_local_graph", "slow on big vaults"),
+        ("list_tags", "whole vault"),
+    ] {
+        let text = description(name);
+        assert!(text.contains(hint), "{name}: {text}");
+    }
+
+    // Names, count and schemas are untouched: only description strings moved.
+    let names: std::collections::BTreeSet<&str> =
+        tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert_eq!(tools.len(), 20);
+    assert_eq!(names.len(), 20);
+    for tool in &tools {
+        let text = tool["description"].as_str().unwrap();
+        assert!(
+            text.chars().count() <= 400,
+            "{} description has {} characters",
+            tool["name"],
+            text.chars().count()
+        );
+        assert_eq!(tool["inputSchema"]["type"], "object", "{}", tool["name"]);
+    }
+}

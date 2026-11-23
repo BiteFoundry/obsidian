@@ -27,7 +27,7 @@ Existing 0.1.x settings use `"command": "obsidian"` or `"command": "obs"`. Set `
 
 | # | Tool | Arguments | Purpose |
 | :-: | :--- | :--- | :--- |
-| 1 | `list_vaults` | *(none)* | List auto-discovered & registered Obsidian vaults with note counts |
+| 1 | `list_vaults` | *(none)* | List registered & auto-discovered Obsidian vaults with note counts (scans every vault to refresh the counts, so the first call can be slow with many or large vaults) |
 | 2 | `search_notes` | `query`, `limit?`, `vault?` | SQLite FTS5 search; Korean/CJK queries also match inside longer words (`limit` default 20, clamped `1..200`; response includes `limit`, `returned`, `has_more`, `next_cursor`) |
 | 3 | `read_note` | `note`, `compact?`, `vault?` | Compact by default (`rel_path`, `title`, `raw_markdown`, `mtime_ms`, `omitted`, `hint`); pass `compact: false` for frontmatter, tags, headings, tasks, backlinks & outgoing links |
 | 4 | `list_notes` | `folder?`, `limit?`, `cursor?`, `vault?` | Paginated note list (`limit` `1..500`, default 50; returns `count`, `returned`, `total`, `has_more`, `next_cursor`, `notes`) |
@@ -38,13 +38,13 @@ Existing 0.1.x settings use `"command": "obsidian"` or `"command": "obs"`. Set `
 | 9 | `daily_note` | `date?`, `append?`, `vault?` | Open or create today's Daily Note and optionally append text (folder and file name follow `.obsidian/daily-notes.json`; a `YYYY-MM-DD` `date` is formatted with the vault's format, see [Daily notes](API.md#daily-notes)); calls with non-empty `append` return a receipt (`rel_path`, `created`, `appended`, `hint`), while calls without `append` return `rel_path`, `created`, `raw_markdown`, `omitted`, `hint` (call `read_note` with `compact: false` for metadata; each call with `append` appends again) |
 | 10 | `get_backlinks` | `note`, `vault?` | Return incoming linked mentions (backlinks) with snippet context |
 | 11 | `get_outgoing_links` | `note`, `vault?` | Return outgoing wikilinks and embeds with `status` (`resolved`, `attachment`, `ambiguous`, `missing`) and `candidates` |
-| 12 | `get_local_graph` | `note?`, `depth?`, `vault?` | Return local BFS neighborhood (`depth` clamped `1..5`, applied `depth` returned; each node includes `status`: `resolved`, `ambiguous`, or `missing`; `in_degree` = distinct referring notes, `out_degree` = distinct targets excluding existing attachments and self-links; omitting `note` returns the full vault graph) |
-| 13 | `list_tags` | `vault?` | List all inline and frontmatter `#tags` with note counts |
+| 12 | `get_local_graph` | `note?`, `depth?`, `vault?` | Return local BFS neighborhood (`depth` clamped `1..5`, applied `depth` returned; each node includes `status`: `resolved`, `ambiguous`, or `missing`; `in_degree` = distinct referring notes, `out_degree` = distinct targets excluding existing attachments and self-links; omitting `note` returns the full vault graph, which is large and slow on big vaults: pass `note` and a small `depth` when possible) |
+| 13 | `list_tags` | `vault?` | List all inline and frontmatter `#tags` with note counts (aggregates over the whole vault) |
 | 14 | `find_by_tag` | `tag`, `vault?` | Find all notes matching a tag (including nested subtags) |
 | 15 | `list_tasks` | `status?`, `note?`, `limit?`, `cursor?`, `vault?` | Paginated checklist tasks (`all`, `open`, `done`; `limit` `1..500`, default 50; returns `count`, `returned`, `total`, `has_more`, `next_cursor`, `tasks`) |
 | 16 | `toggle_task` | `note`, `line`, `expected_text?`, `expected_checked?`, `expected_mtime_ms?`, `vault?` | Toggle a Markdown checkbox at an exact 1-based line number, with optional conflict checks |
-| 17 | `find_orphans` | `vault?` | Find orphan notes with 0 backlinks and 0 outgoing links |
-| 18 | `reindex_vault` | `vault?` | Trigger immediate incremental scan & SQLite FTS5/graph reindex |
+| 17 | `find_orphans` | `vault?` | Find orphan notes with 0 backlinks and 0 outgoing links (reads the whole note index; cost grows with vault size and the result is not paginated) |
+| 18 | `reindex_vault` | `vault?` | Force a full verification rescan: re-reads and hashes every note and rebuilds link resolution. Slow on large vaults and rarely needed, because every other tool already syncs changed files first |
 | 19 | `move_note` | `src`, `dst`, `vault?` | Move or rename a note within its vault, update incoming wikilinks/Markdown links, and rewrite relative Markdown links, images, and attachments inside the moved note so they keep pointing to the same files |
 | 20 | `replace_note_text` | `note`, `find`, `replace`, `vault?` | Replace a literal string that occurs exactly once in the Markdown body |
 

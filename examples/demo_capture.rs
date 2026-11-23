@@ -1,7 +1,26 @@
 //! Captures 8 real `ratatui::TestBackend` frames (120x34) from `obsidian_cli::ui::draw`
 //! on a fictional "Acme Second Brain" vault and renders `assets/demo.gif`.
+//!
+//! The frames are turned into a GIF by an external Python script, `render_tui_gif.py`, which is
+//! not part of this repository. Two environment variables say where things are:
+//!
+//! - `DEMO_RENDERER_SCRIPT`: path of `render_tui_gif.py`. Default: `scripts/render_tui_gif.py`
+//!   in this repository (not shipped, so set the variable unless you put the script there).
+//! - `DEMO_PREVIEW_DIR`: directory for the per-frame preview PNGs. Default:
+//!   `target/demo-previews/obsidian`.
+//!
+//! Usage:
+//!
+//! ```text
+//! DEMO_RENDERER_SCRIPT=/path/to/render_tui_gif.py DEMO_PREVIEW_DIR=/path/to/previews \
+//!     cargo run --example demo_capture
+//! ```
 
-use std::{fs, path::Path, process::Command};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use obsidian_cli::{
     config::{AppConfig, PageWidthMode, ThemePreset, VaultProfile},
@@ -32,8 +51,28 @@ use tokio::sync::{mpsc, watch};
 const WIDTH: u16 = 120;
 const HEIGHT: u16 = 34;
 
-const RENDERER_SCRIPT: &str = r"C:\Users\user\.gemini\antigravity-cli\brain\f9e7f082-6ac8-4e73-9827-8af29ccd4ff4\scratch\render_tui_gif.py";
-const PREVIEW_DIR: &str = r"C:\Users\user\.gemini\antigravity-cli\brain\f9e7f082-6ac8-4e73-9827-8af29ccd4ff4\scratch\gif-previews\obsidian";
+/// A path from the environment, or `fallback` under the repository root when the variable is
+/// unset or blank.
+fn env_path_or(var: &str, fallback: &[&str]) -> PathBuf {
+    match env::var_os(var).filter(|value| !value.to_string_lossy().trim().is_empty()) {
+        Some(value) => PathBuf::from(value),
+        None => fallback
+            .iter()
+            .fold(PathBuf::from(env!("CARGO_MANIFEST_DIR")), |path, part| {
+                path.join(part)
+            }),
+    }
+}
+
+/// `DEMO_RENDERER_SCRIPT`, else `scripts/render_tui_gif.py` in this repository.
+fn renderer_script() -> PathBuf {
+    env_path_or("DEMO_RENDERER_SCRIPT", &["scripts", "render_tui_gif.py"])
+}
+
+/// `DEMO_PREVIEW_DIR`, else `target/demo-previews/obsidian` (git-ignored build output).
+fn preview_dir() -> PathBuf {
+    env_path_or("DEMO_PREVIEW_DIR", &["target", "demo-previews", "obsidian"])
+}
 
 fn color_to_json(c: Color) -> Value {
     match c {
@@ -539,14 +578,23 @@ fn main() {
         fs::create_dir_all(parent).unwrap();
     }
 
+    let renderer = renderer_script();
+    if !renderer.is_file() {
+        eprintln!(
+            "Renderer script not found at {}. Set DEMO_RENDERER_SCRIPT to render_tui_gif.py.",
+            renderer.display()
+        );
+        std::process::exit(1);
+    }
+    let previews = preview_dir();
+    fs::create_dir_all(&previews).expect("create preview directory");
+
     let status = Command::new("python")
-        .args([
-            RENDERER_SCRIPT,
-            tmp_json.to_str().unwrap(),
-            out_gif.to_str().unwrap(),
-            "--preview-png",
-            PREVIEW_DIR,
-        ])
+        .arg(&renderer)
+        .arg(&tmp_json)
+        .arg(&out_gif)
+        .arg("--preview-png")
+        .arg(&previews)
         .status()
         .expect("invoke render_tui_gif.py");
 
