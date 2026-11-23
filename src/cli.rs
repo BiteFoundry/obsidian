@@ -57,7 +57,7 @@ pub enum Commands {
     },
     /// Incrementally scan the active vault and rebuild SQLite WAL + FTS5 + graph index.
     Reindex,
-    /// Full-text search notes via SQLite FTS5 (+ Korean/CJK <3 char LIKE fallback).
+    /// Full-text search notes via SQLite FTS5 (Korean/CJK queries also match inside longer words).
     Search {
         /// Search query string.
         #[arg(allow_hyphen_values = true)]

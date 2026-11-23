@@ -28,7 +28,7 @@ Every `/api/v1/*` request needs `Authorization: Bearer <token>`. `/health` needs
 | :--- | :--- | :--- |
 | `GET` | `/health` | Service health, version, active vault, and indexed note count |
 | `GET` | `/api/v1/vaults` | List all auto-discovered and registered Obsidian vaults |
-| `GET` | `/api/v1/search?q=...&limit=25&vault=...` | Full-text FTS5 search (+ automatic `<3`-char Korean/CJK `LIKE` fallback) |
+| `GET` | `/api/v1/search?q=...&limit=25&vault=...` | Full-text FTS5 search; Korean/CJK queries also match inside longer words (`회의록` finds `주간회의록`) |
 | `GET` | `/api/v1/notes?folder=...&vault=...` | List notes in the vault, optionally filtered by folder prefix |
 | `GET` | `/api/v1/notes/{*path}?vault=...` | Read full note Markdown, frontmatter, headings, tasks, backlinks & outgoing links |
 | `POST` | `/api/v1/notes` | Create a new Markdown note atomically (`{ title, folder?, content?, tags?, vault? }`) |

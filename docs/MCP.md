@@ -28,7 +28,7 @@ Existing 0.1.x settings use `"command": "obsidian"` or `"command": "obs"`. Set `
 | # | Tool | Arguments | Purpose |
 | :-: | :--- | :--- | :--- |
 | 1 | `list_vaults` | *(none)* | List auto-discovered & registered Obsidian vaults with note counts |
-| 2 | `search_notes` | `query`, `limit?`, `vault?` | SQLite FTS5 search with `<3`-char Korean/CJK `LIKE` fallback (`limit` default 20, clamped `1..200`; response includes `limit`, `returned`, `has_more`, `next_cursor`) |
+| 2 | `search_notes` | `query`, `limit?`, `vault?` | SQLite FTS5 search; Korean/CJK queries also match inside longer words (`limit` default 20, clamped `1..200`; response includes `limit`, `returned`, `has_more`, `next_cursor`) |
 | 3 | `read_note` | `note`, `compact?`, `vault?` | Compact by default (`rel_path`, `title`, `raw_markdown`, `mtime_ms`, `omitted`, `hint`); pass `compact: false` for frontmatter, tags, headings, tasks, backlinks & outgoing links |
 | 4 | `list_notes` | `folder?`, `limit?`, `cursor?`, `vault?` | Paginated note list (`limit` `1..500`, default 50; returns `count`, `returned`, `total`, `has_more`, `next_cursor`, `notes`) |
 | 5 | `create_note` | `title`, `folder?`, `content?`, `tags?`, `vault?` | Create a new `.md` note atomically with YAML frontmatter (`tags` must be an array of strings and errors if `content` frontmatter already defines `tags`) |

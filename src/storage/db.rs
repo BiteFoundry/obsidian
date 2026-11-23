@@ -1296,7 +1296,9 @@ impl Storage {
         }))
     }
 
-    /// Full-text search via SQLite FTS5 with automatic `<3`-char Korean/CJK `LIKE` fallback.
+    /// Full-text search via SQLite FTS5. Korean/CJK queries also run a substring `LIKE` scan
+    /// (alone below 3 characters, merged after the FTS hits otherwise), so they match inside
+    /// longer words such as `주간회의록` for `회의록`.
     pub fn search_notes(
         &self,
         vault_id: &str,
@@ -1359,11 +1361,29 @@ impl Storage {
 
         // Use LIKE fallback when query has <3 chars with Hangul/CJK or very short token
         let use_like_first = should_use_short_cjk_like(q);
+        // `unicode61` indexes a run of Hangul/CJK as one token and FTS5 only matches token
+        // prefixes, so a CJK query misses words that merely contain it. Longer CJK queries
+        // therefore merge the substring scan in after the ranked FTS hits.
+        let merge_like = !use_like_first && contains_cjk(q);
         if !use_like_first {
             let fts_query = build_fts5_query(q);
             if !fts_query.is_empty() {
                 let fts_res = run_fts5_search(&conn, vault_id, &fts_query, fetch, &tags_map);
                 if let Ok(hits) = fts_res {
+                    if merge_like {
+                        let mut merged = hits;
+                        let mut seen: HashSet<String> =
+                            merged.iter().map(|h| h.rel_path.clone()).collect();
+                        for hit in run_like_search(&conn, vault_id, q, fetch, &tags_map)? {
+                            if merged.len() >= fetch {
+                                break;
+                            }
+                            if seen.insert(hit.rel_path.clone()) {
+                                merged.push(hit);
+                            }
+                        }
+                        return Ok(merged);
+                    }
                     if !hits.is_empty() {
                         return Ok(hits);
                     }
@@ -2097,14 +2117,18 @@ pub fn should_use_short_cjk_like(query: &str) -> bool {
     if char_count == 0 {
         return false;
     }
-    let has_cjk = trimmed.chars().any(|c| {
+    contains_cjk(trimmed) && char_count < 3
+}
+
+/// True when `s` contains Hangul, Han, Hiragana or Katakana characters.
+fn contains_cjk(s: &str) -> bool {
+    s.chars().any(|c| {
         ('\u{AC00}'..='\u{D7A3}').contains(&c)
             || ('\u{1100}'..='\u{11FF}').contains(&c)
             || ('\u{3130}'..='\u{318F}').contains(&c)
             || ('\u{4E00}'..='\u{9FFF}').contains(&c)
             || ('\u{3040}'..='\u{30FF}').contains(&c)
-    });
-    has_cjk && char_count < 3
+    })
 }
 
 fn build_fts5_query(raw: &str) -> String {
@@ -2911,5 +2935,104 @@ mod tests {
         let stats = storage.sync_vault(&vault).unwrap();
         assert_eq!(stats.updated, 0);
         assert_eq!(stats.removed, 0);
+    }
+
+    fn obs10_vault(
+        notes: &[(&str, &str)],
+    ) -> (tempfile::TempDir, crate::config::VaultProfile, Storage) {
+        let tmp = tempfile::tempdir().unwrap();
+        for (path, body) in notes {
+            fs::write(tmp.path().join(path), body).unwrap();
+        }
+        let vault = vault_from_dir(tmp.path(), Some("obs10"));
+        let storage = Storage::open_in_memory().unwrap();
+        storage.sync_vault(&vault).unwrap();
+        (tmp, vault, storage)
+    }
+
+    const OBS10_KOREAN: &[(&str, &str)] = &[
+        ("a-minutes.md", "회의록 작성\n"),
+        ("b-weekly.md", "주간회의록\n"),
+        ("c-team.md", "팀회의록\n"),
+        ("d-other.md", "관계없는 메모\n"),
+    ];
+
+    fn obs10_paths(hits: &[crate::models::SearchHit]) -> Vec<&str> {
+        hits.iter().map(|h| h.rel_path.as_str()).collect()
+    }
+
+    #[test]
+    fn obs10_korean_three_char_query_recalls_3_of_3() {
+        let (_tmp, vault, storage) = obs10_vault(OBS10_KOREAN);
+        for query in ["회의록", "회의"] {
+            let hits = storage.search_notes(&vault.id, query, 25).unwrap();
+            let mut paths = obs10_paths(&hits);
+            paths.sort_unstable();
+            assert_eq!(
+                paths,
+                ["a-minutes.md", "b-weekly.md", "c-team.md"],
+                "{query}"
+            );
+        }
+    }
+
+    #[test]
+    fn obs10_cjk_merge_reports_has_more() {
+        let (_tmp, vault, storage) = obs10_vault(OBS10_KOREAN);
+        let page = storage.search_notes_page(&vault.id, "회의록", 2).unwrap();
+        assert_eq!(page.hits.len(), 2);
+        assert!(page.has_more);
+        let page = storage.search_notes_page(&vault.id, "회의록", 3).unwrap();
+        assert_eq!(page.hits.len(), 3);
+        assert!(!page.has_more);
+        // The limit bounds the merged list, never more than asked for.
+        assert_eq!(
+            storage.search_notes(&vault.id, "회의록", 1).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn obs10_cjk_merge_keeps_fts_hits_first() {
+        let (_tmp, vault, storage) = obs10_vault(OBS10_KOREAN);
+        let hits = storage.search_notes(&vault.id, "회의록", 25).unwrap();
+        assert_eq!(hits[0].rel_path, "a-minutes.md");
+        let limited = storage.search_notes(&vault.id, "회의록", 1).unwrap();
+        assert_eq!(obs10_paths(&limited), ["a-minutes.md"]);
+    }
+
+    #[test]
+    fn obs10_japanese_and_han_substring() {
+        let (_tmp, vault, storage) = obs10_vault(&[
+            ("weekly.md", "週次議事録\n"),
+            ("kana.md", "まいにちのメモ帳です\n"),
+            ("other.md", "unrelated\n"),
+        ]);
+        let hits = storage.search_notes(&vault.id, "議事録", 25).unwrap();
+        assert_eq!(obs10_paths(&hits), ["weekly.md"]);
+        let hits = storage.search_notes(&vault.id, "メモ帳", 25).unwrap();
+        assert_eq!(obs10_paths(&hits), ["kana.md"]);
+        // LIKE wildcards in a CJK query stay literal.
+        assert!(storage
+            .search_notes(&vault.id, "議%録", 25)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn obs10_ascii_query_path_unchanged() {
+        let (_tmp, vault, storage) = obs10_vault(&[
+            ("first.md", "meeting notes\n"),
+            ("second.md", "premeeting\n"),
+            ("third.md", "ÜBER uns\n"),
+        ]);
+        // The FTS hit suppresses the substring scan for non-CJK queries, as before.
+        let hits = storage.search_notes(&vault.id, "meeting", 25).unwrap();
+        assert_eq!(obs10_paths(&hits), ["first.md"]);
+        let hits = storage.search_notes(&vault.id, "über", 25).unwrap();
+        assert_eq!(obs10_paths(&hits), ["third.md"]);
+        assert!(!should_use_short_cjk_like("meeting"));
+        assert!(should_use_short_cjk_like("회의"));
+        assert!(!should_use_short_cjk_like("회의록"));
     }
 }

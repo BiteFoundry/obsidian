@@ -613,7 +613,7 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "search_notes",
-            "Search notes across a vault using SQLite FTS5 with automatic short Korean/CJK LIKE fallback.",
+            "Search notes across a vault using SQLite FTS5. Korean/CJK queries also match inside longer words (substring scan).",
             json!({
                 "type": "object",
                 "properties": {
