@@ -12,6 +12,7 @@ use crate::{
     mcp::McpServer,
     models::{CodedError, LinkStatus, NoteContent, NoteOmittedCounts, TaskFilter, VaultSummary},
     serve,
+    shell_alias::{self, AliasCommand},
     storage::Storage,
     tui, updater,
     vault::{
@@ -174,6 +175,11 @@ pub enum Commands {
     },
     /// Start the stdio JSON-RPC 2.0 MCP server (20 typed tools).
     Mcp,
+    /// Manage an opt-in short shell alias (`ob` -> `bitefoundry-obsidian`).
+    Alias {
+        #[command(subcommand)]
+        action: AliasCommand,
+    },
     /// Inspect environment, auto-discovered Obsidian vaults, SQLite index, and terminal capabilities.
     Doctor,
     /// Check for or apply a verified GitHub Release binary update.
@@ -1362,6 +1368,8 @@ pub async fn run(cli: Cli) -> Result<()> {
             server.run_stdio()
         }
 
+        Some(Commands::Alias { action }) => shell_alias::cmd_alias(action, cli.json),
+
         Some(Commands::Doctor) => {
             let native_cfg = native_obsidian_config_path();
             let vaults = merged_vaults(&cfg);
@@ -1717,5 +1725,46 @@ mod tests {
                 "expected DisplayHelp for {help_argv:?}, got {err}"
             );
         }
+    }
+
+    #[test]
+    fn parses_alias_subcommands_with_global_json() {
+        let inst = parse(&["alias", "install", "--name", "ob", "--dry-run", "--json"]).unwrap();
+        assert!(inst.json);
+        assert!(matches!(
+            inst.command,
+            Some(Commands::Alias {
+                action: AliasCommand::Install {
+                    ref name,
+                    dry_run: true,
+                    force: false,
+                    ..
+                }
+            }) if name == "ob"
+        ));
+
+        let status = parse(&["alias", "status", "--shell", "zsh"]).unwrap();
+        assert!(matches!(
+            status.command,
+            Some(Commands::Alias {
+                action: AliasCommand::Status {
+                    shell: Some(crate::shell_alias::ShellKind::Zsh),
+                    ref name,
+                    ..
+                }
+            }) if name == "ob"
+        ));
+
+        let snippet = parse(&["alias", "init", "pwsh", "--force"]).unwrap();
+        assert!(matches!(
+            snippet.command,
+            Some(Commands::Alias {
+                action: AliasCommand::Snippet {
+                    shell: Some(crate::shell_alias::ShellKind::Powershell),
+                    force: true,
+                    ..
+                }
+            })
+        ));
     }
 }

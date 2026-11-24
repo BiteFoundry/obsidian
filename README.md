@@ -39,6 +39,9 @@ npm i -g @bitefoundry/obsidian
 # 2. Launch directly — auto-discovers your existing local Obsidian vaults!
 bitefoundry-obsidian
 
+# Optional: install a short shell alias (`ob` -> `bitefoundry-obsidian`)
+bitefoundry-obsidian alias install
+
 # Or scaffold a starter local vault anywhere:
 bitefoundry-obsidian init ~/Documents/SecondBrain
 bitefoundry-obsidian vaults list

@@ -1,0 +1,29 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.BiteFoundry/obsidian",
+  "title": "Obsidian Vault (TUI, CLI & MCP)",
+  "description": "Local Obsidian vault MCP server, CLI, and TUI in Rust with Braille graph & safe edits.",
+  "version": "0.4.2",
+  "websiteUrl": "https://bitefoundry.dev/#app-obsidian",
+  "repository": {
+    "url": "https://github.com/BiteFoundry/obsidian",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "oci",
+      "identifier": "ghcr.io/bitefoundry/obsidian:0.4.2",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "OBSIDIAN_VAULT",
+          "description": "Path or name of the Obsidian vault inside the container (defaults to /data/vault).",
+          "isRequired": false,
+          "isSecret": false
+        }
+      ]
+    }
+  ]
+}

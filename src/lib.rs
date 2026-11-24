@@ -5,6 +5,7 @@ pub mod img_preview;
 pub mod mcp;
 pub mod models;
 pub mod serve;
+pub mod shell_alias;
 pub mod storage;
 pub mod sync;
 pub mod tui;
