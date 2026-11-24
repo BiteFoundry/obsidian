@@ -1766,5 +1766,22 @@ mod tests {
                 }
             })
         ));
+
+        for (flag, expected) in [
+            ("tcsh", crate::shell_alias::ShellKind::Tcsh),
+            ("csh", crate::shell_alias::ShellKind::Csh),
+            ("sh", crate::shell_alias::ShellKind::Sh),
+            ("dash", crate::shell_alias::ShellKind::Sh),
+            ("ash", crate::shell_alias::ShellKind::Sh),
+            ("ksh", crate::shell_alias::ShellKind::Sh),
+        ] {
+            let parsed = parse(&["alias", "snippet", flag]).unwrap();
+            assert!(matches!(
+                parsed.command,
+                Some(Commands::Alias {
+                    action: AliasCommand::Snippet { shell: Some(s), .. }
+                }) if s == expected
+            ));
+        }
     }
 }

@@ -5555,7 +5555,9 @@ fn plan_compact_note_object_reports_exact_omissions() {
             "aliases": 1,
             "headings": 1,
             "tasks": 2,
-            "fields": ["folder", "frontmatter", "word_count"],
+            "images": Value::Null,
+            "frontmatter_keys": ["aliases", "tags"],
+            "fields": ["folder", "word_count", "size_bytes", "is_bookmarked", "md_links"],
         })
     );
     for key in [

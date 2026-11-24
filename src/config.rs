@@ -461,6 +461,27 @@ pub fn strip_verbatim_prefix(s: &str) -> Cow<'_, str> {
     Cow::Borrowed(rest)
 }
 
+pub fn canonicalize_existing_ancestor(path: &Path) -> PathBuf {
+    if let Ok(canon) = fs::canonicalize(path) {
+        return canon;
+    }
+    let mut current = path.to_path_buf();
+    let mut tail = Vec::new();
+    while let Some(name) = current.file_name() {
+        tail.push(name.to_os_string());
+        if !current.pop() || current.as_os_str().is_empty() {
+            break;
+        }
+        if let Ok(mut canon) = fs::canonicalize(&current) {
+            for comp in tail.into_iter().rev() {
+                canon.push(comp);
+            }
+            return canon;
+        }
+    }
+    path.to_path_buf()
+}
+
 pub fn normalize_path_key(path: &Path) -> String {
     let resolved = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let s = resolved.to_string_lossy().replace('\\', "/");
@@ -475,7 +496,7 @@ pub fn normalize_path_key(path: &Path) -> String {
 pub fn config_dir() -> PathBuf {
     if let Ok(override_dir) = std::env::var("OBSIDIAN_CONFIG_DIR") {
         if !override_dir.trim().is_empty() {
-            return PathBuf::from(override_dir.trim());
+            return expand_tilde(override_dir.trim());
         }
     }
     dirs::config_dir()
@@ -486,7 +507,7 @@ pub fn config_dir() -> PathBuf {
 pub fn data_dir() -> PathBuf {
     if let Ok(override_dir) = std::env::var("OBSIDIAN_DATA_DIR") {
         if !override_dir.trim().is_empty() {
-            return PathBuf::from(override_dir.trim());
+            return expand_tilde(override_dir.trim());
         }
     }
     dirs::data_local_dir()
@@ -540,12 +561,44 @@ pub fn write_atomic_0600(path: &Path, data: &[u8]) -> Result<()> {
 }
 
 fn write_atomic_with_mode(path: &Path, data: &[u8], mode_0600: bool) -> Result<()> {
-    ensure_parent(path)?;
-    let parent = path
+    let target_path: Cow<'_, Path> = match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            if mode_0600 {
+                bail!(
+                    "Refusing to write sensitive file through symlink: {}",
+                    path.display()
+                );
+            }
+            let resolved = fs::canonicalize(path).with_context(|| {
+                format!(
+                    "Failed to resolve symlink target for atomic write: {}",
+                    path.display()
+                )
+            })?;
+            if resolved.is_dir() {
+                bail!(
+                    "Refusing to overwrite directory through symlink: {} -> {}",
+                    path.display(),
+                    resolved.display()
+                );
+            }
+            Cow::Owned(resolved)
+        }
+        Ok(meta) if meta.file_type().is_dir() => {
+            bail!("Refusing to overwrite directory: {}", path.display());
+        }
+        _ => Cow::Borrowed(path),
+    };
+    let target = target_path.as_ref();
+    ensure_parent(target)?;
+    let parent = target
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    let name = target
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file");
     let pid = std::process::id();
     let seq = ATOMIC_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp = parent.join(format!(".{name}.{pid}.{seq}.tmp"));
@@ -576,9 +629,9 @@ fn write_atomic_with_mode(path: &Path, data: &[u8], mode_0600: bool) -> Result<(
         return Err(err);
     }
 
-    if let Err(rename_err) = fs::rename(&tmp, path) {
+    if let Err(rename_err) = fs::rename(&tmp, target) {
         if let Err(replace_err) =
-            replace_existing_with_backup(&tmp, path, parent, name, pid, seq, rename_err)
+            replace_existing_with_backup(&tmp, target, parent, name, pid, seq, rename_err)
         {
             let _ = fs::remove_file(&tmp);
             return Err(replace_err);
@@ -656,7 +709,7 @@ fn first_non_empty_env(keys: &[&str]) -> Option<String> {
     None
 }
 
-fn expand_tilde(input: &str) -> PathBuf {
+pub(crate) fn expand_tilde(input: &str) -> PathBuf {
     if input == "~" {
         return dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
     }
@@ -852,5 +905,103 @@ mod tests {
             assert!(!saved.contains(key), "{key} survived in:\n{saved}");
         }
         assert!(saved.contains("theme = \"nord\""));
+    }
+
+    #[test]
+    fn canonicalize_existing_ancestor_resolves_missing_tail_and_existing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing_sub = dir.path().join("real_sub");
+        fs::create_dir_all(&existing_sub).unwrap();
+
+        let missing_leaf = existing_sub.join("future").join("nested").join("config.toml");
+        let resolved = canonicalize_existing_ancestor(&missing_leaf);
+        let canon_sub = fs::canonicalize(&existing_sub).unwrap();
+        assert_eq!(resolved, canon_sub.join("future").join("nested").join("config.toml"));
+
+        let existing_file = existing_sub.join("here.txt");
+        fs::write(&existing_file, "ok").unwrap();
+        assert_eq!(
+            canonicalize_existing_ancestor(&existing_file),
+            fs::canonicalize(&existing_file).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn env_config_and_data_dirs_expand_tilde() {
+        let _lock = TEST_ENV_LOCK.lock().await;
+        let home = dirs::home_dir().expect("home dir available");
+        let _guard = EnvVarGuard::set(&[
+            ("OBSIDIAN_CONFIG_DIR", Some("~/.custom-ob-cfg")),
+            ("OBSIDIAN_DATA_DIR", Some("~/.custom-ob-data")),
+        ]);
+        assert_eq!(config_dir(), home.join(".custom-ob-cfg"));
+        assert_eq!(data_dir(), home.join(".custom-ob-data"));
+    }
+
+    #[test]
+    fn write_atomic_symlink_hardening_preserves_normal_and_refuses_0600_and_dangling() {
+        let dir = tempfile::tempdir().unwrap();
+        let target_dir = dir.path().join("dotfiles");
+        let link_dir = dir.path().join("config");
+        fs::create_dir_all(&target_dir).unwrap();
+        fs::create_dir_all(&link_dir).unwrap();
+
+        let real_file = target_dir.join("config.toml");
+        fs::write(&real_file, "old = 1\n").unwrap();
+        let link_file = link_dir.join("config.toml");
+
+        // Refuses overwriting a directory directly.
+        assert!(write_atomic(&target_dir, b"nope").is_err());
+
+        let symlink_ok = {
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(&real_file, &link_file).is_ok()
+            }
+            #[cfg(windows)]
+            {
+                match std::os::windows::fs::symlink_file(&real_file, &link_file) {
+                    Ok(()) => true,
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::PermissionDenied
+                            || e.raw_os_error() == Some(1314) =>
+                    {
+                        false
+                    }
+                    Err(e) => panic!("unexpected symlink_file error: {e}"),
+                }
+            }
+        };
+
+        if !symlink_ok {
+            return;
+        }
+
+        // 1. mode_0600 == false resolves target and preserves the symlink.
+        write_atomic(&link_file, b"updated = 2\n").unwrap();
+        assert!(link_file.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(fs::read_to_string(&real_file).unwrap(), "updated = 2\n");
+
+        // 2. mode_0600 == true refuses symlinks and leaves target untouched.
+        let err = write_atomic_0600(&link_file, b"secret").unwrap_err();
+        assert!(err.to_string().contains("symlink"), "got: {err}");
+        assert_eq!(fs::read_to_string(&real_file).unwrap(), "updated = 2\n");
+
+        // 3. Dangling symlink fails cleanly.
+        let dangling = link_dir.join("dangling.toml");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target_dir.join("does-not-exist.toml"), &dangling).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(target_dir.join("does-not-exist.toml"), &dangling)
+            .unwrap();
+        assert!(write_atomic(&dangling, b"nope").is_err());
+
+        // 4. Symlink to a directory fails cleanly.
+        let dir_link = link_dir.join("dir_link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target_dir, &dir_link).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&target_dir, &dir_link).unwrap();
+        assert!(write_atomic(&dir_link, b"nope").is_err());
     }
 }

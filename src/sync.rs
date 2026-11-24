@@ -663,6 +663,10 @@ fn register_native_watcher(vault_root: &Path) -> Option<NativeWatchBinding> {
     }
     let root_owned = vault_root.to_path_buf();
     let canonical_root = fs::canonicalize(vault_root).ok();
+    let watch_root = canonical_root
+        .as_deref()
+        .unwrap_or(vault_root)
+        .to_path_buf();
     let (tx, rx) = mpsc::channel::<FsSignal>(EVENT_CHANNEL_CAPACITY);
     let overflow_flag = Arc::new(AtomicBool::new(false));
     let overflow_notify = Arc::new(Notify::new());
@@ -699,7 +703,7 @@ fn register_native_watcher(vault_root: &Path) -> Option<NativeWatchBinding> {
     )
     .ok()?;
 
-    if watcher.watch(vault_root, RecursiveMode::Recursive).is_err() {
+    if watcher.watch(&watch_root, RecursiveMode::Recursive).is_err() {
         return None;
     }
 
@@ -1571,6 +1575,113 @@ mod tests {
         assert_eq!(
             storage
                 .search_notes(&vault.id, "REAL_UPDATED_123", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_symlinked_home_vault_scan_and_watcher_work_while_inner_symlinks_blocked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real_home = tmp.path().join("real_home");
+        let linked_home = tmp.path().join("linked_home");
+        let real_vault = real_home.join("Vault");
+        let outside = tmp.path().join("OutsideSecret");
+        fs::create_dir_all(&real_vault).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(real_vault.join("HomeNote.md"), "# HomeNote\n\nINIT_HOME\n").unwrap();
+        fs::write(
+            outside.join("External.md"),
+            "# External\n\nOUTSIDE_SECRET_INIT\n",
+        )
+        .unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            symlink(&real_home, &linked_home).unwrap();
+            symlink(&outside, real_vault.join("InnerLink")).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::symlink_dir;
+            let is_unprivileged = |err: &std::io::Error| {
+                err.kind() == std::io::ErrorKind::PermissionDenied
+                    || err.raw_os_error() == Some(1314)
+            };
+            if let Err(err) = symlink_dir(&real_home, &linked_home) {
+                if is_unprivileged(&err) {
+                    return;
+                }
+                panic!("failed to create symlink_dir for home: {err}");
+            }
+            if let Err(err) = symlink_dir(&outside, real_vault.join("InnerLink")) {
+                if is_unprivileged(&err) {
+                    return;
+                }
+                panic!("failed to create symlink_dir inside vault: {err}");
+            }
+        }
+
+        let linked_vault = linked_home.join("Vault");
+        let scanned = crate::vault::fs::scan_vault_markdown_files(&linked_vault).unwrap();
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(scanned[0].rel_path, "HomeNote.md");
+
+        let mut vault = vault_from_dir(&linked_vault, Some("LinkedHomeVault"));
+        // Keep the uncanonicalized symlinked-HOME path in VaultProfile, matching config.toml/obsidian.json.
+        vault.path = linked_vault.clone();
+
+        let storage = Storage::open_in_memory().unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let (_ctrl, diag) = spawn_vault_watcher_with_options(
+            vault.clone(),
+            storage.clone(),
+            2_500,
+            tx,
+            WatcherOptions::default(),
+        );
+        assert_eq!(diag.mode(), WatcherMode::Native);
+
+        let _ = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(storage.note_count(&vault.id).unwrap(), 1);
+
+        // Mutations inside the inner symlinked directory must still be ignored.
+        fs::write(
+            outside.join("External.md"),
+            "# External\n\nOUTSIDE_MUTATED_SYMLINK_HOME\n",
+        )
+        .unwrap();
+        let ignored = tokio::time::timeout(Duration::from_millis(400), rx.recv()).await;
+        assert!(
+            ignored.is_err(),
+            "mutations inside inner symlinked directory must be ignored"
+        );
+        assert_eq!(storage.note_count(&vault.id).unwrap(), 1);
+        assert!(storage
+            .search_notes(&vault.id, "OUTSIDE_MUTATED_SYMLINK_HOME", 10)
+            .unwrap()
+            .is_empty());
+
+        // Mutations to real notes under the symlinked $HOME vault must propagate cleanly.
+        fs::write(
+            linked_vault.join("HomeNote.md"),
+            "# HomeNote\n\nSYMLINK_HOME_UPDATED_777\n",
+        )
+        .unwrap();
+        let ev = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(ev, CoreEvent::VaultIndexed { .. }));
+        assert_eq!(
+            storage
+                .search_notes(&vault.id, "SYMLINK_HOME_UPDATED_777", 10)
                 .unwrap()
                 .len(),
             1

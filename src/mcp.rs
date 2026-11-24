@@ -225,6 +225,31 @@ impl McpServer {
             "read_note" => {
                 let vault = self.resolve_vault(args)?;
                 let note = req_str(args, "note")?;
+                let fields: Option<Vec<String>> = match args.get("fields") {
+                    None | Some(Value::Null) => None,
+                    Some(v) => {
+                        let arr = v.as_array().ok_or_else(|| {
+                            anyhow!("Invalid 'fields': expected an array of strings")
+                        })?;
+                        let mut out = Vec::with_capacity(arr.len());
+                        for item in arr {
+                            let s = item
+                                .as_str()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .ok_or_else(|| {
+                                    anyhow!(
+                                        "Invalid 'fields': expected an array of non-empty strings"
+                                    )
+                                })?;
+                            out.push(s.to_string());
+                        }
+                        Some(out)
+                    }
+                };
+                if let Some(requested_fields) = fields {
+                    return self.read_note_projected(&vault, note, &requested_fields);
+                }
                 let compact = match args.get("compact") {
                     None => true,
                     Some(v) => v
@@ -236,15 +261,17 @@ impl McpServer {
                     let counts = self
                         .storage
                         .note_omitted_counts(&vault.id, &content.rel_path)?;
+                    let frontmatter_keys: Vec<String> = self
+                        .storage
+                        .get_note_summary(&vault.id, &content.rel_path)?
+                        .map(|s| s.frontmatter.keys().cloned().collect())
+                        .unwrap_or_default();
                     return Ok(json!({
                         "rel_path": content.rel_path,
                         "title": content.title,
                         "raw_markdown": content.raw_markdown,
                         "mtime_ms": content.mtime_ms,
-                        "omitted": mcp_omitted(
-                            Some(counts),
-                            &["folder", "frontmatter", "word_count"],
-                        ),
+                        "omitted": mcp_read_note_omitted(counts, &frontmatter_keys),
                         "hint": mcp_read_note_hint(&content.rel_path),
                     }));
                 }
@@ -257,10 +284,14 @@ impl McpServer {
                     "tags": detail.summary.tags,
                     "aliases": detail.summary.aliases,
                     "word_count": detail.summary.word_count,
+                    "size_bytes": detail.summary.size_bytes,
+                    "is_bookmarked": detail.summary.is_bookmarked,
                     "mtime_ms": detail.summary.mtime_ms,
                     "raw_markdown": detail.raw_markdown,
                     "headings": detail.parsed.headings,
                     "tasks": detail.parsed.tasks,
+                    "md_links": detail.parsed.md_links,
+                    "images": detail.images,
                     "backlinks": detail.backlinks,
                     "outgoing_links": detail.outgoing_links,
                 }))
@@ -540,6 +571,170 @@ impl McpServer {
             other => bail!("Unknown MCP tool: {other}"),
         }
     }
+
+    fn read_note_projected(
+        &self,
+        vault: &VaultProfile,
+        note: &str,
+        requested_fields: &[String],
+    ) -> Result<Value> {
+        let rel_path = self.storage.resolve_note_path(&vault.id, note)?;
+        let summary = self
+            .storage
+            .get_note_summary(&vault.id, &rel_path)?
+            .ok_or_else(|| anyhow!("Note missing from index: {rel_path}"))?;
+
+        let needs_detail = requested_fields.iter().any(|f| {
+            matches!(
+                f.as_str(),
+                "raw_markdown" | "body" | "headings" | "md_links" | "images"
+            )
+        });
+        let detail = if needs_detail {
+            Some(self.storage.load_note_detail(vault, &rel_path)?)
+        } else {
+            None
+        };
+
+        let mut obj = serde_json::Map::new();
+        obj.insert("rel_path".into(), json!(summary.rel_path));
+        obj.insert("title".into(), json!(summary.title));
+        obj.insert("mtime_ms".into(), json!(summary.mtime_ms));
+
+        let mut frontmatter_all = false;
+        let mut frontmatter_subset = serde_json::Map::new();
+        let mut saw_frontmatter_key = false;
+        let mut missing_fields: Vec<String> = Vec::new();
+
+        for field in requested_fields {
+            match field.as_str() {
+                "rel_path" | "title" | "mtime_ms" => {}
+                "folder" => {
+                    obj.insert("folder".into(), json!(summary.folder));
+                }
+                "frontmatter" => {
+                    frontmatter_all = true;
+                }
+                f if f.starts_with("frontmatter.") => {
+                    let key_path = &f["frontmatter.".len()..];
+                    saw_frontmatter_key = true;
+                    if let Some(val) = lookup_frontmatter_key(&summary.frontmatter, key_path) {
+                        frontmatter_subset.insert(key_path.to_string(), val.clone());
+                    } else if !missing_fields.iter().any(|m| m == f) {
+                        missing_fields.push(f.to_string());
+                    }
+                }
+                "tags" => {
+                    obj.insert("tags".into(), json!(summary.tags));
+                }
+                "aliases" => {
+                    obj.insert("aliases".into(), json!(summary.aliases));
+                }
+                "word_count" => {
+                    obj.insert("word_count".into(), json!(summary.word_count));
+                }
+                "size_bytes" => {
+                    obj.insert("size_bytes".into(), json!(summary.size_bytes));
+                }
+                "is_bookmarked" => {
+                    obj.insert("is_bookmarked".into(), json!(summary.is_bookmarked));
+                }
+                "tasks" => {
+                    let tasks = if let Some(ref d) = detail {
+                        json!(d.parsed.tasks)
+                    } else {
+                        let page = self.storage.list_tasks_page(
+                            &vault.id,
+                            TaskFilter::All,
+                            Some(&rel_path),
+                            None,
+                            None,
+                        )?;
+                        json!(page.items)
+                    };
+                    obj.insert("tasks".into(), tasks);
+                }
+                "backlinks" => {
+                    let backlinks = if let Some(ref d) = detail {
+                        json!(d.backlinks)
+                    } else {
+                        json!(self.storage.get_backlinks(&vault.id, &rel_path)?)
+                    };
+                    obj.insert("backlinks".into(), backlinks);
+                }
+                "outgoing_links" => {
+                    let outgoing = if let Some(ref d) = detail {
+                        json!(d.outgoing_links)
+                    } else {
+                        json!(self.storage.get_outgoing_links(vault, &rel_path)?)
+                    };
+                    obj.insert("outgoing_links".into(), outgoing);
+                }
+                "headings" => {
+                    obj.insert(
+                        "headings".into(),
+                        json!(detail.as_ref().unwrap().parsed.headings),
+                    );
+                }
+                "md_links" => {
+                    obj.insert(
+                        "md_links".into(),
+                        json!(detail.as_ref().unwrap().parsed.md_links),
+                    );
+                }
+                "images" => {
+                    obj.insert("images".into(), json!(detail.as_ref().unwrap().images));
+                }
+                "raw_markdown" => {
+                    obj.insert(
+                        "raw_markdown".into(),
+                        json!(detail.as_ref().unwrap().raw_markdown),
+                    );
+                }
+                "body" => {
+                    obj.insert(
+                        "body".into(),
+                        json!(detail.as_ref().unwrap().parsed.body_markdown),
+                    );
+                }
+                other => {
+                    if !missing_fields.iter().any(|m| m == other) {
+                        missing_fields.push(other.to_string());
+                    }
+                }
+            }
+        }
+
+        if frontmatter_all {
+            obj.insert("frontmatter".into(), json!(summary.frontmatter));
+        } else if saw_frontmatter_key {
+            obj.insert("frontmatter".into(), Value::Object(frontmatter_subset));
+        }
+        if !missing_fields.is_empty() {
+            obj.insert("missing_fields".into(), json!(missing_fields));
+        }
+
+        Ok(Value::Object(obj))
+    }
+}
+
+fn lookup_frontmatter_key<'a>(
+    fm: &'a BTreeMap<String, Value>,
+    key_path: &str,
+) -> Option<&'a Value> {
+    if key_path.is_empty() {
+        return None;
+    }
+    if let Some(direct) = fm.get(key_path) {
+        return Some(direct);
+    }
+    let mut segments = key_path.split('.');
+    let first = segments.next()?;
+    let mut cur = fm.get(first)?;
+    for seg in segments {
+        cur = cur.as_object()?.get(seg)?;
+    }
+    Some(cur)
 }
 
 fn req_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
@@ -558,6 +753,20 @@ fn mcp_read_note_hint(rel_path: &str) -> String {
         "read_note {}",
         json!({ "note": rel_path, "compact": false })
     )
+}
+
+fn mcp_read_note_omitted(counts: NoteOmittedCounts, frontmatter_keys: &[String]) -> Value {
+    json!({
+        "backlinks": counts.backlinks,
+        "outgoing_links": counts.outgoing_links,
+        "tags": counts.tags,
+        "aliases": counts.aliases,
+        "headings": counts.headings,
+        "tasks": counts.tasks,
+        "images": Value::Null,
+        "frontmatter_keys": frontmatter_keys,
+        "fields": ["folder", "word_count", "size_bytes", "is_bookmarked", "md_links"],
+    })
 }
 
 fn mcp_omitted(counts: Option<NoteOmittedCounts>, fields: &[&str]) -> Value {
@@ -626,12 +835,17 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "read_note",
-            "Read a Markdown note. Returns a compact object by default; pass compact:false for frontmatter, tags, headings, tasks, backlinks, and outgoing links.",
+            "Read a Markdown note. Returns a compact object by default; pass compact:false for all metadata (including is_bookmarked, size_bytes, images, md_links), or pass fields to project specific fields (e.g. frontmatter, frontmatter.<key>, tasks, backlinks, body) without fetching the full body.",
             json!({
                 "type": "object",
                 "properties": {
                     "note": { "type": "string", "description": "Relative path, note title, or alias." },
-                    "compact": { "type": "boolean", "description": "Default true: return rel_path, title, raw_markdown, mtime_ms, omitted, and hint. Set false for frontmatter, tags, headings, tasks, backlinks, and outgoing links." },
+                    "compact": { "type": "boolean", "description": "Default true: return rel_path, title, raw_markdown, mtime_ms, omitted (including frontmatter_keys), and hint. Set false for full metadata including frontmatter, tags, headings, tasks, md_links, images, is_bookmarked, size_bytes, backlinks, and outgoing links." },
+                    "fields": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional selective field projection (e.g. frontmatter, frontmatter.<key>, folder, tags, aliases, word_count, size_bytes, is_bookmarked, mtime_ms, headings, tasks, backlinks, outgoing_links, images, md_links, body, raw_markdown). Unknown or absent keys are reported in missing_fields."
+                    },
                     "vault": { "type": "string", "description": "Optional registered vault name, ID, or path (see list_vaults). Unregistered directories are rejected." }
                 },
                 "required": ["note"]
@@ -860,4 +1074,151 @@ fn tool(name: &str, description: &str, input_schema: Value) -> Value {
         "description": description,
         "inputSchema": input_schema,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vault::vault_from_dir;
+
+    fn setup_test_mcp() -> (tempfile::TempDir, McpServer) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("vault");
+        fs::create_dir_all(root.join("Attachments")).unwrap();
+        fs::write(root.join("Attachments/diagram.png"), b"\x89PNG\r\n\x1a\n").unwrap();
+        fs::write(
+            root.join("Target.md"),
+            "---\nzeta: 42\nalpha: draft\nowner:\n  name: alice\naliases:\n  - TAlias\ntags:\n  - design\n---\n\n# Overview\n\nSee [[Other]] and [Docs](https://example.com/docs).\n![[Attachments/diagram.png]]\n\n- [ ] Ship fix\n- [x] Write test\n",
+        )
+        .unwrap();
+        fs::write(root.join("Other.md"), "# Other\n\nLinks back to [[Target]].\n").unwrap();
+        fs::write(root.join("Plain.md"), "# Plain\n\nNo frontmatter here.\n").unwrap();
+
+        let vault = vault_from_dir(&root, Some("TestVault"));
+        let storage = Storage::open_in_memory().unwrap();
+        let cfg = AppConfig {
+            active_vault: vault.name.clone(),
+            vaults: vec![vault.clone()],
+            ..AppConfig::default()
+        };
+        let server = McpServer::new(cfg, vault.clone(), storage);
+        server
+            .storage
+            .toggle_bookmark(&vault.id, "Target.md")
+            .unwrap();
+        (tmp, server)
+    }
+
+    #[test]
+    fn read_note_compact_surfaces_sorted_frontmatter_keys_and_omitted_counts() {
+        let (_tmp, mcp) = setup_test_mcp();
+
+        let compact = mcp
+            .dispatch_tool("read_note", &json!({ "note": "Target" }))
+            .unwrap();
+        assert_eq!(compact["rel_path"], "Target.md");
+        assert_eq!(
+            compact["omitted"]["frontmatter_keys"],
+            json!(["aliases", "alpha", "owner", "tags", "zeta"])
+        );
+        let omitted_fields = compact["omitted"]["fields"].as_array().unwrap();
+        assert!(
+            !omitted_fields.iter().any(|v| v == "frontmatter"),
+            "bare static 'frontmatter' should be replaced by frontmatter_keys"
+        );
+        assert_eq!(compact["omitted"]["backlinks"], 1);
+        assert_eq!(compact["omitted"]["outgoing_links"], 2);
+        assert_eq!(compact["omitted"]["tasks"], 2);
+        assert!(compact["omitted"]["images"].is_null());
+
+        let plain = mcp
+            .dispatch_tool("read_note", &json!({ "note": "Plain" }))
+            .unwrap();
+        assert_eq!(plain["omitted"]["frontmatter_keys"], json!([]));
+    }
+
+    #[test]
+    fn read_note_full_mode_includes_bookmarked_size_images_and_md_links() {
+        let (_tmp, mcp) = setup_test_mcp();
+
+        let full = mcp
+            .dispatch_tool("read_note", &json!({ "note": "Target", "compact": false }))
+            .unwrap();
+        assert_eq!(full["is_bookmarked"], true);
+        assert!(full["size_bytes"].as_i64().unwrap() > 0);
+        let images = full["images"].as_array().unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0]["raw_target"], "Attachments/diagram.png");
+        let md_links = full["md_links"].as_array().unwrap();
+        assert_eq!(md_links.len(), 1);
+        assert_eq!(md_links[0]["label"], "Docs");
+        assert_eq!(md_links[0]["url"], "https://example.com/docs");
+    }
+
+    #[test]
+    fn read_note_selective_fields_projection_and_missing_fields() {
+        let (_tmp, mcp) = setup_test_mcp();
+
+        // Schema advertises `fields`.
+        let defs = tool_definitions();
+        let read_def = defs.iter().find(|t| t["name"] == "read_note").unwrap();
+        assert!(read_def["inputSchema"]["properties"]["fields"].is_object());
+
+        // Metadata/frontmatter-only projection omits note body & raw_markdown.
+        let projected = mcp
+            .dispatch_tool(
+                "read_note",
+                &json!({
+                    "note": "Target",
+                    "fields": [
+                        "frontmatter.alpha",
+                        "frontmatter.owner.name",
+                        "frontmatter.nonexistent",
+                        "is_bookmarked",
+                        "size_bytes",
+                        "tasks",
+                        "backlinks",
+                        "outgoing_links",
+                        "bogus_field"
+                    ]
+                }),
+            )
+            .unwrap();
+        assert_eq!(projected["rel_path"], "Target.md");
+        assert_eq!(projected["title"], "Target");
+        assert!(projected.get("raw_markdown").is_none());
+        assert!(projected.get("body").is_none());
+        assert_eq!(projected["frontmatter"]["alpha"], "draft");
+        assert_eq!(projected["frontmatter"]["owner.name"], "alice");
+        assert_eq!(projected["is_bookmarked"], true);
+        assert!(projected["size_bytes"].as_i64().unwrap() > 0);
+        assert_eq!(projected["tasks"].as_array().unwrap().len(), 2);
+        assert_eq!(projected["backlinks"].as_array().unwrap().len(), 1);
+        assert_eq!(projected["outgoing_links"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            projected["missing_fields"],
+            json!(["frontmatter.nonexistent", "bogus_field"])
+        );
+
+        // Requesting full frontmatter + body + images + md_links works and has no missing_fields.
+        let with_body = mcp
+            .dispatch_tool(
+                "read_note",
+                &json!({
+                    "note": "Target",
+                    "fields": ["frontmatter", "body", "raw_markdown", "images", "md_links"]
+                }),
+            )
+            .unwrap();
+        assert!(with_body.get("missing_fields").is_none());
+        assert_eq!(with_body["frontmatter"]["zeta"], 42);
+        assert!(with_body["body"].as_str().unwrap().contains("# Overview"));
+        assert!(!with_body["body"].as_str().unwrap().contains("zeta: 42"));
+        assert!(with_body["raw_markdown"]
+            .as_str()
+            .unwrap()
+            .contains("zeta: 42"));
+        assert_eq!(with_body["images"].as_array().unwrap().len(), 1);
+        assert_eq!(with_body["md_links"].as_array().unwrap().len(), 1);
+    }
 }

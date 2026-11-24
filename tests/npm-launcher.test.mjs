@@ -40,3 +40,62 @@ test('npm symlink runs the launcher with install scripts disabled', { skip: proc
   assert.equal(launched.stdout, 'notes\nnote with spaces\n');
   assert.equal(launched.stderr, '');
 });
+
+test('postinstall runs when invoked via a symlinked prefix or home path', (t) => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'obsidian-postinstall-symlink-'));
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+
+  const realPrefix = path.join(base, 'real-prefix');
+  const linkPrefix = path.join(base, 'linked-prefix');
+  fs.mkdirSync(realPrefix, { recursive: true });
+  try {
+    fs.symlinkSync(realPrefix, linkPrefix, process.platform === 'win32' ? 'dir' : undefined);
+  } catch (err) {
+    if (process.platform === 'win32' && err && err.code === 'EPERM') {
+      t.skip('Windows unprivileged directory symlinks unavailable');
+      return;
+    }
+    throw err;
+  }
+
+  const scopeReal = path.join(realPrefix, 'lib', 'node_modules', '@bitefoundry');
+  const pkgRootReal = path.join(scopeReal, 'obsidian');
+  const postinstallReal = path.join(pkgRootReal, 'scripts', 'postinstall.mjs');
+  const jsBinReal = path.join(pkgRootReal, 'bin', `${launcher}.js`);
+  fs.mkdirSync(path.dirname(postinstallReal), { recursive: true });
+  fs.mkdirSync(path.dirname(jsBinReal), { recursive: true });
+  fs.copyFileSync(new URL('../scripts/postinstall.mjs', import.meta.url), postinstallReal);
+  fs.writeFileSync(path.join(pkgRootReal, 'package.json'), '{"name":"@bitefoundry/obsidian","type":"module"}');
+  fs.writeFileSync(jsBinReal, '// placeholder js launcher\n');
+
+  const binName = process.platform === 'win32' ? `${launcher}.exe` : launcher;
+  const platformRootReal = path.join(scopeReal, platformPackage);
+  const nativeBinReal = path.join(platformRootReal, 'bin', binName);
+  const marker = '#!/bin/sh\necho linked-via-symlinked-postinstall\n';
+  fs.mkdirSync(path.dirname(nativeBinReal), { recursive: true });
+  fs.writeFileSync(
+    path.join(platformRootReal, 'package.json'),
+    JSON.stringify({ name: `@bitefoundry/${platformPackage}` }),
+  );
+  fs.writeFileSync(nativeBinReal, marker, { mode: 0o755 });
+
+  const postinstallViaLink = path.join(
+    linkPrefix,
+    'lib',
+    'node_modules',
+    '@bitefoundry',
+    'obsidian',
+    'scripts',
+    'postinstall.mjs',
+  );
+  const res = spawnSync(process.execPath, [postinstallViaLink], { encoding: 'utf8' });
+  assert.equal(res.status, 0, res.stderr);
+
+  if (process.platform === 'win32') {
+    const linkedExe = path.join(pkgRootReal, 'bin', binName);
+    assert.equal(fs.existsSync(linkedExe), true, 'expected native exe to be linked/copied');
+    assert.equal(fs.readFileSync(linkedExe, 'utf8'), marker);
+  } else {
+    assert.equal(fs.readFileSync(jsBinReal, 'utf8'), marker);
+  }
+});

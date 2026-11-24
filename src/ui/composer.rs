@@ -966,13 +966,21 @@ pub(crate) fn run_editor_command(editor: &str, path: &std::path::Path) -> std::i
         .split_first()
         .filter(|(program, _)| !program.is_empty())
         .ok_or_else(|| std::io::Error::other("Editor command is empty"))?;
-    let status = Command::new(program).args(args).arg(path).status()?;
+    let resolved_program = resolve_editor_program(program);
+    let status = Command::new(&resolved_program)
+        .args(args)
+        .arg(path)
+        .status()?;
     if !status.success() {
         return Err(std::io::Error::other(format!(
             "Editor exited with status {status}"
         )));
     }
     Ok(())
+}
+
+fn resolve_editor_program(program: &str) -> std::path::PathBuf {
+    crate::config::expand_tilde(program)
 }
 
 fn parse_editor_command(raw: &str) -> std::io::Result<Vec<String>> {
@@ -1052,6 +1060,27 @@ mod tests {
             ],
         );
         assert!(parse_editor_command(r#"editor "unfinished"#).is_err());
+    }
+
+    #[test]
+    fn editor_program_expands_leading_tilde() {
+        let home = dirs::home_dir().expect("home dir available");
+        assert_eq!(
+            resolve_editor_program("~/bin/my-editor"),
+            home.join("bin/my-editor")
+        );
+        assert_eq!(
+            resolve_editor_program(r"~\bin\editor.exe"),
+            home.join(r"bin\editor.exe")
+        );
+        assert_eq!(
+            resolve_editor_program("nvim"),
+            std::path::PathBuf::from("nvim")
+        );
+        assert_eq!(
+            resolve_editor_program("/usr/bin/vim"),
+            std::path::PathBuf::from("/usr/bin/vim")
+        );
     }
 
     fn composer_with(text: &str) -> ComposerState {

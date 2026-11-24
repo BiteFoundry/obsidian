@@ -32,10 +32,21 @@ struct GitHubAsset {
     browser_download_url: String,
 }
 
+fn resolve_target_executable(exe: &Path) -> PathBuf {
+    match std::fs::canonicalize(exe) {
+        Ok(canon) => {
+            let s = canon.to_string_lossy();
+            PathBuf::from(crate::config::strip_verbatim_prefix(&s).into_owned())
+        }
+        Err(_) => exe.to_path_buf(),
+    }
+}
+
 /// Silently cleans up any `<current_exe>.old` left behind by a previous self-update.
 pub fn cleanup_stale_old_binary() {
     if let Ok(exe) = std::env::current_exe() {
-        let old_path = append_ext_suffix(&exe, ".old");
+        let target = resolve_target_executable(&exe);
+        let old_path = append_ext_suffix(&target, ".old");
         if old_path.symlink_metadata().is_ok() {
             let _ = std::fs::remove_file(&old_path);
         }
@@ -58,8 +69,9 @@ pub async fn check_or_apply_update_with_api_base(
     check_only: bool,
     force: bool,
 ) -> Result<UpdateCheckResult> {
-    let binary_path =
+    let current_exe =
         std::env::current_exe().context("Unable to determine current executable path")?;
+    let binary_path = resolve_target_executable(&current_exe);
     let token = discover_github_token(api_base_url).await;
     check_or_apply_update_at(api_base_url, repo, check_only, force, &binary_path, token).await
 }
@@ -1034,5 +1046,79 @@ mod tests {
         assert_eq!(std::fs::read(&fake_exe).unwrap(), b"ORIGINAL-SAFE-BINARY");
 
         server.abort();
+    }
+
+    #[test]
+    fn test_resolve_target_executable_and_new_symlink_refusal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real_dir = tmp.path().join("real");
+        let bin_dir = tmp.path().join("bin");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        std::fs::create_dir_all(&bin_dir).unwrap();
+
+        let real_exe = real_dir.join("bitefoundry-obsidian");
+        std::fs::write(&real_exe, b"REAL-BIN").unwrap();
+
+        // Missing path falls back to input unchanged.
+        let missing = tmp.path().join("does-not-exist");
+        assert_eq!(resolve_target_executable(&missing), missing);
+
+        // Regular file resolves to its canonical path (stripped of Windows verbatim prefix).
+        let canon_real = resolve_target_executable(&real_exe);
+        assert_eq!(
+            crate::config::normalize_path_key(&canon_real),
+            crate::config::normalize_path_key(&real_exe)
+        );
+
+        // Symlinked executable resolves to the underlying real binary, and `.new` symlink is refused.
+        let link_exe = bin_dir.join("bitefoundry-obsidian");
+        let symlink_created = {
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(&real_exe, &link_exe).is_ok()
+            }
+            #[cfg(windows)]
+            {
+                match std::os::windows::fs::symlink_file(&real_exe, &link_exe) {
+                    Ok(()) => true,
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::PermissionDenied
+                            || e.raw_os_error() == Some(1314) =>
+                    {
+                        false
+                    }
+                    Err(e) => panic!("unexpected symlink_file error: {e}"),
+                }
+            }
+        };
+
+        if symlink_created {
+            let resolved = resolve_target_executable(&link_exe);
+            assert_eq!(
+                crate::config::normalize_path_key(&resolved),
+                crate::config::normalize_path_key(&real_exe)
+            );
+
+            // Replacing through the resolved path updates the real binary while keeping the symlink intact.
+            replace_executable_at(&resolved, b"UPDATED-REAL-BIN").unwrap();
+            assert_eq!(std::fs::read(&real_exe).unwrap(), b"UPDATED-REAL-BIN");
+            assert!(link_exe.symlink_metadata().unwrap().file_type().is_symlink());
+
+            // Pre-existing `.new` symlink must still be refused.
+            let decoy = tmp.path().join("decoy");
+            std::fs::write(&decoy, b"DO-NOT-TOUCH").unwrap();
+            let new_path = append_ext_suffix(&resolved, ".new");
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&decoy, &new_path).unwrap();
+            #[cfg(windows)]
+            std::os::windows::fs::symlink_file(&decoy, &new_path).unwrap();
+
+            let err = replace_executable_at(&resolved, b"EVIL-BIN").unwrap_err();
+            assert!(
+                err.to_string().contains("symlink"),
+                "expected symlink refusal, got: {err}"
+            );
+            assert_eq!(std::fs::read(&decoy).unwrap(), b"DO-NOT-TOUCH");
+        }
     }
 }

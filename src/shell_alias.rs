@@ -61,9 +61,12 @@ pub enum ShellKind {
     #[value(aliases = ["pwsh", "ps"])]
     Powershell,
     Zsh,
-    #[value(alias = "sh")]
     Bash,
     Fish,
+    Tcsh,
+    Csh,
+    #[value(aliases = ["dash", "ash", "ksh"])]
+    Sh,
 }
 
 impl ShellKind {
@@ -73,6 +76,9 @@ impl ShellKind {
             ShellKind::Zsh => "zsh",
             ShellKind::Bash => "bash",
             ShellKind::Fish => "fish",
+            ShellKind::Tcsh => "tcsh",
+            ShellKind::Csh => "csh",
+            ShellKind::Sh => "sh",
         }
     }
 }
@@ -136,26 +142,37 @@ pub enum AliasCommand {
     },
 }
 
-pub fn detect_shell() -> ShellKind {
-    if let Ok(shell_env) = env::var("SHELL") {
-        let lower = shell_env.to_ascii_lowercase();
-        if lower.contains("fish") {
-            return ShellKind::Fish;
-        }
-        if lower.contains("zsh") {
-            return ShellKind::Zsh;
-        }
-        if lower.contains("bash") {
-            return ShellKind::Bash;
-        }
+pub fn detect_shell() -> Result<ShellKind> {
+    let shell_env = env::var("SHELL").ok();
+    detect_shell_from_env(shell_env.as_deref())
+}
+
+fn detect_shell_from_env(shell_env: Option<&str>) -> Result<ShellKind> {
+    if let Some(raw) = shell_env.map(str::trim).filter(|s| !s.is_empty()) {
+        let base = raw.split(['/', '\\']).next_back().unwrap_or(raw);
+        let stripped = base.trim_start_matches('-');
+        let lower = stripped.to_ascii_lowercase();
+        let name = lower.strip_suffix(".exe").unwrap_or(&lower);
+        return match name {
+            "tcsh" => Ok(ShellKind::Tcsh),
+            "csh" => Ok(ShellKind::Csh),
+            "zsh" => Ok(ShellKind::Zsh),
+            "fish" => Ok(ShellKind::Fish),
+            "bash" => Ok(ShellKind::Bash),
+            "sh" | "dash" | "ash" | "ksh" | "mksh" => Ok(ShellKind::Sh),
+            "pwsh" | "powershell" => Ok(ShellKind::Powershell),
+            _ => bail!(
+                "Unsupported shell '{raw}' detected from $SHELL. Pass --shell <powershell|zsh|bash|fish|tcsh|csh|sh> and/or --profile <path>."
+            ),
+        };
     }
     if cfg!(windows) {
-        return ShellKind::Powershell;
+        return Ok(ShellKind::Powershell);
     }
     if cfg!(target_os = "macos") {
-        return ShellKind::Zsh;
+        return Ok(ShellKind::Zsh);
     }
-    ShellKind::Bash
+    Ok(ShellKind::Bash)
 }
 
 pub fn validate_alias_name(name: &str) -> Result<String> {
@@ -180,6 +197,14 @@ pub fn validate_alias_name(name: &str) -> Result<String> {
     Ok(trimmed.to_string())
 }
 
+pub fn validate_alias_name_for_shell(name: &str, shell: ShellKind) -> Result<String> {
+    let valid = validate_alias_name(name)?;
+    if shell == ShellKind::Sh && valid.contains('-') {
+        bail!("Invalid alias name '{valid}' for POSIX sh: '-' is not allowed in sh function names.");
+    }
+    Ok(valid)
+}
+
 pub fn render_init_script(shell: ShellKind, name: &str, force: bool) -> String {
     match shell {
         ShellKind::Powershell => {
@@ -193,7 +218,7 @@ pub fn render_init_script(shell: ShellKind, name: &str, force: bool) -> String {
                 )
             }
         }
-        ShellKind::Zsh | ShellKind::Bash => {
+        ShellKind::Zsh | ShellKind::Bash | ShellKind::Sh => {
             if force {
                 format!(
                     "unalias {name} 2>/dev/null || true\n{name}() {{ {TARGET_BIN} \"$@\"; }}\n"
@@ -201,6 +226,17 @@ pub fn render_init_script(shell: ShellKind, name: &str, force: bool) -> String {
             } else {
                 format!(
                     "if ! command -v {name} >/dev/null 2>&1; then\n  {name}() {{ {TARGET_BIN} \"$@\"; }}\nfi\n"
+                )
+            }
+        }
+        ShellKind::Tcsh | ShellKind::Csh => {
+            if force {
+                format!(
+                    "unalias {name} >& /dev/null\nalias {name} '{TARGET_BIN} \\!*'\n"
+                )
+            } else {
+                format!(
+                    "which {name} >& /dev/null\nif ( $status != 0 ) alias {name} '{TARGET_BIN} \\!*'\n"
                 )
             }
         }
@@ -266,14 +302,23 @@ pub fn default_profile_paths(shell: ShellKind) -> Result<Vec<PathBuf>> {
         }
         ShellKind::Bash => {
             let home = dirs::home_dir().context("Could not determine home directory")?;
-            if cfg!(target_os = "macos") {
-                let bashrc = home.join(".bashrc");
-                let bash_profile = home.join(".bash_profile");
-                if !bashrc.exists() && bash_profile.exists() {
-                    return Ok(vec![bash_profile]);
-                }
+            Ok(default_bash_profile_paths(&home))
+        }
+        ShellKind::Tcsh => {
+            let home = dirs::home_dir().context("Could not determine home directory")?;
+            Ok(default_tcsh_profile_paths(&home))
+        }
+        ShellKind::Csh => {
+            let home = dirs::home_dir().context("Could not determine home directory")?;
+            Ok(vec![home.join(".cshrc")])
+        }
+        ShellKind::Sh => {
+            let sh_env = env::var_os("ENV").filter(|v| !v.is_empty());
+            if let Some(env_val) = sh_env {
+                return Ok(vec![PathBuf::from(env_val)]);
             }
-            Ok(vec![home.join(".bashrc")])
+            let home = dirs::home_dir().context("Could not determine home directory")?;
+            Ok(vec![home.join(".profile")])
         }
         ShellKind::Fish => {
             if let Some(xdg) = env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
@@ -283,6 +328,27 @@ pub fn default_profile_paths(shell: ShellKind) -> Result<Vec<PathBuf>> {
             Ok(vec![home.join(".config").join("fish").join("config.fish")])
         }
     }
+}
+
+fn default_tcsh_profile_paths(home: &Path) -> Vec<PathBuf> {
+    let tcshrc = home.join(".tcshrc");
+    if tcshrc.exists() {
+        return vec![tcshrc];
+    }
+    let cshrc = home.join(".cshrc");
+    if cshrc.exists() {
+        return vec![cshrc];
+    }
+    vec![tcshrc]
+}
+
+fn default_bash_profile_paths(home: &Path) -> Vec<PathBuf> {
+    let bashrc = home.join(".bashrc");
+    let bash_profile = home.join(".bash_profile");
+    if !bashrc.exists() && bash_profile.exists() {
+        return vec![bash_profile];
+    }
+    vec![bashrc]
 }
 
 pub fn find_path_collision(name: &str) -> Option<PathBuf> {
@@ -429,11 +495,51 @@ pub fn remove_managed_block(existing: &str) -> (String, bool) {
     (final_text, true)
 }
 
+fn resolve_profile_write_target(profile_path: &Path) -> Result<PathBuf> {
+    let mut current = profile_path.to_path_buf();
+    for _ in 0..40 {
+        let Ok(meta) = fs::symlink_metadata(&current) else {
+            return Ok(current);
+        };
+        if !meta.file_type().is_symlink() {
+            if meta.file_type().is_dir() {
+                bail!(
+                    "Shell profile path {} resolves to a directory, not a file.",
+                    profile_path.display()
+                );
+            }
+            return Ok(current);
+        }
+        let raw_target = fs::read_link(&current).with_context(|| {
+            format!(
+                "Failed to read symlink target for shell profile {}",
+                current.display()
+            )
+        })?;
+        current = if raw_target.is_absolute() {
+            raw_target
+        } else {
+            current
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."))
+                .join(raw_target)
+        };
+    }
+    bail!(
+        "Shell profile symlink loop detected at {}",
+        profile_path.display()
+    )
+}
+
 pub fn cmd_alias(action: AliasCommand, json_out: bool) -> Result<()> {
     match action {
         AliasCommand::Snippet { shell, name, force } => {
-            let shell = shell.unwrap_or_else(detect_shell);
-            let alias_name = validate_alias_name(&name)?;
+            let shell = match shell {
+                Some(s) => s,
+                None => detect_shell()?,
+            };
+            let alias_name = validate_alias_name_for_shell(&name, shell)?;
             let script = render_init_script(shell, &alias_name, force);
             if json_out {
                 println!(
@@ -460,8 +566,11 @@ pub fn cmd_alias(action: AliasCommand, json_out: bool) -> Result<()> {
             force,
             dry_run,
         } => {
-            let shell = shell.unwrap_or_else(detect_shell);
-            let alias_name = validate_alias_name(&name)?;
+            let shell = match shell {
+                Some(s) => s,
+                None => detect_shell()?,
+            };
+            let alias_name = validate_alias_name_for_shell(&name, shell)?;
             let profile_paths = match profile {
                 Some(p) => vec![p],
                 None => default_profile_paths(shell)?,
@@ -473,6 +582,7 @@ pub fn cmd_alias(action: AliasCommand, json_out: bool) -> Result<()> {
             let mut any_changed = false;
             let mut results = Vec::with_capacity(profile_paths.len());
             for profile_path in &profile_paths {
+                let write_target = resolve_profile_write_target(profile_path)?;
                 let existing = if profile_path.exists() {
                     fs::read_to_string(profile_path).with_context(|| {
                         format!("Failed to read shell profile {}", profile_path.display())
@@ -487,15 +597,23 @@ pub fn cmd_alias(action: AliasCommand, json_out: bool) -> Result<()> {
                 }
 
                 if !dry_run && changed {
-                    if let Some(parent) = profile_path.parent() {
+                    if let Some(parent) = write_target.parent() {
                         if !parent.as_os_str().is_empty() && !parent.exists() {
                             fs::create_dir_all(parent).with_context(|| {
-                                format!("Failed to create profile directory {}", parent.display())
+                                format!(
+                                    "Failed to create profile directory {} for {}",
+                                    parent.display(),
+                                    profile_path.display()
+                                )
                             })?;
                         }
                     }
-                    fs::write(profile_path, updated).with_context(|| {
-                        format!("Failed to write shell profile {}", profile_path.display())
+                    fs::write(&write_target, updated).with_context(|| {
+                        format!(
+                            "Failed to write shell profile {} (target {})",
+                            profile_path.display(),
+                            write_target.display()
+                        )
                     })?;
                 }
                 results.push((profile_path.clone(), changed));
@@ -571,7 +689,10 @@ pub fn cmd_alias(action: AliasCommand, json_out: bool) -> Result<()> {
             profile,
             dry_run,
         } => {
-            let shell = shell.unwrap_or_else(detect_shell);
+            let shell = match shell {
+                Some(s) => s,
+                None => detect_shell()?,
+            };
             let profile_paths = match profile {
                 Some(p) => vec![p],
                 None => default_profile_paths(shell)?,
@@ -582,13 +703,18 @@ pub fn cmd_alias(action: AliasCommand, json_out: bool) -> Result<()> {
             let mut results = Vec::with_capacity(profile_paths.len());
             for profile_path in &profile_paths {
                 let (removed, existed) = if profile_path.exists() {
-                    let existing = fs::read_to_string(profile_path).with_context(|| {
+                    let write_target = resolve_profile_write_target(profile_path)?;
+                    let existing = fs::read_to_string(&write_target).with_context(|| {
                         format!("Failed to read shell profile {}", profile_path.display())
                     })?;
                     let (updated, removed) = remove_managed_block(&existing);
                     if removed && !dry_run {
-                        fs::write(profile_path, updated).with_context(|| {
-                            format!("Failed to write shell profile {}", profile_path.display())
+                        fs::write(&write_target, updated).with_context(|| {
+                            format!(
+                                "Failed to write shell profile {} (target {})",
+                                profile_path.display(),
+                                write_target.display()
+                            )
                         })?;
                     }
                     (removed, true)
@@ -648,8 +774,11 @@ pub fn cmd_alias(action: AliasCommand, json_out: bool) -> Result<()> {
             profile,
             name,
         } => {
-            let shell = shell.unwrap_or_else(detect_shell);
-            let alias_name = validate_alias_name(&name)?;
+            let shell = match shell {
+                Some(s) => s,
+                None => detect_shell()?,
+            };
+            let alias_name = validate_alias_name_for_shell(&name, shell)?;
             let profile_paths = match profile {
                 Some(p) => vec![p],
                 None => default_profile_paths(shell)?,
@@ -719,8 +848,8 @@ pub fn cmd_alias(action: AliasCommand, json_out: bool) -> Result<()> {
 
 fn reload_instruction(shell: ShellKind, profile_path: &Path) -> String {
     match shell {
-        ShellKind::Powershell => format!(". \"{}\"", profile_path.display()),
-        ShellKind::Zsh | ShellKind::Bash | ShellKind::Fish => {
+        ShellKind::Powershell | ShellKind::Sh => format!(". \"{}\"", profile_path.display()),
+        ShellKind::Zsh | ShellKind::Bash | ShellKind::Fish | ShellKind::Tcsh | ShellKind::Csh => {
             format!("source \"{}\"", profile_path.display())
         }
     }
@@ -868,5 +997,188 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fs::read_to_string(&profile).unwrap(), "# existing profile\n");
+    }
+
+    #[test]
+    fn detect_shell_handles_all_supported_shells_login_prefix_and_rejects_unknown() {
+        assert_eq!(detect_shell_from_env(Some("/bin/tcsh")).unwrap(), ShellKind::Tcsh);
+        assert_eq!(detect_shell_from_env(Some("-tcsh")).unwrap(), ShellKind::Tcsh);
+        assert_eq!(
+            detect_shell_from_env(Some("/home/bashir/bin/tcsh")).unwrap(),
+            ShellKind::Tcsh
+        );
+        assert_eq!(detect_shell_from_env(Some("/bin/csh")).unwrap(), ShellKind::Csh);
+        assert_eq!(detect_shell_from_env(Some("/bin/sh")).unwrap(), ShellKind::Sh);
+        assert_eq!(detect_shell_from_env(Some("/usr/bin/dash")).unwrap(), ShellKind::Sh);
+        assert_eq!(detect_shell_from_env(Some("/bin/ash")).unwrap(), ShellKind::Sh);
+        assert_eq!(detect_shell_from_env(Some("/bin/ksh")).unwrap(), ShellKind::Sh);
+        assert_eq!(detect_shell_from_env(Some("/bin/mksh")).unwrap(), ShellKind::Sh);
+        assert_eq!(detect_shell_from_env(Some("-zsh")).unwrap(), ShellKind::Zsh);
+        assert_eq!(detect_shell_from_env(Some("/usr/bin/fish")).unwrap(), ShellKind::Fish);
+        assert_eq!(detect_shell_from_env(Some("/bin/bash")).unwrap(), ShellKind::Bash);
+        assert_eq!(
+            detect_shell_from_env(Some(r"C:\Program Files\PowerShell\7\pwsh.exe")).unwrap(),
+            ShellKind::Powershell
+        );
+
+        for unknown in ["/usr/bin/nu", "xonsh", "/opt/elvish"] {
+            let err = detect_shell_from_env(Some(unknown)).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("Unsupported shell") && msg.contains("--shell"),
+                "expected clear unsupported shell error for {unknown}, got: {msg}"
+            );
+        }
+
+        // Unset or empty falls back to platform default.
+        let fallback = detect_shell_from_env(None).unwrap();
+        let empty_fallback = detect_shell_from_env(Some("   ")).unwrap();
+        assert_eq!(fallback, empty_fallback);
+    }
+
+    #[test]
+    fn renders_tcsh_csh_sh_scripts_and_reload_instructions() {
+        let tcsh = render_init_script(ShellKind::Tcsh, "ob", false);
+        assert_eq!(
+            tcsh,
+            "which ob >& /dev/null\nif ( $status != 0 ) alias ob 'bitefoundry-obsidian \\!*'\n"
+        );
+        let tcsh_force = render_init_script(ShellKind::Tcsh, "ob", true);
+        assert_eq!(
+            tcsh_force,
+            "unalias ob >& /dev/null\nalias ob 'bitefoundry-obsidian \\!*'\n"
+        );
+        assert_eq!(render_init_script(ShellKind::Csh, "ob", false), tcsh);
+        assert_eq!(render_init_script(ShellKind::Csh, "ob", true), tcsh_force);
+
+        let sh = render_init_script(ShellKind::Sh, "ob", false);
+        assert_eq!(sh, render_init_script(ShellKind::Bash, "ob", false));
+        assert!(validate_alias_name_for_shell("my-ob", ShellKind::Sh).is_err());
+        assert!(validate_alias_name_for_shell("my_ob", ShellKind::Sh).is_ok());
+        assert!(validate_alias_name_for_shell("my-ob", ShellKind::Bash).is_ok());
+
+        let p = Path::new("/tmp/.profile");
+        assert_eq!(reload_instruction(ShellKind::Sh, p), ". \"/tmp/.profile\"");
+        assert_eq!(
+            reload_instruction(ShellKind::Powershell, p),
+            ". \"/tmp/.profile\""
+        );
+        assert_eq!(
+            reload_instruction(ShellKind::Tcsh, p),
+            "source \"/tmp/.profile\""
+        );
+        assert_eq!(
+            reload_instruction(ShellKind::Csh, p),
+            "source \"/tmp/.profile\""
+        );
+    }
+
+    #[test]
+    fn tcsh_preserves_existing_cshrc_and_bash_uses_bash_profile_when_bashrc_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+
+        // Neither .tcshrc nor .cshrc exists -> defaults to .tcshrc.
+        assert_eq!(
+            default_tcsh_profile_paths(home),
+            vec![home.join(".tcshrc")]
+        );
+
+        // Only .cshrc exists -> MUST pick .cshrc so tcsh doesn't ignore it.
+        fs::write(home.join(".cshrc"), "# existing cshrc\n").unwrap();
+        assert_eq!(
+            default_tcsh_profile_paths(home),
+            vec![home.join(".cshrc")]
+        );
+
+        // Once .tcshrc exists too -> picks .tcshrc.
+        fs::write(home.join(".tcshrc"), "# existing tcshrc\n").unwrap();
+        assert_eq!(
+            default_tcsh_profile_paths(home),
+            vec![home.join(".tcshrc")]
+        );
+
+        // Bash: .bash_profile without .bashrc -> picks .bash_profile (both macOS and Linux).
+        assert_eq!(
+            default_bash_profile_paths(home),
+            vec![home.join(".bashrc")]
+        );
+        fs::write(home.join(".bash_profile"), "# existing bash_profile\n").unwrap();
+        assert_eq!(
+            default_bash_profile_paths(home),
+            vec![home.join(".bash_profile")]
+        );
+        fs::write(home.join(".bashrc"), "# existing bashrc\n").unwrap();
+        assert_eq!(
+            default_bash_profile_paths(home),
+            vec![home.join(".bashrc")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_and_dangling_rc_files_preserve_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dotfiles = tmp.path().join("dotfiles");
+        fs::create_dir_all(&dotfiles).unwrap();
+
+        // 1. Valid symlink: install and uninstall must preserve the symlink and mutate target.
+        let real_rc = dotfiles.join("tcshrc");
+        fs::write(&real_rc, "set prompt = '% '\n").unwrap();
+        let linked_rc = tmp.path().join(".tcshrc");
+        symlink(&real_rc, &linked_rc).unwrap();
+
+        cmd_alias(
+            AliasCommand::Install {
+                shell: Some(ShellKind::Tcsh),
+                profile: Some(linked_rc.clone()),
+                name: "ob".into(),
+                force: false,
+                dry_run: false,
+            },
+            false,
+        )
+        .unwrap();
+        assert!(linked_rc.symlink_metadata().unwrap().file_type().is_symlink());
+        let after_install = fs::read_to_string(&real_rc).unwrap();
+        assert!(after_install.contains("alias ob 'bitefoundry-obsidian \\!*'"));
+
+        cmd_alias(
+            AliasCommand::Uninstall {
+                shell: Some(ShellKind::Tcsh),
+                profile: Some(linked_rc.clone()),
+                dry_run: false,
+            },
+            false,
+        )
+        .unwrap();
+        assert!(linked_rc.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(fs::read_to_string(&real_rc).unwrap(), "set prompt = '% '\n");
+
+        // 2. Dangling relative symlink with missing target parent dir: creates parent dir and target.
+        let dangling_link = tmp.path().join(".cshrc");
+        symlink("nested/dir/cshrc", &dangling_link).unwrap();
+        assert!(dangling_link.symlink_metadata().is_ok());
+        assert!(!dangling_link.exists());
+
+        cmd_alias(
+            AliasCommand::Install {
+                shell: Some(ShellKind::Csh),
+                profile: Some(dangling_link.clone()),
+                name: "ob".into(),
+                force: true,
+                dry_run: false,
+            },
+            false,
+        )
+        .unwrap();
+        assert!(dangling_link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(dangling_link.exists());
+        let target_file = tmp.path().join("nested/dir/cshrc");
+        assert!(fs::read_to_string(&target_file)
+            .unwrap()
+            .contains("unalias ob >& /dev/null"));
     }
 }
