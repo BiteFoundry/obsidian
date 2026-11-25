@@ -109,6 +109,7 @@ pub enum Action {
         col: u16,
         row: u16,
     },
+    OpenContextMenuKeyboard,
     CloseOverlay,
     OverlaySubmit,
     SwitchVault(String),

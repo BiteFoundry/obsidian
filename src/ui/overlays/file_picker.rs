@@ -175,6 +175,22 @@ impl FilePickerOverlay {
                 }
                 OverlayOutcome::Handled
             }
+            Action::MouseScrollUp { .. } => {
+                let len = self.filtered_entries().len();
+                if len > 0 {
+                    let cur = self.selected.min(len - 1);
+                    self.selected = cur.saturating_sub(1);
+                }
+                OverlayOutcome::Handled
+            }
+            Action::MouseScrollDown { .. } => {
+                let len = self.filtered_entries().len();
+                if len > 0 {
+                    let cur = self.selected.min(len - 1);
+                    self.selected = (cur + 1).min(len - 1);
+                }
+                OverlayOutcome::Handled
+            }
             Action::CursorHome | Action::JumpTop => {
                 self.selected = 0;
                 OverlayOutcome::Handled
@@ -263,6 +279,22 @@ impl FilePickerOverlay {
                 if len > 0 {
                     let cur = self.zoxide_selected.min(len - 1);
                     self.zoxide_selected = (cur + 1) % len;
+                }
+                OverlayOutcome::Handled
+            }
+            Action::MouseScrollUp { .. } => {
+                let len = self.filtered_zoxide_dirs().len();
+                if len > 0 {
+                    let cur = self.zoxide_selected.min(len - 1);
+                    self.zoxide_selected = cur.saturating_sub(1);
+                }
+                OverlayOutcome::Handled
+            }
+            Action::MouseScrollDown { .. } => {
+                let len = self.filtered_zoxide_dirs().len();
+                if len > 0 {
+                    let cur = self.zoxide_selected.min(len - 1);
+                    self.zoxide_selected = (cur + 1).min(len - 1);
                 }
                 OverlayOutcome::Handled
             }

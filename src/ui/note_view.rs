@@ -32,7 +32,7 @@ use crate::{
 struct RenderedLine {
     line: Line<'static>,
     block_idx: Option<usize>,
-    task_line_no: Option<usize>,
+    task_checkbox: Option<(usize, u16)>,
     has_wikilink: bool,
     image_idx: Option<usize>,
     html_pill: Option<(u16, u16, usize)>,
@@ -133,15 +133,16 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiState, hit
         );
         if let Some(b_idx) = rl.block_idx {
             hitmap.add(row_rect, HitTarget::CanvasBlock(b_idx));
-            if let Some(t_ln) = rl.task_line_no {
+            if rl.has_wikilink {
+                hitmap.add(row_rect, HitTarget::WikilinkBlock(b_idx));
+            }
+            if let Some((t_ln, hit_w)) = rl.task_checkbox {
                 hitmap.add_line(
                     content_area.x,
                     y,
-                    6,
+                    hit_w.min(content_area.width),
                     HitTarget::TaskCheckbox { line_no: t_ln },
                 );
-            } else if rl.has_wikilink {
-                hitmap.add(row_rect, HitTarget::WikilinkBlock(b_idx));
             }
             if let Some(img_i) = rl.image_idx {
                 hitmap.add(row_rect, HitTarget::ImageChip(img_i));
@@ -182,7 +183,7 @@ fn build_canvas_lines(
             out.push(RenderedLine {
                 line,
                 block_idx: None,
-                task_line_no: None,
+                task_checkbox: None,
                 has_wikilink: false,
                 image_idx: None,
                 html_pill: None,
@@ -281,7 +282,7 @@ fn build_canvas_lines(
             out.push(RenderedLine {
                 line: Line::from(spans),
                 block_idx: None,
-                task_line_no: None,
+                task_checkbox: None,
                 has_wikilink: false,
                 image_idx: None,
                 html_pill: None,
@@ -399,7 +400,7 @@ fn build_canvas_lines(
                 out.push(RenderedLine {
                     line: Line::from(line_spans),
                     block_idx: Some(b_idx),
-                    task_line_no: None,
+                    task_checkbox: None,
                     has_wikilink: has_wl,
                     image_idx: None,
                     html_pill: None,
@@ -424,7 +425,7 @@ fn build_canvas_lines(
                             ),
                         ]),
                         block_idx: Some(b_idx),
-                        task_line_no: None,
+                        task_checkbox: None,
                         has_wikilink: false,
                         image_idx: None,
                         html_pill: Some((19, pill_w, b_idx)),
@@ -457,7 +458,7 @@ fn build_canvas_lines(
                     out.push(RenderedLine {
                         line: wrapped,
                         block_idx: Some(b_idx),
-                        task_line_no: None,
+                        task_checkbox: None,
                         has_wikilink: has_wl,
                         image_idx: None,
                         html_pill: None,
@@ -505,7 +506,7 @@ fn build_canvas_lines(
                 out.push(RenderedLine {
                     line: header,
                     block_idx: Some(b_idx),
-                    task_line_no: None,
+                    task_checkbox: None,
                     has_wikilink: has_wl,
                     image_idx: None,
                     html_pill: None,
@@ -531,7 +532,7 @@ fn build_canvas_lines(
                         out.push(RenderedLine {
                             line: wrapped,
                             block_idx: Some(b_idx),
-                            task_line_no: None,
+                            task_checkbox: None,
                             has_wikilink: has_wl,
                             image_idx: None,
                             html_pill: None,
@@ -582,10 +583,11 @@ fn build_canvas_lines(
                     ui.show_inline_hrefs,
                     base_style,
                 ));
+                let hit_w = ((*indent).min(8) + 6) as u16;
                 out.push(RenderedLine {
                     line: Line::from(line_spans),
                     block_idx: Some(b_idx),
-                    task_line_no: Some(*line_no),
+                    task_checkbox: Some((*line_no, hit_w)),
                     has_wikilink: has_wl,
                     image_idx: None,
                     html_pill: None,
@@ -610,7 +612,7 @@ fn build_canvas_lines(
                     out.push(RenderedLine {
                         line: wrapped,
                         block_idx: Some(b_idx),
-                        task_line_no: None,
+                        task_checkbox: None,
                         has_wikilink: has_wl,
                         image_idx: None,
                         html_pill: None,
@@ -641,7 +643,7 @@ fn build_canvas_lines(
                     out.push(RenderedLine {
                         line: wrapped,
                         block_idx: Some(b_idx),
-                        task_line_no: None,
+                        task_checkbox: None,
                         has_wikilink: has_wl,
                         image_idx: None,
                         html_pill: None,
@@ -698,7 +700,7 @@ fn build_canvas_lines(
                 out.push(RenderedLine {
                     line: Line::from(hdr_spans),
                     block_idx: Some(b_idx),
-                    task_line_no: None,
+                    task_checkbox: None,
                     has_wikilink: false,
                     image_idx: None,
                     html_pill,
@@ -715,7 +717,7 @@ fn build_canvas_lines(
                             ),
                         ]),
                         block_idx: Some(b_idx),
-                        task_line_no: None,
+                        task_checkbox: None,
                         has_wikilink: false,
                         image_idx: None,
                         html_pill: None,
@@ -729,7 +731,7 @@ fn build_canvas_lines(
                         Style::default().fg(theme.border),
                     )),
                     block_idx: Some(b_idx),
-                    task_line_no: None,
+                    task_checkbox: None,
                     has_wikilink: false,
                     image_idx: None,
                     html_pill: None,
@@ -751,7 +753,7 @@ fn build_canvas_lines(
                     out.push(RenderedLine {
                         line: Line::from(spans),
                         block_idx: Some(b_idx),
-                        task_line_no: None,
+                        task_checkbox: None,
                         has_wikilink: has_wl,
                         image_idx: None,
                         html_pill: None,
@@ -777,7 +779,7 @@ fn build_canvas_lines(
                             .add_modifier(Modifier::BOLD),
                     )),
                     block_idx: Some(b_idx),
-                    task_line_no: None,
+                    task_checkbox: None,
                     has_wikilink: false,
                     image_idx: None,
                     html_pill: None,
@@ -791,7 +793,7 @@ fn build_canvas_lines(
                         Style::default().fg(theme.border),
                     )),
                     block_idx: Some(b_idx),
-                    task_line_no: None,
+                    task_checkbox: None,
                     has_wikilink: false,
                     image_idx: None,
                     html_pill: None,
@@ -811,7 +813,7 @@ fn build_canvas_lines(
                             Style::default().fg(theme.fg_primary),
                         )),
                         block_idx: Some(b_idx),
-                        task_line_no: None,
+                        task_checkbox: None,
                         has_wikilink: false,
                         image_idx: None,
                         html_pill: None,
@@ -828,8 +830,13 @@ fn build_canvas_lines(
                 resolved_path,
                 ..
             } => {
-                let img_idx = image_counter;
-                image_counter += 1;
+                let img_idx = if resolved_path.is_some() {
+                    let idx = image_counter;
+                    image_counter += 1;
+                    Some(idx)
+                } else {
+                    None
+                };
                 let badge = if resolved_path.is_some() {
                     format!(" ▣ IMG: {alt} ({raw_target}) · [v HD Preview] ")
                 } else {
@@ -845,9 +852,9 @@ fn build_canvas_lines(
                         },
                     )),
                     block_idx: Some(b_idx),
-                    task_line_no: None,
+                    task_checkbox: None,
                     has_wikilink: false,
-                    image_idx: Some(img_idx),
+                    image_idx: img_idx,
                     html_pill: None,
                     action_pills: Vec::new(),
                     bg_override: sel_bg,
@@ -862,9 +869,9 @@ fn build_canvas_lines(
                                 out.push(RenderedLine {
                                     line: img_line.clone(),
                                     block_idx: Some(b_idx),
-                                    task_line_no: None,
+                                    task_checkbox: None,
                                     has_wikilink: false,
-                                    image_idx: Some(img_idx),
+                                    image_idx: img_idx,
                                     html_pill: None,
                                     action_pills: Vec::new(),
                                     bg_override: None,
@@ -892,7 +899,7 @@ fn build_canvas_lines(
                         Span::styled(label, theme.wikilink_style(resolved_path.is_some())),
                     ]),
                     block_idx: Some(b_idx),
-                    task_line_no: None,
+                    task_checkbox: None,
                     has_wikilink: true,
                     image_idx: None,
                     html_pill: None,
@@ -909,7 +916,7 @@ fn build_canvas_lines(
                         Style::default().fg(theme.divider),
                     )),
                     block_idx: Some(b_idx),
-                    task_line_no: None,
+                    task_checkbox: None,
                     has_wikilink: false,
                     image_idx: None,
                     html_pill: None,

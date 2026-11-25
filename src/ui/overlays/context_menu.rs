@@ -13,6 +13,7 @@ use crate::ui::{
     app::UiState,
     hitmap::{HitMap, HitTarget},
     overlays::{OverlayKind, OverlayOutcome},
+    sidebar::selection_offset,
 };
 
 #[derive(Debug, Clone)]
@@ -123,6 +124,20 @@ impl ContextMenuOverlay {
                 }
                 OverlayOutcome::Handled
             }
+            Action::MouseScrollUp { .. } => {
+                if !self.items.is_empty() {
+                    let cur = self.selected.min(self.items.len() - 1);
+                    self.selected = cur.saturating_sub(1);
+                }
+                OverlayOutcome::Handled
+            }
+            Action::MouseScrollDown { .. } => {
+                if !self.items.is_empty() {
+                    let cur = self.selected.min(self.items.len() - 1);
+                    self.selected = (cur + 1).min(self.items.len() - 1);
+                }
+                OverlayOutcome::Handled
+            }
             Action::Activate | Action::OverlaySubmit => {
                 if let Some(it) = self.items.get(self.selected) {
                     OverlayOutcome::CloseAndDispatch(it.action.clone())
@@ -154,13 +169,24 @@ impl ContextMenuOverlay {
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
 
-        for (idx, it) in self.items.iter().enumerate() {
-            let ry = inner.y + idx as u16;
-            if ry >= inner.y + inner.height {
-                break;
-            }
+        let visible = inner.height as usize;
+        if visible == 0 || self.items.is_empty() {
+            return;
+        }
+        let sel = self.selected.min(self.items.len() - 1);
+        let offset = selection_offset(sel, visible, self.items.len());
+
+        for (row, (idx, it)) in self
+            .items
+            .iter()
+            .enumerate()
+            .skip(offset)
+            .take(visible)
+            .enumerate()
+        {
+            let ry = inner.y + row as u16;
             let row_rect = Rect::new(inner.x, ry, inner.width, 1);
-            let is_sel = idx == self.selected;
+            let is_sel = idx == sel;
             let line = Line::from(vec![
                 Span::styled(
                     if is_sel { " ▸ " } else { "   " },

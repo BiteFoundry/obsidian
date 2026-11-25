@@ -64,6 +64,14 @@ impl SettingsOverlay {
                 self.selected = (self.selected + 1) % ITEMS;
                 OverlayOutcome::Handled
             }
+            Action::MouseScrollUp { .. } => {
+                self.selected = self.selected.saturating_sub(1);
+                OverlayOutcome::Handled
+            }
+            Action::MouseScrollDown { .. } => {
+                self.selected = (self.selected + 1).min(ITEMS - 1);
+                OverlayOutcome::Handled
+            }
             Action::Activate | Action::CursorRight | Action::Input(' ') => {
                 self.cycle_selected(true)
             }

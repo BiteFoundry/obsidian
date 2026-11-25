@@ -71,6 +71,8 @@ pub fn draw(frame: &mut Frame, app: &AppState, ui: &mut UiState) -> HitMap {
 
     if let Some(mut overlay) = ui.overlay.take() {
         ui.cursor_pos = None;
+        hitmap.clear();
+        hitmap.add(area, HitTarget::OverlayBackdrop);
         overlay.draw(frame, area, app, ui, &mut hitmap);
         ui.overlay = Some(overlay);
     }

@@ -528,9 +528,10 @@ impl HtmlPreviewOverlay {
         }
 
         match action {
-            Action::CloseOverlay | Action::OpenHtmlPreview | Action::Input('q') => {
-                OverlayOutcome::Close
-            }
+            Action::CloseOverlay
+            | Action::OpenHtmlPreview
+            | Action::Input('q')
+            | Action::Input('H') => OverlayOutcome::Close,
             Action::Quit | Action::QuitConfirm => OverlayOutcome::NotHandled,
             Action::Tab | Action::NextFocus => {
                 self.session.focus_next_control();

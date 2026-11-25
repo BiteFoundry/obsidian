@@ -29,10 +29,64 @@ pub fn key_to_action(
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
-    // When an overlay is focused (and not editing text), `q` closes the overlay
-    // while `Ctrl+C` still quits the app globally.
-    if focus == Focus::Overlay && !text_input && !ctrl && !alt && key.code == KeyCode::Char('q') {
-        return Some(Action::Input('q'));
+    // Always allow Ctrl+C / Ctrl+Q to trigger quit confirmation, even inside overlays.
+    if ctrl
+        && !alt
+        && matches!(
+            key.code,
+            KeyCode::Char('c') | KeyCode::Char('C') | KeyCode::Char('q') | KeyCode::Char('Q')
+        )
+    {
+        return Some(Action::QuitConfirm);
+    }
+
+    // Route overlay keys BEFORE the global keymap so modal shortcuts (`y`, `G`, `?`, `.`, `q`, etc.)
+    // are never intercepted by workspace commands.
+    if focus == Focus::Overlay {
+        if ctrl && key.code == KeyCode::Enter
+            || alt && key.code == KeyCode::Enter
+            || ctrl && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S'))
+        {
+            return Some(Action::OverlaySubmit);
+        }
+        if ctrl && !alt {
+            match key.code {
+                KeyCode::Char('z') | KeyCode::Char('Z') => return Some(Action::Undo),
+                KeyCode::Char('y') | KeyCode::Char('Y') => return Some(Action::Redo),
+                KeyCode::Char('e') | KeyCode::Char('E') => {
+                    return Some(Action::RequestExternalEditor);
+                }
+                KeyCode::Char('v') | KeyCode::Char('V') => {
+                    return Some(Action::PasteClipboard);
+                }
+                KeyCode::Char('d') | KeyCode::Char('D') if !text_input => {
+                    return Some(Action::PageDown);
+                }
+                KeyCode::Char('u') | KeyCode::Char('U') if !text_input => {
+                    return Some(Action::PageUp);
+                }
+                _ => {}
+            }
+        }
+        return match key.code {
+            KeyCode::Esc => Some(Action::CloseOverlay),
+            KeyCode::Enter if shift => Some(Action::Newline),
+            KeyCode::Enter => Some(Action::Activate),
+            KeyCode::Tab => Some(Action::Tab),
+            KeyCode::BackTab => Some(Action::PrevFocus),
+            KeyCode::Backspace => Some(Action::Backspace),
+            KeyCode::Delete => Some(Action::Delete),
+            KeyCode::Up => Some(Action::MoveUp),
+            KeyCode::Down => Some(Action::MoveDown),
+            KeyCode::Left => Some(Action::CursorLeft),
+            KeyCode::Right => Some(Action::CursorRight),
+            KeyCode::Home => Some(Action::CursorHome),
+            KeyCode::End => Some(Action::CursorEnd),
+            KeyCode::PageUp => Some(Action::PageUp),
+            KeyCode::PageDown => Some(Action::PageDown),
+            KeyCode::Char(ch) if !ctrl && !alt => Some(Action::Input(ch)),
+            _ => None,
+        };
     }
 
     // Graph View specific shortcuts when viewing Knowledge Graph in Canvas.
@@ -77,7 +131,7 @@ pub fn key_to_action(
             KeyCommand::NewNote => Action::OpenNewNoteModal,
             KeyCommand::DeleteNote => Action::ConfirmDeleteNote,
             KeyCommand::OpenFilePicker => Action::OpenFilePicker,
-            KeyCommand::OpenContextMenu => Action::OpenContextMenu { col: 14, row: 4 },
+            KeyCommand::OpenContextMenu => Action::OpenContextMenuKeyboard,
             KeyCommand::OpenLinkExtractor => Action::OpenLinkExtractor,
             KeyCommand::ToggleShowLinkUrls => Action::ToggleShowLinkUrls,
             KeyCommand::OpenImagePreview => Action::OpenImagePreview,
@@ -88,47 +142,6 @@ pub fn key_to_action(
             KeyCommand::SmoothScrollDown => Action::PageDown,
             KeyCommand::SmoothScrollUp => Action::PageUp,
         });
-    }
-
-    if focus == Focus::Overlay {
-        if ctrl && key.code == KeyCode::Enter
-            || alt && key.code == KeyCode::Enter
-            || ctrl && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('S'))
-        {
-            return Some(Action::OverlaySubmit);
-        }
-        if ctrl && !alt {
-            match key.code {
-                KeyCode::Char('z') | KeyCode::Char('Z') => return Some(Action::Undo),
-                KeyCode::Char('y') | KeyCode::Char('Y') => return Some(Action::Redo),
-                KeyCode::Char('e') | KeyCode::Char('E') => {
-                    return Some(Action::RequestExternalEditor);
-                }
-                KeyCode::Char('v') | KeyCode::Char('V') => {
-                    return Some(Action::PasteClipboard);
-                }
-                _ => {}
-            }
-        }
-        return match key.code {
-            KeyCode::Esc => Some(Action::CloseOverlay),
-            KeyCode::Enter if shift => Some(Action::Newline),
-            KeyCode::Enter => Some(Action::Activate),
-            KeyCode::Tab => Some(Action::Tab),
-            KeyCode::BackTab => Some(Action::PrevFocus),
-            KeyCode::Backspace => Some(Action::Backspace),
-            KeyCode::Delete => Some(Action::Delete),
-            KeyCode::Up => Some(Action::MoveUp),
-            KeyCode::Down => Some(Action::MoveDown),
-            KeyCode::Left => Some(Action::CursorLeft),
-            KeyCode::Right => Some(Action::CursorRight),
-            KeyCode::Home => Some(Action::CursorHome),
-            KeyCode::End => Some(Action::CursorEnd),
-            KeyCode::PageUp => Some(Action::PageUp),
-            KeyCode::PageDown => Some(Action::PageDown),
-            KeyCode::Char(ch) if !ctrl && !alt => Some(Action::Input(ch)),
-            _ => None,
-        };
     }
 
     // In-place inline note editor key routing: typing/editing keys go straight to the inline editor

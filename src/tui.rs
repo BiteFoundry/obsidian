@@ -684,9 +684,14 @@ pub async fn run_tui(cfg: AppConfig, vault: VaultProfile, storage: Storage) -> R
                 match maybe_ev {
                     Some(Ok(CrosstermEvent::Key(key))) => {
                         let text_input = ui.is_text_input_active();
+                        let effective_focus = if ui.overlay.is_some() {
+                            ui::app::Focus::Overlay
+                        } else {
+                            ui.focus
+                        };
                         if let Some(act) = event::key_to_action(
                             key,
-                            ui.focus,
+                            effective_focus,
                             ui.canvas_mode,
                             &ui.keymap,
                             text_input,

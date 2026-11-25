@@ -169,6 +169,20 @@ impl QuickSwitcherOverlay {
                 }
                 OverlayOutcome::Handled
             }
+            Action::MouseScrollUp { .. } => {
+                if !list.is_empty() {
+                    let cur = self.selected.min(list.len() - 1);
+                    self.selected = cur.saturating_sub(1);
+                }
+                OverlayOutcome::Handled
+            }
+            Action::MouseScrollDown { .. } => {
+                if !list.is_empty() {
+                    let cur = self.selected.min(list.len() - 1);
+                    self.selected = (cur + 1).min(list.len() - 1);
+                }
+                OverlayOutcome::Handled
+            }
             Action::Backspace => {
                 self.query.pop();
                 self.selected = 0;

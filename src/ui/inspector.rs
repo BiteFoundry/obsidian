@@ -12,11 +12,53 @@ use ratatui::{
     Frame,
 };
 
-use crate::ui::{
-    app::{AppState, Focus, UiState},
-    hitmap::{HitMap, HitTarget},
-    truncate_width,
+use crate::{
+    models::BacklinkEntry,
+    ui::{
+        app::{AppState, Focus, UiState},
+        hitmap::{HitMap, HitTarget},
+        sidebar::selection_offset,
+        truncate_width,
+    },
 };
+
+/// Computes the starting backlink index so `selected` fits within `avail_rows` visual lines.
+pub fn backlinks_scroll_offset(
+    backlinks: &[BacklinkEntry],
+    selected: usize,
+    avail_rows: usize,
+) -> usize {
+    if backlinks.is_empty() || avail_rows == 0 {
+        return 0;
+    }
+    let sel = selected.min(backlinks.len() - 1);
+    let item_rows = |bl: &BacklinkEntry| -> usize {
+        if bl.context_snippet.is_empty() {
+            1
+        } else {
+            2
+        }
+    };
+
+    // Fast path: if items `0..=sel` already fit in the viewport, start at 0.
+    let prefix_rows: usize = backlinks[..=sel].iter().map(item_rows).sum();
+    if prefix_rows <= avail_rows {
+        return 0;
+    }
+
+    // Otherwise walk backwards from `sel` so `sel` is kept inside the viewport.
+    let mut used = item_rows(&backlinks[sel]);
+    let mut start = sel;
+    while start > 0 {
+        let prev_h = item_rows(&backlinks[start - 1]);
+        if used + prev_h > avail_rows {
+            break;
+        }
+        used += prev_h;
+        start -= 1;
+    }
+    start
+}
 
 pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap: &mut HitMap) {
     let theme = &ui.theme;
@@ -71,7 +113,8 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
     let w = inner.width as usize;
     let total_bl = detail.backlinks.len();
     let total_ol = detail.outgoing_links.len();
-    let total_items = total_bl + total_ol;
+    let total_h = detail.parsed.headings.len();
+    let total_items = total_bl + total_ol + total_h;
     let sel = ui.inspector_selected.min(total_items.saturating_sub(1));
 
     // 1. Linked Mentions (Backlinks)
@@ -80,7 +123,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
         Paragraph::new(Line::from(vec![Span::styled(
             format!(" ← Linked Mentions ({total_bl}) "),
             Style::default()
-                .fg(if focused && sel < total_bl {
+                .fg(if focused && total_bl > 0 && sel < total_bl {
                     theme.accent
                 } else {
                     theme.accent_soft
@@ -102,8 +145,14 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
             );
         }
     } else {
+        let bl_avail_rows = bl_area.height.saturating_sub(1) as usize;
+        let bl_offset = if sel < total_bl {
+            backlinks_scroll_offset(&detail.backlinks, sel, bl_avail_rows)
+        } else {
+            0
+        };
         let mut y = bl_area.y + 1;
-        for (idx, bl) in detail.backlinks.iter().enumerate() {
+        for (idx, bl) in detail.backlinks.iter().enumerate().skip(bl_offset) {
             if y >= bl_area.y + bl_area.height {
                 break;
             }
@@ -155,11 +204,13 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
         Paragraph::new(Line::from(vec![Span::styled(
             format!(" → Outgoing Links ({total_ol}) "),
             Style::default()
-                .fg(if focused && sel >= total_bl {
-                    theme.accent
-                } else {
-                    theme.accent_soft
-                })
+                .fg(
+                    if focused && total_ol > 0 && sel >= total_bl && sel < total_bl + total_ol {
+                        theme.accent
+                    } else {
+                        theme.accent_soft
+                    },
+                )
                 .add_modifier(Modifier::BOLD),
         )]))
         .style(Style::default().bg(theme.bg_sidebar)),
@@ -177,10 +228,21 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
             );
         }
     } else {
-        for (y, (idx, ol)) in (ol_area.y.saturating_add(1)
-            ..ol_area.y.saturating_add(ol_area.height))
-            .zip(detail.outgoing_links.iter().enumerate())
+        let ol_avail_rows = ol_area.height.saturating_sub(1) as usize;
+        let ol_offset = if sel >= total_bl && sel < total_bl + total_ol {
+            selection_offset(sel - total_bl, ol_avail_rows, total_ol)
+        } else {
+            0
+        };
+        for (row, (idx, ol)) in detail
+            .outgoing_links
+            .iter()
+            .enumerate()
+            .skip(ol_offset)
+            .take(ol_avail_rows)
+            .enumerate()
         {
+            let y = ol_area.y.saturating_add(1 + row as u16);
             let flat_idx = total_bl + idx;
             let is_sel = focused && sel == flat_idx;
             let row_bg = if is_sel {
@@ -215,41 +277,72 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
     if show_outline && chunks[2].height >= 3 {
         let out_area = chunks[2];
         let heading_cnt = detail.parsed.headings.len();
+        let outline_base = total_bl + total_ol;
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 format!(" § Outline ({heading_cnt}) "),
                 Style::default()
-                    .fg(theme.accent_soft)
+                    .fg(if focused && total_h > 0 && sel >= outline_base {
+                        theme.accent
+                    } else {
+                        theme.accent_soft
+                    })
                     .add_modifier(Modifier::BOLD),
             )))
             .style(Style::default().bg(theme.bg_sidebar)),
             Rect::new(out_area.x, out_area.y, out_area.width, 1),
         );
 
-        let mut y = out_area.y + 1;
+        let start_y = out_area.y + 1;
         let tags_rows: u16 = if detail.summary.tags.is_empty() || out_area.height < 4 {
             0
         } else {
             1
         };
         let heading_limit_y = out_area.bottom().saturating_sub(tags_rows);
+        let h_avail_rows = heading_limit_y.saturating_sub(start_y) as usize;
 
         if detail.parsed.headings.is_empty() {
-            if y < heading_limit_y {
+            if start_y < heading_limit_y {
                 frame.render_widget(
                     Paragraph::new(Span::styled("  No headings yet.", theme.muted_style())),
-                    Rect::new(out_area.x, y, out_area.width, 1),
+                    Rect::new(out_area.x, start_y, out_area.width, 1),
                 );
             }
-        } else {
-            for h in &detail.parsed.headings {
-                if y >= heading_limit_y {
-                    break;
-                }
+        } else if h_avail_rows > 0 {
+            let h_offset = if sel >= outline_base {
+                selection_offset(sel - outline_base, h_avail_rows, total_h)
+            } else {
+                0
+            };
+            for (row, (idx, h)) in detail
+                .parsed
+                .headings
+                .iter()
+                .enumerate()
+                .skip(h_offset)
+                .take(h_avail_rows)
+                .enumerate()
+            {
+                let y = start_y + row as u16;
+                let flat_idx = outline_base + idx;
+                let is_sel = focused && sel == flat_idx;
+                let row_bg = if is_sel {
+                    theme.bg_selected
+                } else {
+                    theme.bg_sidebar
+                };
                 let indent = " ".repeat((h.level.saturating_sub(1) as usize).min(3));
+                let marker = if is_sel { "▸" } else { " " };
                 let avail = w.saturating_sub(indent.len() + 5);
                 let line = Line::from(vec![
-                    Span::raw(format!(" {indent}")),
+                    Span::styled(
+                        marker.to_string(),
+                        Style::default()
+                            .fg(theme.accent)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(indent),
                     Span::styled(
                         format!("H{} ", h.level),
                         Style::default()
@@ -258,14 +351,21 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
                     ),
                     Span::styled(
                         truncate_width(&h.text, avail),
-                        Style::default().fg(theme.fg_primary),
+                        Style::default()
+                            .fg(theme.fg_primary)
+                            .add_modifier(if is_sel {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
                     ),
                 ]);
+                let row_rect = Rect::new(out_area.x, y, out_area.width, 1);
                 frame.render_widget(
-                    Paragraph::new(line).style(Style::default().bg(theme.bg_sidebar)),
-                    Rect::new(out_area.x, y, out_area.width, 1),
+                    Paragraph::new(line).style(Style::default().bg(row_bg)),
+                    row_rect,
                 );
-                y += 1;
+                hitmap.add(row_rect, HitTarget::InspectorOutline(idx));
             }
         }
 

@@ -13,6 +13,7 @@ use crate::ui::{
     app::{AppState, UiState},
     hitmap::{HitMap, HitTarget},
     overlays::{centered_rect, OverlayOutcome},
+    sidebar::selection_offset,
     truncate_width,
 };
 
@@ -45,6 +46,20 @@ impl VaultSwitcherOverlay {
             Action::MoveDown | Action::Input('j') => {
                 if len > 0 {
                     self.selected = (self.selected + 1) % len;
+                }
+                OverlayOutcome::Handled
+            }
+            Action::MouseScrollUp { .. } => {
+                if len > 0 {
+                    let cur = self.selected.min(len - 1);
+                    self.selected = cur.saturating_sub(1);
+                }
+                OverlayOutcome::Handled
+            }
+            Action::MouseScrollDown { .. } => {
+                if len > 0 {
+                    let cur = self.selected.min(len - 1);
+                    self.selected = (cur + 1).min(len - 1);
                 }
                 OverlayOutcome::Handled
             }
@@ -91,13 +106,24 @@ impl VaultSwitcherOverlay {
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
 
-        for (idx, v) in app.vaults.iter().enumerate() {
-            let y = inner.y + idx as u16;
-            if y >= inner.y + inner.height {
-                break;
-            }
+        let visible = inner.height as usize;
+        if visible == 0 || app.vaults.is_empty() {
+            return;
+        }
+        let sel = self.selected.min(app.vaults.len() - 1);
+        let offset = selection_offset(sel, visible, app.vaults.len());
+
+        for (row, (idx, v)) in app
+            .vaults
+            .iter()
+            .enumerate()
+            .skip(offset)
+            .take(visible)
+            .enumerate()
+        {
+            let y = inner.y + row as u16;
             let row_rect = Rect::new(inner.x, y, inner.width, 1);
-            let is_sel = idx == self.selected;
+            let is_sel = idx == sel;
             let is_active = v.id == app.active_vault.id;
             let badge = if v.discovered { "auto" } else { "local" };
             let line = Line::from(vec![

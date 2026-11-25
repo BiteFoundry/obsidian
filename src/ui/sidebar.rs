@@ -568,6 +568,15 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
             row_rect,
         );
         hitmap.add(row_rect, HitTarget::SidebarRow(idx));
+        if matches!(entry, SidebarEntry::Task { .. }) {
+            let chk_w = 4u16.min(row_rect.width);
+            hitmap.add_line(
+                row_rect.x,
+                row_rect.y,
+                chk_w,
+                HitTarget::SidebarTaskCheckbox(idx),
+            );
+        }
     }
 }
 

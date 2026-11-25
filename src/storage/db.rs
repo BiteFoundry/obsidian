@@ -335,6 +335,14 @@ impl Storage {
         let mut stem_candidates = HashSet::new();
         if is_new {
             stem_candidates.insert(title.to_ascii_lowercase());
+            insert_alias_names(&mut stem_candidates, &parsed.aliases);
+        } else if aliases_changed {
+            let prev_aliases: Vec<String> = prev_aliases_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str(json).ok())
+                .unwrap_or_default();
+            insert_alias_names(&mut stem_candidates, &prev_aliases);
+            insert_alias_names(&mut stem_candidates, &parsed.aliases);
         }
         resolve_affected_links_in_tx(
             &tx,
@@ -3630,6 +3638,63 @@ mod tests {
         assert!(
             one_edit < no_change * 5 + std::time::Duration::from_millis(250),
             "one-edit sync {one_edit:?} vs no-change sync {no_change:?}"
+        );
+    }
+
+    #[test]
+    fn upsert_single_note_reresolves_wikilinks_on_new_and_changed_aliases() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault = vault_from_dir(tmp.path(), Some("AliasUpsertVault"));
+        let storage = Storage::open_in_memory().unwrap();
+
+        let source_md = "# Source\n\nLinks to [[CodenameAlpha]] and [[CodenameBeta]].\n";
+        let target_a_md = "---\naliases: [CodenameAlpha]\n---\n\n# TargetA\n";
+        fs::write(tmp.path().join("Source.md"), source_md).unwrap();
+        fs::write(tmp.path().join("TargetA.md"), target_a_md).unwrap();
+        storage.sync_vault(&vault).unwrap();
+
+        let links0 = storage.get_outgoing_links(&vault, "Source.md").unwrap();
+        assert_eq!(links0[0].target_resolved_path.as_deref(), Some("TargetA.md"));
+        assert_eq!(links0[1].target_resolved_path, None);
+
+        // 1. New note created with alias `CodenameBeta` AND conflicting alias `CodenameAlpha`:
+        //    `upsert_single_note` must add aliases to `stem_candidates` so [[CodenameBeta]] resolves
+        //    and [[CodenameAlpha]] immediately becomes ambiguous (unresolved) without a full reindex!
+        let target_b_md = "---\naliases: [CodenameAlpha, CodenameBeta]\n---\n\n# TargetB\n";
+        fs::write(tmp.path().join("TargetB.md"), target_b_md).unwrap();
+        let (mt_b, sz_b) = file_mtime_and_size(&tmp.path().join("TargetB.md"));
+        storage
+            .upsert_single_note(&vault, "TargetB.md", target_b_md, mt_b, sz_b)
+            .unwrap();
+
+        let links1 = storage.get_outgoing_links(&vault, "Source.md").unwrap();
+        assert_eq!(
+            links1[0].target_resolved_path, None,
+            "duplicate alias on new note must make [[CodenameAlpha]] ambiguous immediately"
+        );
+        assert_eq!(
+            links1[1].target_resolved_path.as_deref(),
+            Some("TargetB.md"),
+            "new note alias must resolve [[CodenameBeta]] immediately"
+        );
+
+        // 2. Updating TargetB to drop `CodenameAlpha` must re-resolve [[CodenameAlpha]] back to TargetA!
+        let target_b_updated = "---\naliases: [CodenameBeta]\n---\n\n# TargetB\n";
+        fs::write(tmp.path().join("TargetB.md"), target_b_updated).unwrap();
+        let (mt_b2, sz_b2) = file_mtime_and_size(&tmp.path().join("TargetB.md"));
+        storage
+            .upsert_single_note(&vault, "TargetB.md", target_b_updated, mt_b2, sz_b2)
+            .unwrap();
+
+        let links2 = storage.get_outgoing_links(&vault, "Source.md").unwrap();
+        assert_eq!(
+            links2[0].target_resolved_path.as_deref(),
+            Some("TargetA.md"),
+            "removing conflicting alias via upsert_single_note must re-resolve [[CodenameAlpha]] to TargetA"
+        );
+        assert_eq!(
+            links2[1].target_resolved_path.as_deref(),
+            Some("TargetB.md")
         );
     }
 }

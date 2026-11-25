@@ -17,7 +17,7 @@ use crate::{
     },
     models::{
         CodedError, CoreEvent, GraphData, IndexStats, LinkStatus, NoteBlock, NoteDetail,
-        NoteSummary, OutgoingLinkEntry, SidebarTab, TagCount, TaskEntry, TaskFilter,
+        NoteImageRef, NoteSummary, OutgoingLinkEntry, SidebarTab, TagCount, TaskEntry, TaskFilter,
     },
     storage::Storage,
     sync::SyncController,
@@ -289,6 +289,11 @@ impl AppState {
                 )
             })
         {
+            let stored_bookmarked = self
+                .notes
+                .iter()
+                .find(|n| n.rel_path == ed_path)
+                .map(|n| n.is_bookmarked);
             match self.inspect_editor_disk_state(&ed_path, ed_base_hash) {
                 EditorDiskState::Unchanged => {
                     if ed_dirty {
@@ -343,8 +348,25 @@ impl AppState {
                     }
                 }
             }
+            // Keep backlinks & bookmark status fresh even when inline_editor is dirty.
+            if let Some(detail) = self.active_note.as_mut() {
+                if detail.summary.rel_path == ed_path {
+                    if let Some(bm) = stored_bookmarked {
+                        detail.summary.is_bookmarked = bm;
+                    }
+                    if let Ok(bl) = self.storage.get_backlinks(&vid, &ed_path) {
+                        detail.summary.backlink_count = bl.len();
+                        detail.backlinks = bl;
+                    }
+                    let updated_summary = detail.summary.clone();
+                    if let Some(slot) = self.notes.iter_mut().find(|n| n.rel_path == ed_path) {
+                        *slot = updated_summary;
+                    }
+                }
+            }
             self.refresh_graph(ui);
             self.refresh_open_html_preview(ui);
+            self.clamp_selections(ui);
             return;
         }
 
@@ -363,15 +385,30 @@ impl AppState {
                 if let Ok(detail) = self.storage.load_note_detail(&self.active_vault, &first_rp) {
                     self.cache_inline_images(&detail);
                     self.active_note = Some(detail);
+                } else {
+                    self.active_note = None;
                 }
+                ui.canvas_scroll = 0;
+                ui.canvas_selected_block = 0;
+                ui.canvas_follow_selected = true;
+                ui.inspector_selected = 0;
             } else {
                 self.active_note = None;
+                ui.canvas_scroll = 0;
+                ui.canvas_selected_block = 0;
+                ui.canvas_follow_selected = true;
+                ui.inspector_selected = 0;
             }
         } else {
             self.active_note = None;
+            ui.canvas_scroll = 0;
+            ui.canvas_selected_block = 0;
+            ui.canvas_follow_selected = true;
+            ui.inspector_selected = 0;
         }
         self.refresh_graph(ui);
         self.refresh_open_html_preview(ui);
+        self.clamp_selections(ui);
     }
 
     fn refresh_open_html_preview(&self, ui: &mut UiState) {
@@ -413,6 +450,30 @@ impl AppState {
         }
     }
 
+    fn inspector_item_count(detail: &NoteDetail) -> usize {
+        detail.backlinks.len() + detail.outgoing_links.len() + detail.parsed.headings.len()
+    }
+
+    pub fn clamp_selections(&self, ui: &mut UiState) {
+        let sidebar_len = build_sidebar_entries(self, ui).len();
+        ui.sidebar_selected = ui.sidebar_selected.min(sidebar_len.saturating_sub(1));
+
+        let graph_len = self.graph.nodes.len();
+        ui.graph_selected = ui.graph_selected.min(graph_len.saturating_sub(1));
+
+        if let Some(detail) = self.active_note.as_ref() {
+            let blocks_len = detail.parsed.blocks.len();
+            ui.canvas_selected_block = ui.canvas_selected_block.min(blocks_len.saturating_sub(1));
+
+            let inspector_len = Self::inspector_item_count(detail);
+            ui.inspector_selected = ui.inspector_selected.min(inspector_len.saturating_sub(1));
+        } else {
+            ui.canvas_selected_block = 0;
+            ui.canvas_scroll = 0;
+            ui.inspector_selected = 0;
+        }
+    }
+
     pub fn refresh_graph(&mut self, ui: &mut UiState) {
         let center = if ui.graph_global {
             None
@@ -426,13 +487,18 @@ impl AppState {
             .get_graph(&self.active_vault, center.as_deref(), ui.graph_depth)
             .unwrap_or_default();
         ui.graph_sim.sync_from_graph(&self.graph);
+        self.clamp_selections(ui);
     }
 
     fn cache_inline_images(&mut self, detail: &NoteDetail) {
+        self.cache_inline_images_list(&detail.images);
+    }
+
+    fn cache_inline_images_list(&mut self, images: &[NoteImageRef]) {
         if !self.cfg.inline_images {
             return;
         }
-        for img in &detail.images {
+        for img in images {
             let key = inline_image_cache_key(&img.abs_path);
             if self.preview_cache.contains_key(&key) {
                 continue;
@@ -705,8 +771,13 @@ impl AppState {
                                     self.storage.load_note_detail(&self.active_vault, &rel_path)
                                 {
                                     self.push_history_entry(previous);
+                                    self.cache_inline_images(&detail);
                                     self.active_note = Some(detail);
                                     ui.canvas_mode = CanvasMode::Note;
+                                    ui.canvas_selected_block = 0;
+                                    ui.canvas_scroll = 0;
+                                    ui.canvas_follow_selected = true;
+                                    ui.inspector_selected = 0;
                                     ui.toasts.success(format!("Created note: {rel_path}"));
                                     self.refresh_graph(ui);
                                 }
@@ -1025,6 +1096,10 @@ impl AppState {
                 }
             }
         }
+        if let Some(images) = self.active_note.as_ref().map(|d| d.images.clone()) {
+            self.cache_inline_images_list(&images);
+        }
+        self.refresh_graph(ui);
         true
     }
 
@@ -1077,8 +1152,10 @@ impl AppState {
     pub fn handle_core_event(&mut self, ev: CoreEvent, ui: &mut UiState) {
         match ev {
             CoreEvent::VaultIndexed { stats } => {
-                self.last_index_stats = Some(stats);
-                self.reload_from_storage(ui);
+                if stats.vault_id == self.active_vault.id {
+                    self.last_index_stats = Some(stats);
+                    self.reload_from_storage(ui);
+                }
             }
             CoreEvent::NoteChanged { .. } => {
                 self.reload_from_storage(ui);
@@ -1103,8 +1180,29 @@ impl AppState {
 
         // Route overlay input first when an overlay is open
         if ui.overlay.is_some() && !matches!(action, Action::MouseClick { .. }) {
+            // Block opening a context menu while another modal overlay is open; if a ContextMenu
+            // itself is already open, right-clicking repositions it cleanly.
+            if let Action::OpenContextMenu { col, row } = action {
+                if matches!(ui.overlay, Some(Overlay::ContextMenu(_))) {
+                    ui.overlay = Some(Overlay::ContextMenu(ContextMenuOverlay::default_menu(
+                        col, row,
+                    )));
+                }
+                return;
+            }
+            if matches!(action, Action::OpenContextMenuKeyboard) {
+                if matches!(ui.overlay, Some(Overlay::ContextMenu(_))) {
+                    ui.close_overlay();
+                }
+                return;
+            }
+            let effective_action = if matches!(action, Action::ClearTagFilter) {
+                Action::CloseOverlay
+            } else {
+                action
+            };
             let outcome = if let Some(mut ov) = ui.overlay.take() {
-                let res = ov.handle(&action, self);
+                let res = ov.handle(&effective_action, self);
                 match res {
                     OverlayOutcome::Close => {
                         ui.close_overlay();
@@ -1124,7 +1222,8 @@ impl AppState {
                     }
                     OverlayOutcome::NotHandled => {
                         ui.overlay = Some(ov);
-                        matches!(action, Action::Quit | Action::QuitConfirm).then(|| action.clone())
+                        matches!(effective_action, Action::Quit | Action::QuitConfirm)
+                            .then(|| effective_action.clone())
                     }
                 }
             } else {
@@ -1243,6 +1342,9 @@ impl AppState {
             }
 
             Action::NextFocus => {
+                if ui.inline_editor.is_some() && !self.finish_inline_edit(ui) {
+                    return;
+                }
                 if ui.canvas_mode == CanvasMode::Graph && ui.focus == Focus::Canvas {
                     let len = self.graph.nodes.len();
                     if len > 0 {
@@ -1272,6 +1374,9 @@ impl AppState {
                 }
             }
             Action::PrevFocus => {
+                if ui.inline_editor.is_some() && !self.finish_inline_edit(ui) {
+                    return;
+                }
                 ui.focus = match ui.focus {
                     Focus::Sidebar => {
                         if ui.show_inspector {
@@ -1336,7 +1441,7 @@ impl AppState {
                 }
                 Focus::Inspector => {
                     if let Some(d) = &self.active_note {
-                        let total = d.backlinks.len() + d.outgoing_links.len();
+                        let total = Self::inspector_item_count(d);
                         if total > 0 {
                             ui.inspector_selected = (ui.inspector_selected + 1).min(total - 1);
                         }
@@ -1345,30 +1450,73 @@ impl AppState {
                 Focus::Overlay => {}
             },
 
-            Action::PageUp => {
-                ui.canvas_follow_selected = false;
-                ui.canvas_scroll = ui.canvas_scroll.saturating_sub(10);
-                ui.canvas_selected_block = ui.canvas_selected_block.saturating_sub(5);
-            }
-            Action::PageDown => {
-                ui.canvas_follow_selected = false;
-                ui.canvas_scroll = ui.canvas_scroll.saturating_add(10);
-                if let Some(d) = &self.active_note {
-                    let max_b = d.parsed.blocks.len().saturating_sub(1);
-                    ui.canvas_selected_block = (ui.canvas_selected_block + 5).min(max_b);
+            Action::PageUp => match ui.focus {
+                Focus::Sidebar => {
+                    ui.sidebar_selected = ui.sidebar_selected.saturating_sub(10);
                 }
-            }
-            Action::JumpTop => {
-                ui.canvas_selected_block = 0;
-                ui.canvas_scroll = 0;
-                ui.canvas_follow_selected = true;
-            }
-            Action::JumpBottom => {
-                if let Some(d) = &self.active_note {
-                    ui.canvas_selected_block = d.parsed.blocks.len().saturating_sub(1);
+                Focus::Inspector => {
+                    ui.inspector_selected = ui.inspector_selected.saturating_sub(10);
+                }
+                Focus::Canvas | Focus::Overlay => {
+                    ui.canvas_follow_selected = false;
+                    ui.canvas_scroll = ui.canvas_scroll.saturating_sub(10);
+                    ui.canvas_selected_block = ui.canvas_selected_block.saturating_sub(5);
+                }
+            },
+            Action::PageDown => match ui.focus {
+                Focus::Sidebar => {
+                    let len = build_sidebar_entries(self, ui).len();
+                    if len > 0 {
+                        ui.sidebar_selected = (ui.sidebar_selected + 10).min(len - 1);
+                    }
+                }
+                Focus::Inspector => {
+                    if let Some(d) = &self.active_note {
+                        let total = Self::inspector_item_count(d);
+                        if total > 0 {
+                            ui.inspector_selected = (ui.inspector_selected + 10).min(total - 1);
+                        }
+                    }
+                }
+                Focus::Canvas | Focus::Overlay => {
+                    ui.canvas_follow_selected = false;
+                    ui.canvas_scroll = ui.canvas_scroll.saturating_add(10);
+                    if let Some(d) = &self.active_note {
+                        let max_b = d.parsed.blocks.len().saturating_sub(1);
+                        ui.canvas_selected_block = (ui.canvas_selected_block + 5).min(max_b);
+                    }
+                }
+            },
+            Action::JumpTop => match ui.focus {
+                Focus::Sidebar => {
+                    ui.sidebar_selected = 0;
+                }
+                Focus::Inspector => {
+                    ui.inspector_selected = 0;
+                }
+                Focus::Canvas | Focus::Overlay => {
+                    ui.canvas_selected_block = 0;
+                    ui.canvas_scroll = 0;
                     ui.canvas_follow_selected = true;
                 }
-            }
+            },
+            Action::JumpBottom => match ui.focus {
+                Focus::Sidebar => {
+                    let len = build_sidebar_entries(self, ui).len();
+                    ui.sidebar_selected = len.saturating_sub(1);
+                }
+                Focus::Inspector => {
+                    if let Some(d) = &self.active_note {
+                        ui.inspector_selected = Self::inspector_item_count(d).saturating_sub(1);
+                    }
+                }
+                Focus::Canvas | Focus::Overlay => {
+                    if let Some(d) = &self.active_note {
+                        ui.canvas_selected_block = d.parsed.blocks.len().saturating_sub(1);
+                        ui.canvas_follow_selected = true;
+                    }
+                }
+            },
 
             Action::Activate => match ui.focus {
                 Focus::Sidebar => self.activate_sidebar_selected(ui),
@@ -1411,15 +1559,20 @@ impl AppState {
                 let _ = self.cfg.save();
             }
             Action::SetSidebarTab(tab) => {
+                if ui.inline_editor.is_some() && !self.finish_inline_edit(ui) {
+                    return;
+                }
                 ui.sidebar_tab = tab;
                 ui.sidebar_selected = 0;
                 ui.show_sidebar = true;
                 ui.focus = Focus::Sidebar;
+                self.clamp_selections(ui);
             }
             Action::ClearTagFilter => {
                 if ui.active_tag_filter.is_some() {
                     ui.active_tag_filter = None;
                     ui.sidebar_selected = 0;
+                    self.clamp_selections(ui);
                 }
             }
 
@@ -1605,6 +1758,9 @@ impl AppState {
             }
 
             Action::OpenQuickAppend => {
+                if ui.inline_editor.is_some() && !self.finish_inline_edit(ui) {
+                    return;
+                }
                 let title = self
                     .active_note
                     .as_ref()
@@ -1658,6 +1814,9 @@ impl AppState {
                 }
             }
             Action::QuickAppendSubmit { text } => {
+                if ui.inline_editor.is_some() && !self.finish_inline_edit(ui) {
+                    return;
+                }
                 if let Some(d) = &self.active_note {
                     let rp = d.summary.rel_path.clone();
                     if let Ok(abs) = safe_vault_path(&self.active_vault.path, &rp) {
@@ -1698,6 +1857,10 @@ impl AppState {
                     match move_note_to_trash(&self.active_vault.path, &rp) {
                         Ok(_) => {
                             self.active_note = None;
+                            ui.canvas_scroll = 0;
+                            ui.canvas_selected_block = 0;
+                            ui.canvas_follow_selected = true;
+                            ui.inspector_selected = 0;
                             let _ = self.storage.sync_vault(&self.active_vault);
                             self.reload_from_storage(ui);
                             ui.toasts.success(format!("Moved {rp} to .trash/"));
@@ -1708,11 +1871,17 @@ impl AppState {
             }
 
             Action::OpenFilePicker => {
+                if ui.inline_editor.is_some() && !self.finish_inline_edit(ui) {
+                    return;
+                }
                 ui.open_overlay(Overlay::FilePicker(FilePickerOverlay::new_in_dir(
                     self.active_vault.path.clone(),
                 )));
             }
             Action::AttachLocalFile(src_path) => {
+                if ui.inline_editor.is_some() && !self.finish_inline_edit(ui) {
+                    return;
+                }
                 if let Ok(bytes) = fs::read(&src_path) {
                     let fname = src_path
                         .file_name()
@@ -1735,32 +1904,39 @@ impl AppState {
                     }
                 }
             }
-            Action::PasteClipboard => match read_clipboard_image_png() {
-                Ok(Some((filename, bytes))) => {
-                    let name = if filename.trim().is_empty() {
-                        format!("pasted-{}.png", Local::now().format("%Y%m%d-%H%M%S"))
-                    } else {
-                        filename
-                    };
-                    match save_vault_attachment(&self.active_vault, &name, &bytes) {
-                        Ok((saved_name, _)) => {
-                            if let Some(d) = &self.active_note {
-                                if let Ok(abs) =
-                                    safe_vault_path(&self.active_vault.path, &d.summary.rel_path)
-                                {
-                                    let _ = append_to_note(&abs, &format!("\n![[{saved_name}]]"));
-                                    let _ = self.storage.sync_vault(&self.active_vault);
-                                    self.reload_from_storage(ui);
-                                    ui.toasts.success(format!("Pasted ![[{saved_name}]]"));
+            Action::PasteClipboard => {
+                if ui.inline_editor.is_some() && !self.finish_inline_edit(ui) {
+                    return;
+                }
+                match read_clipboard_image_png() {
+                    Ok(Some((filename, bytes))) => {
+                        let name = if filename.trim().is_empty() {
+                            format!("pasted-{}.png", Local::now().format("%Y%m%d-%H%M%S"))
+                        } else {
+                            filename
+                        };
+                        match save_vault_attachment(&self.active_vault, &name, &bytes) {
+                            Ok((saved_name, _)) => {
+                                if let Some(d) = &self.active_note {
+                                    if let Ok(abs) = safe_vault_path(
+                                        &self.active_vault.path,
+                                        &d.summary.rel_path,
+                                    ) {
+                                        let _ =
+                                            append_to_note(&abs, &format!("\n![[{saved_name}]]"));
+                                        let _ = self.storage.sync_vault(&self.active_vault);
+                                        self.reload_from_storage(ui);
+                                        ui.toasts.success(format!("Pasted ![[{saved_name}]]"));
+                                    }
                                 }
                             }
+                            Err(e) => ui.toasts.error(format!("Clipboard save failed: {e}")),
                         }
-                        Err(e) => ui.toasts.error(format!("Clipboard save failed: {e}")),
                     }
+                    Ok(None) => ui.toasts.info("No image found in clipboard"),
+                    Err(e) => ui.toasts.warning(format!("Clipboard error: {e}")),
                 }
-                Ok(None) => ui.toasts.info("No image found in clipboard"),
-                Err(e) => ui.toasts.warning(format!("Clipboard error: {e}")),
-            },
+            }
 
             Action::OpenLinkExtractor => {
                 if let Some(d) = &self.active_note {
@@ -1881,9 +2057,81 @@ impl AppState {
                 }
             },
             Action::OpenContextMenu { col, row } => {
+                // Target the actual item under the right-click cursor so actions like
+                // "Move Note to .trash/" or "Edit" operate on the right-clicked note/block.
+                match ui.last_hitmap.hit(row, col) {
+                    Some(HitTarget::SidebarRow(idx)) | Some(HitTarget::SidebarTaskCheckbox(idx)) => {
+                        if ui.inline_editor.is_some() && !self.finish_inline_edit(ui) {
+                            return;
+                        }
+                        let entries = build_sidebar_entries(self, ui);
+                        if let Some(entry) = entries.get(idx).cloned() {
+                            ui.sidebar_selected = idx;
+                            match entry {
+                                SidebarEntry::Note { rel_path, .. } => {
+                                    self.open_note(ui, &rel_path, true);
+                                    if ui.inline_editor.is_some() {
+                                        return;
+                                    }
+                                }
+                                SidebarEntry::Task { note_path, .. } => {
+                                    self.open_note(ui, &note_path, true);
+                                    if ui.inline_editor.is_some() {
+                                        return;
+                                    }
+                                }
+                                _ => {}
+                            }
+                            ui.focus = Focus::Sidebar;
+                        }
+                    }
+                    Some(HitTarget::CanvasBlock(idx)) | Some(HitTarget::WikilinkBlock(idx)) => {
+                        ui.canvas_selected_block = idx;
+                        ui.focus = Focus::Canvas;
+                    }
+                    Some(HitTarget::GraphNode(idx)) => {
+                        ui.graph_selected = idx;
+                        ui.focus = Focus::Canvas;
+                    }
+                    Some(HitTarget::InspectorBacklink(idx)) => {
+                        if ui.inline_editor.is_some() && !self.finish_inline_edit(ui) {
+                            return;
+                        }
+                        ui.inspector_selected = idx;
+                        ui.focus = Focus::Inspector;
+                    }
+                    Some(HitTarget::InspectorOutgoing(idx)) => {
+                        if ui.inline_editor.is_some() && !self.finish_inline_edit(ui) {
+                            return;
+                        }
+                        let bl_len = self
+                            .active_note
+                            .as_ref()
+                            .map(|d| d.backlinks.len())
+                            .unwrap_or(0);
+                        ui.inspector_selected = bl_len + idx;
+                        ui.focus = Focus::Inspector;
+                    }
+                    Some(HitTarget::InspectorOutline(idx)) => {
+                        if ui.inline_editor.is_some() && !self.finish_inline_edit(ui) {
+                            return;
+                        }
+                        let base = self
+                            .active_note
+                            .as_ref()
+                            .map(|d| d.backlinks.len() + d.outgoing_links.len())
+                            .unwrap_or(0);
+                        ui.inspector_selected = base + idx;
+                        ui.focus = Focus::Inspector;
+                    }
+                    _ => {}
+                }
                 ui.open_overlay(Overlay::ContextMenu(ContextMenuOverlay::default_menu(
                     col, row,
                 )));
+            }
+            Action::OpenContextMenuKeyboard => {
+                ui.open_overlay(Overlay::ContextMenu(ContextMenuOverlay::default_menu(14, 4)));
             }
             Action::CloseOverlay => ui.close_overlay(),
 
@@ -1898,6 +2146,14 @@ impl AppState {
                     self.active_note = None;
                     self.history.clear();
                     self.preview_cache.clear();
+                    ui.active_tag_filter = None;
+                    ui.collapsed_folders.clear();
+                    ui.sidebar_selected = 0;
+                    ui.canvas_selected_block = 0;
+                    ui.canvas_scroll = 0;
+                    ui.canvas_follow_selected = true;
+                    ui.inspector_selected = 0;
+                    ui.graph_selected = 0;
                     self.sync_ctrl.switch_vault(next.clone());
                     let _ = self.storage.sync_vault(&next);
                     self.reload_from_storage(ui);
@@ -1918,12 +2174,27 @@ impl AppState {
             }
             Action::SetImageProtocol(p) => {
                 self.cfg.image_protocol = p;
-                self.graphics_caps = detect_graphics_caps(p);
+                let prev_cell_px = self.graphics_caps.cell_px;
+                let prev_cell_px_exact = self.graphics_caps.cell_px_exact;
+                let mut caps = detect_graphics_caps(p);
+                if prev_cell_px_exact || !caps.cell_px_exact {
+                    caps.cell_px = prev_cell_px;
+                    caps.cell_px_exact = prev_cell_px_exact;
+                }
+                self.graphics_caps = caps;
                 self.preview_cache.clear();
+                if let Some(images) = self.active_note.as_ref().map(|d| d.images.clone()) {
+                    self.cache_inline_images_list(&images);
+                }
                 let _ = self.cfg.save();
             }
             Action::ToggleInlineImages => {
                 self.cfg.inline_images = !self.cfg.inline_images;
+                if self.cfg.inline_images {
+                    if let Some(images) = self.active_note.as_ref().map(|d| d.images.clone()) {
+                        self.cache_inline_images_list(&images);
+                    }
+                }
                 let _ = self.cfg.save();
             }
 
@@ -2005,7 +2276,7 @@ impl AppState {
                         }
                         Focus::Inspector => {
                             if let Some(d) = &self.active_note {
-                                let total = d.backlinks.len() + d.outgoing_links.len();
+                                let total = Self::inspector_item_count(d);
                                 if total > 0 {
                                     ui.inspector_selected =
                                         (ui.inspector_selected + 1).min(total - 1);
@@ -2035,8 +2306,7 @@ impl AppState {
                     ui.collapsed_folders.insert(path);
                 }
                 // Collapsing hides the whole subtree, so keep the selection inside the list.
-                let len = build_sidebar_entries(self, ui).len();
-                ui.sidebar_selected = ui.sidebar_selected.min(len.saturating_sub(1));
+                self.clamp_selections(ui);
             }
             SidebarEntry::Note { rel_path, .. } => {
                 self.open_note(ui, &rel_path, true);
@@ -2052,10 +2322,12 @@ impl AppState {
                     ui.active_tag_filter = Some(tag);
                     ui.sidebar_selected = 0;
                 }
+                self.clamp_selections(ui);
             }
             SidebarEntry::TagHeader { .. } => {
                 ui.active_tag_filter = None;
                 ui.sidebar_selected = 0;
+                self.clamp_selections(ui);
             }
             SidebarEntry::Heading { line_no, .. } => {
                 self.dispatch_core(Action::JumpToHeadingLine(line_no), ui);
@@ -2074,15 +2346,25 @@ impl AppState {
             return;
         };
         let bl_len = detail.backlinks.len();
+        let ol_len = detail.outgoing_links.len();
         if ui.inspector_selected < bl_len {
             let src = detail.backlinks[ui.inspector_selected].source_path.clone();
             self.open_note(ui, &src, true);
-        } else if let Some(ol) = detail.outgoing_links.get(ui.inspector_selected - bl_len) {
-            let dest = ol
-                .target_resolved_path
-                .clone()
-                .unwrap_or_else(|| ol.target_raw.clone());
-            self.open_note_with(ui, &dest, true, OpenIntent::FollowLink);
+        } else if ui.inspector_selected < bl_len + ol_len {
+            if let Some(ol) = detail.outgoing_links.get(ui.inspector_selected - bl_len) {
+                let dest = ol
+                    .target_resolved_path
+                    .clone()
+                    .unwrap_or_else(|| ol.target_raw.clone());
+                self.open_note_with(ui, &dest, true, OpenIntent::FollowLink);
+            }
+        } else if let Some(h) = detail
+            .parsed
+            .headings
+            .get(ui.inspector_selected - bl_len - ol_len)
+        {
+            let line_no = h.line_no;
+            self.dispatch_core(Action::JumpToHeadingLine(line_no), ui);
         }
     }
 
@@ -2117,11 +2399,13 @@ impl AppState {
             Some(
                 HitTarget::SidebarTab(_)
                 | HitTarget::SidebarRow(_)
+                | HitTarget::SidebarTaskCheckbox(_)
                 | HitTarget::Pane(Focus::Sidebar),
             ) => Focus::Sidebar,
             Some(
                 HitTarget::InspectorBacklink(_)
                 | HitTarget::InspectorOutgoing(_)
+                | HitTarget::InspectorOutline(_)
                 | HitTarget::Pane(Focus::Inspector),
             ) => Focus::Inspector,
             Some(
@@ -2146,7 +2430,8 @@ impl AppState {
     fn handle_mouse_click(&mut self, col: u16, row: u16, ui: &mut UiState) {
         if matches!(ui.overlay, Some(Overlay::HtmlPreview(_))) {
             match ui.last_hitmap.hit(row, col) {
-                Some(HitTarget::Button(ButtonId::ConfirmCancel)) => {
+                Some(HitTarget::OverlayBackdrop)
+                | Some(HitTarget::Button(ButtonId::ConfirmCancel)) => {
                     ui.close_overlay();
                     return;
                 }
@@ -2196,23 +2481,76 @@ impl AppState {
             }
         }
 
-        let Some(target) = ui.last_hitmap.hit(row, col) else {
-            if ui.overlay.is_some() {
-                ui.close_overlay();
+        // Strict modal click isolation: while ANY overlay is open, only overlay targets are
+        // dispatched; any click outside the modal (backdrop or None) closes it cleanly without
+        // ever clicking through or changing workspace focus while the overlay remains open.
+        if ui.overlay.is_some() {
+            match ui.last_hitmap.hit(row, col) {
+                Some(HitTarget::OverlayBody) => {}
+                Some(HitTarget::OverlayItem { index }) => {
+                    if let Some(ref mut ov) = ui.overlay {
+                        match ov {
+                            Overlay::QuickSwitcher(q) => q.selected = index,
+                            Overlay::VaultSwitcher(v) => v.selected = index,
+                            Overlay::Settings(s) => s.selected = index,
+                            Overlay::LinkExtractor(l) => l.selected = index,
+                            Overlay::FilePicker(f) => f.select(index),
+                            Overlay::ContextMenu(c) => c.selected = index,
+                            _ => {}
+                        }
+                    }
+                    self.dispatch(Action::Activate, ui);
+                }
+                Some(HitTarget::Button(ButtonId::ConfirmOk)) => {
+                    self.dispatch(Action::Input('y'), ui);
+                }
+                Some(HitTarget::Button(ButtonId::ConfirmCancel)) => {
+                    self.dispatch(Action::CloseOverlay, ui);
+                }
+                _ => {
+                    ui.close_overlay();
+                }
             }
+            return;
+        }
+
+        let Some(target) = ui.last_hitmap.hit(row, col) else {
             return;
         };
         match target {
             HitTarget::Pane(focus) => {
                 if focus != Focus::Overlay {
+                    if focus != Focus::Canvas
+                        && ui.inline_editor.is_some()
+                        && !self.finish_inline_edit(ui)
+                    {
+                        return;
+                    }
                     ui.focus = focus;
                 }
             }
             HitTarget::SidebarTab(tab) => self.dispatch_core(Action::SetSidebarTab(tab), ui),
             HitTarget::SidebarRow(idx) => {
+                if ui.inline_editor.is_some() && !self.finish_inline_edit(ui) {
+                    return;
+                }
                 ui.focus = Focus::Sidebar;
                 ui.sidebar_selected = idx;
                 self.activate_sidebar_selected(ui);
+            }
+            HitTarget::SidebarTaskCheckbox(idx) => {
+                if ui.inline_editor.is_some() && !self.finish_inline_edit(ui) {
+                    return;
+                }
+                ui.focus = Focus::Sidebar;
+                ui.sidebar_selected = idx;
+                let entries = build_sidebar_entries(self, ui);
+                if let Some(SidebarEntry::Task {
+                    note_path, line_no, ..
+                }) = entries.get(idx).cloned()
+                {
+                    self.dispatch_core(Action::ToggleTaskAtLine { note_path, line_no }, ui);
+                }
             }
             HitTarget::CanvasBlock(idx) => {
                 ui.focus = Focus::Canvas;
@@ -2225,7 +2563,19 @@ impl AppState {
                 }
             }
             HitTarget::TaskCheckbox { line_no } => {
+                if ui.inline_editor.is_some() && !self.finish_inline_edit(ui) {
+                    return;
+                }
+                ui.focus = Focus::Canvas;
                 if let Some(d) = &self.active_note {
+                    if let Some(b_idx) = d
+                        .parsed
+                        .blocks
+                        .iter()
+                        .position(|b| matches!(b, NoteBlock::Task { line_no: ln, .. } if *ln == line_no))
+                    {
+                        ui.canvas_selected_block = b_idx;
+                    }
                     let note_path = d.summary.rel_path.clone();
                     self.dispatch_core(Action::ToggleTaskAtLine { note_path, line_no }, ui);
                 }
@@ -2258,11 +2608,17 @@ impl AppState {
                 ui.graph_sim.last_mouse = Some((col, row));
             }
             HitTarget::InspectorBacklink(idx) => {
+                if ui.inline_editor.is_some() && !self.finish_inline_edit(ui) {
+                    return;
+                }
                 ui.focus = Focus::Inspector;
                 ui.inspector_selected = idx;
                 self.activate_inspector_selected(ui);
             }
             HitTarget::InspectorOutgoing(idx) => {
+                if ui.inline_editor.is_some() && !self.finish_inline_edit(ui) {
+                    return;
+                }
                 let bl_len = self
                     .active_note
                     .as_ref()
@@ -2270,6 +2626,19 @@ impl AppState {
                     .unwrap_or(0);
                 ui.focus = Focus::Inspector;
                 ui.inspector_selected = bl_len + idx;
+                self.activate_inspector_selected(ui);
+            }
+            HitTarget::InspectorOutline(idx) => {
+                if ui.inline_editor.is_some() && !self.finish_inline_edit(ui) {
+                    return;
+                }
+                let base = self
+                    .active_note
+                    .as_ref()
+                    .map(|d| d.backlinks.len() + d.outgoing_links.len())
+                    .unwrap_or(0);
+                ui.focus = Focus::Inspector;
+                ui.inspector_selected = base + idx;
                 self.activate_inspector_selected(ui);
             }
             HitTarget::Button(btn) => match btn {
@@ -2319,21 +2688,483 @@ impl AppState {
                 ButtonId::ConfirmOk => self.dispatch(Action::Input('y'), ui),
                 ButtonId::ConfirmCancel => self.dispatch(Action::CloseOverlay, ui),
             },
-            HitTarget::OverlayItem { index } => {
-                if let Some(ref mut ov) = ui.overlay {
-                    match ov {
-                        Overlay::QuickSwitcher(q) => q.selected = index,
-                        Overlay::VaultSwitcher(v) => v.selected = index,
-                        Overlay::Settings(s) => s.selected = index,
-                        Overlay::LinkExtractor(l) => l.selected = index,
-                        Overlay::FilePicker(f) => f.select(index),
-                        Overlay::ContextMenu(c) => c.selected = index,
-                        _ => {}
-                    }
-                }
-                self.dispatch(Action::Activate, ui);
+            HitTarget::OverlayBackdrop | HitTarget::OverlayBody | HitTarget::OverlayItem { .. } => {
             }
-            HitTarget::OverlayBody => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::{backend::TestBackend, Terminal};
+    use tokio::sync::{mpsc, watch};
+
+    use super::*;
+    use crate::{
+        config::ImageProtocolPreference,
+        img_preview::TerminalImageProtocol,
+        models::BacklinkEntry,
+        sync::{FocusTarget, SyncCommand, SyncController},
+        ui::{self, event::key_to_action},
+        vault::vault_from_dir,
+    };
+
+    fn make_valid_png_bytes() -> Vec<u8> {
+        let img = image::RgbaImage::from_pixel(4, 4, image::Rgba([120, 80, 240, 255]));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .unwrap();
+        buf.into_inner()
+    }
+
+    fn make_harness(root: &std::path::Path, name: &str) -> (AppState, UiState) {
+        let vault = vault_from_dir(root, Some(name));
+        let mut cfg = AppConfig::default();
+        cfg.load_failed = true; // prevent tests from touching real user config.toml
+        let storage = Storage::open_in_memory().unwrap();
+        storage.sync_vault(&vault).unwrap();
+        let (focus_tx, _focus_rx) = watch::channel(FocusTarget::default());
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel::<SyncCommand>();
+        let sync_ctrl = SyncController::from_channels(focus_tx, cmd_tx);
+        let mut app = AppState::new(cfg.clone(), vault, storage, sync_ctrl);
+        let mut ui = UiState::from_config(&cfg);
+        app.reload_from_storage(&mut ui);
+        (app, ui)
+    }
+
+    fn draw_frame(app: &AppState, ui: &mut UiState, width: u16, height: u16) -> HitMap {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut hitmap = HitMap::new();
+        terminal
+            .draw(|f| {
+                hitmap = ui::draw(f, app, ui);
+            })
+            .unwrap();
+        hitmap
+    }
+
+    #[test]
+    fn p0_overlay_backdrop_closes_modal_without_clickthrough_or_esc_trap() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("Alpha.md"), "# Alpha\n\nBody A\n").unwrap();
+        fs::write(tmp.path().join("Beta.md"), "# Beta\n\nBody B\n").unwrap();
+        let (mut app, mut ui) = make_harness(tmp.path(), "BackdropVault");
+        app.open_note(&mut ui, "Alpha.md", false);
+        ui.focus = Focus::Canvas;
+
+        // First draw without overlay to locate Beta's sidebar row coordinates.
+        let base_map = draw_frame(&app, &mut ui, 120, 34);
+        let beta_row = base_map
+            .region_of(HitTarget::SidebarRow(1))
+            .expect("Beta row in sidebar");
+
+        // Open Settings overlay and redraw: underlying sidebar must NOT be in hitmap!
+        app.dispatch(Action::OpenOverlay(OverlayKind::Settings), &mut ui);
+        assert!(ui.overlay.is_some());
+        assert_eq!(ui.focus, Focus::Overlay);
+        let ov_map = draw_frame(&app, &mut ui, 120, 34);
+        assert_eq!(
+            ov_map.hit(beta_row.y, beta_row.x + 1),
+            Some(HitTarget::OverlayBackdrop)
+        );
+
+        // Clicking outside the modal where SidebarRow(1) sits must close the overlay,
+        // restore Canvas focus, and NOT switch active_note to Beta!
+        app.dispatch(
+            Action::MouseClick {
+                col: beta_row.x + 1,
+                row: beta_row.y,
+            },
+            &mut ui,
+        );
+        assert!(ui.overlay.is_none());
+        assert_eq!(ui.focus, Focus::Canvas);
+        assert_eq!(
+            app.active_note.as_ref().unwrap().summary.rel_path,
+            "Alpha.md"
+        );
+
+        // Even if focus somehow diverged while an overlay is open, Esc (`ClearTagFilter`) still closes it.
+        app.dispatch(Action::OpenOverlay(OverlayKind::Help), &mut ui);
+        ui.focus = Focus::Sidebar;
+        app.dispatch(Action::ClearTagFilter, &mut ui);
+        assert!(ui.overlay.is_none());
+    }
+
+    #[test]
+    fn p0_right_click_sidebar_row_targets_clicked_note_not_active_note() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("Alpha.md"), "# Alpha\n\nKeep me.\n").unwrap();
+        fs::write(tmp.path().join("Beta.md"), "# Beta\n\nTrash me.\n").unwrap();
+        let (mut app, mut ui) = make_harness(tmp.path(), "ContextVault");
+        app.open_note(&mut ui, "Alpha.md", false);
+        assert_eq!(
+            app.active_note.as_ref().unwrap().summary.rel_path,
+            "Alpha.md"
+        );
+
+        let hitmap = draw_frame(&app, &mut ui, 120, 34);
+        let beta_row = hitmap
+            .region_of(HitTarget::SidebarRow(1))
+            .expect("Beta row in sidebar");
+
+        // Right-click Beta while Alpha is active
+        app.dispatch(
+            Action::OpenContextMenu {
+                col: beta_row.x + 2,
+                row: beta_row.y,
+            },
+            &mut ui,
+        );
+        assert!(matches!(ui.overlay, Some(Overlay::ContextMenu(_))));
+        assert_eq!(
+            app.active_note.as_ref().unwrap().summary.rel_path,
+            "Beta.md"
+        );
+
+        // Choose "Move Note to .trash/" (last item) and confirm
+        if let Some(Overlay::ContextMenu(ref mut cm)) = ui.overlay {
+            cm.selected = cm.items.len() - 1;
+        }
+        app.dispatch(Action::Activate, &mut ui);
+        assert!(matches!(ui.overlay, Some(Overlay::Confirm(_))));
+
+        // Right-clicking while Confirm modal is open must be blocked!
+        app.dispatch(Action::OpenContextMenu { col: 5, row: 5 }, &mut ui);
+        assert!(matches!(ui.overlay, Some(Overlay::Confirm(_))));
+
+        // Confirm trash -> Beta is trashed, Alpha survives!
+        app.dispatch(Action::Input('y'), &mut ui);
+        assert!(tmp.path().join("Alpha.md").is_file());
+        assert!(!tmp.path().join("Beta.md").exists());
+    }
+
+    #[test]
+    fn p0_global_keymap_does_not_hijack_overlay_shortcuts() {
+        let km = KeyMap;
+        for (ch, expected) in [
+            ('y', Action::Input('y')),
+            ('G', Action::Input('G')),
+            ('?', Action::Input('?')),
+            ('.', Action::Input('.')),
+        ] {
+            let mods = if ch.is_ascii_uppercase() {
+                KeyModifiers::SHIFT
+            } else {
+                KeyModifiers::NONE
+            };
+            let act = key_to_action(
+                KeyEvent::new(KeyCode::Char(ch), mods),
+                Focus::Overlay,
+                CanvasMode::Note,
+                &km,
+                false,
+            );
+            assert_eq!(act, Some(expected), "char '{ch}' must reach overlay");
+        }
+        // Ctrl+C still triggers QuitConfirm inside overlays
+        let quit = key_to_action(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            Focus::Overlay,
+            CanvasMode::Note,
+            &km,
+            false,
+        );
+        assert_eq!(quit, Some(Action::QuitConfirm));
+    }
+
+    #[test]
+    fn p1_inspector_scroll_windowing_and_clickable_outline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut md = String::from("# Doc\n\n");
+        for i in 1..=12 {
+            md.push_str(&format!("## Heading {i}\n\nParagraph {i} with [[Link{i}]].\n\n"));
+        }
+        fs::write(tmp.path().join("Doc.md"), &md).unwrap();
+        let (mut app, mut ui) = make_harness(tmp.path(), "InspectorVault");
+        app.open_note(&mut ui, "Doc.md", false);
+
+        // Populate 10 backlinks to exercise backlink scroll windowing in a compact viewport
+        if let Some(detail) = app.active_note.as_mut() {
+            detail.backlinks = (0..10)
+                .map(|i| BacklinkEntry {
+                    source_path: format!("Src{i}.md"),
+                    source_title: format!("Source {i}"),
+                    context_snippet: format!("Snippet {i}"),
+                    heading: None,
+                    is_embed: false,
+                })
+                .collect();
+        }
+        ui.focus = Focus::Inspector;
+        ui.inspector_selected = 9; // last backlink
+        let map_bl = draw_frame(&app, &mut ui, 120, 26);
+        assert!(
+            map_bl.region_of(HitTarget::InspectorBacklink(9)).is_some(),
+            "selected backlink #9 must scroll into viewport"
+        );
+
+        // Select last outgoing link -> must scroll into viewport
+        let bl_len = app.active_note.as_ref().unwrap().backlinks.len();
+        let ol_len = app.active_note.as_ref().unwrap().outgoing_links.len();
+        ui.inspector_selected = bl_len + ol_len - 1;
+        let map_ol = draw_frame(&app, &mut ui, 120, 26);
+        assert!(
+            map_ol
+                .region_of(HitTarget::InspectorOutgoing(ol_len - 1))
+                .is_some(),
+            "selected outgoing link must scroll into viewport"
+        );
+
+        // Select last outline heading -> must scroll into viewport and clicking it jumps Canvas!
+        let h_len = app.active_note.as_ref().unwrap().parsed.headings.len();
+        let target_heading_idx = h_len - 1;
+        let target_line = app.active_note.as_ref().unwrap().parsed.headings[target_heading_idx].line_no;
+        ui.inspector_selected = bl_len + ol_len + target_heading_idx;
+        let map_h = draw_frame(&app, &mut ui, 120, 26);
+        let h_rect = map_h
+            .region_of(HitTarget::InspectorOutline(target_heading_idx))
+            .expect("selected outline heading must be visible & clickable");
+
+        app.dispatch(
+            Action::MouseClick {
+                col: h_rect.x + 2,
+                row: h_rect.y,
+            },
+            &mut ui,
+        );
+        assert_eq!(ui.focus, Focus::Canvas);
+        let jumped_block = &app.active_note.as_ref().unwrap().parsed.blocks[ui.canvas_selected_block];
+        assert!(jumped_block.line_no() >= target_line);
+    }
+
+    #[test]
+    fn p1_indented_task_checkbox_and_missing_image_index_alignment() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("Attachments")).unwrap();
+        fs::write(tmp.path().join("Attachments/real.png"), make_valid_png_bytes()).unwrap();
+        fs::write(
+            tmp.path().join("TasksAndImages.md"),
+            "# TasksAndImages\n\n    - [ ] Indented task\n\n![[missing.png]]\n\n![[real.png]]\n",
+        )
+        .unwrap();
+
+        let (mut app, mut ui) = make_harness(tmp.path(), "TaskImgVault");
+        app.open_note(&mut ui, "TasksAndImages.md", false);
+        ui.focus = Focus::Sidebar;
+        let hitmap = draw_frame(&app, &mut ui, 120, 34);
+
+        // 1. Indented task checkbox (indent=4): checkbox is at x_off = 6..8, well past old width 6!
+        let task_line_no = app.active_note.as_ref().unwrap().parsed.tasks[0].line_no;
+        let chk_rect = hitmap
+            .region_of(HitTarget::TaskCheckbox {
+                line_no: task_line_no,
+            })
+            .expect("indented task checkbox hit target");
+        assert!(
+            chk_rect.width >= 10,
+            "expected hit width >= indent(4)+6=10, got {}",
+            chk_rect.width
+        );
+        // Clicking right on the indented checkbox (`x + 7`) toggles it AND focuses Canvas!
+        app.dispatch(
+            Action::MouseClick {
+                col: chk_rect.x + 7,
+                row: chk_rect.y,
+            },
+            &mut ui,
+        );
+        assert_eq!(ui.focus, Focus::Canvas);
+        assert!(app.active_note.as_ref().unwrap().parsed.tasks[0].checked);
+
+        // 2. Missing image must NOT shift `real.png`'s ImageChip index (must be ImageChip(0) matching detail.images[0]).
+        assert_eq!(app.active_note.as_ref().unwrap().images.len(), 1);
+        assert!(hitmap.region_of(HitTarget::ImageChip(0)).is_some());
+        assert!(
+            hitmap.region_of(HitTarget::ImageChip(1)).is_none(),
+            "missing image must not shift real.png to ImageChip(1)"
+        );
+
+        // 3. Sidebar Tasks tab checkbox click toggles task directly.
+        app.dispatch(Action::SetSidebarTab(SidebarTab::Tasks), &mut ui);
+        let task_map = draw_frame(&app, &mut ui, 120, 34);
+        let sb_chk = task_map
+            .region_of(HitTarget::SidebarTaskCheckbox(0))
+            .expect("sidebar task checkbox");
+        app.dispatch(
+            Action::MouseClick {
+                col: sb_chk.x + 1,
+                row: sb_chk.y,
+            },
+            &mut ui,
+        );
+        assert!(!app.active_note.as_ref().unwrap().parsed.tasks[0].checked);
+    }
+
+    #[test]
+    fn p1_switch_vault_resets_state_and_core_event_ignores_other_vault() {
+        let tmp = tempfile::tempdir().unwrap();
+        let v1_dir = tmp.path().join("VaultOne");
+        let v2_dir = tmp.path().join("VaultTwo");
+        fs::create_dir_all(v1_dir.join("Sub")).unwrap();
+        fs::create_dir_all(&v2_dir).unwrap();
+        fs::write(v1_dir.join("Sub/One.md"), "# One\n\n#alpha\n").unwrap();
+        fs::write(v2_dir.join("Two.md"), "# Two\n\nHello vault 2.\n").unwrap();
+
+        let (mut app, mut ui) = make_harness(&v1_dir, "VaultOne");
+        let v2 = vault_from_dir(&v2_dir, Some("VaultTwo"));
+        app.vaults.push(v2.clone());
+
+        ui.active_tag_filter = Some("alpha".into());
+        ui.collapsed_folders.insert("Sub".into());
+        ui.sidebar_selected = 5;
+        ui.canvas_selected_block = 3;
+        ui.canvas_scroll = 12;
+        ui.inspector_selected = 4;
+        ui.graph_selected = 2;
+
+        // CoreEvent for another vault must NOT overwrite last_index_stats
+        let foreign_stats = IndexStats {
+            vault_id: "unrelated-vault-id".into(),
+            vault_name: "Other".into(),
+            total_notes: 999,
+            ..IndexStats::default()
+        };
+        app.handle_core_event(CoreEvent::VaultIndexed { stats: foreign_stats }, &mut ui);
+        assert!(app.last_index_stats.is_none());
+
+        // SwitchVault clears filters, collapsed folders, and resets selections/scroll!
+        app.dispatch(Action::SwitchVault(v2.id.clone()), &mut ui);
+        assert_eq!(app.active_vault.id, v2.id);
+        assert!(ui.active_tag_filter.is_none());
+        assert!(ui.collapsed_folders.is_empty());
+        assert_eq!(ui.sidebar_selected, 0);
+        assert_eq!(ui.canvas_selected_block, 0);
+        assert_eq!(ui.canvas_scroll, 0);
+        assert_eq!(ui.inspector_selected, 0);
+        assert_eq!(ui.graph_selected, 0);
+    }
+
+    #[test]
+    fn p1_image_settings_preserve_cell_px_and_populate_inline_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("Attachments")).unwrap();
+        fs::write(tmp.path().join("Attachments/pic.png"), make_valid_png_bytes()).unwrap();
+        fs::write(tmp.path().join("Pic.md"), "# Pic\n\n![[pic.png]]\n").unwrap();
+
+        let (mut app, mut ui) = make_harness(tmp.path(), "ImgSettingsVault");
+        app.cfg.inline_images = false;
+        app.preview_cache.clear();
+        app.graphics_caps.cell_px = (9, 18);
+        app.graphics_caps.cell_px_exact = true;
+
+        // Turning inline_images ON populates preview_cache for active_note
+        app.dispatch(Action::ToggleInlineImages, &mut ui);
+        assert!(app.cfg.inline_images);
+        assert!(!app.preview_cache.is_empty());
+
+        // SetImageProtocol preserves probed cell_px/cell_px_exact and re-populates inline cache
+        app.dispatch(
+            Action::SetImageProtocol(ImageProtocolPreference::Halfblock),
+            &mut ui,
+        );
+        assert_eq!(app.graphics_caps.protocol, TerminalImageProtocol::Halfblock);
+        assert_eq!(app.graphics_caps.cell_px, (9, 18));
+        assert!(app.graphics_caps.cell_px_exact);
+        assert!(!app.preview_cache.is_empty());
+    }
+
+    #[test]
+    fn p1_inline_editor_focus_switch_and_backlink_bookmark_freshness() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("NoteA.md"), "# NoteA\n\nInitial text.\n").unwrap();
+        fs::write(tmp.path().join("NoteB.md"), "# NoteB\n\nPlain.\n").unwrap();
+        let (mut app, mut ui) = make_harness(tmp.path(), "InlineVault");
+        app.open_note(&mut ui, "NoteA.md", false);
+
+        // Start inline edit and make it dirty
+        app.dispatch(Action::OpenNoteEditor, &mut ui);
+        assert!(ui.inline_editor.is_some());
+        app.dispatch(Action::Input('!'), &mut ui);
+        assert!(ui.inline_editor.as_ref().unwrap().dirty);
+
+        // External bookmark + new incoming backlink from NoteB while inline editor is dirty
+        app.storage
+            .toggle_bookmark(&app.active_vault.id, "NoteA.md")
+            .unwrap();
+        fs::write(tmp.path().join("NoteB.md"), "# NoteB\n\nSee [[NoteA]].\n").unwrap();
+        app.storage.sync_vault(&app.active_vault).unwrap();
+        app.reload_from_storage(&mut ui);
+
+        let active = app.active_note.as_ref().unwrap();
+        assert!(active.summary.is_bookmarked);
+        assert_eq!(active.backlinks.len(), 1);
+        assert!(ui.inline_editor.as_ref().unwrap().dirty);
+
+        // Clicking Sidebar pane flushes & exits inline editor cleanly before moving focus
+        let map = draw_frame(&app, &mut ui, 120, 34);
+        let sb_rect = map
+            .region_of(HitTarget::Pane(Focus::Sidebar))
+            .expect("sidebar pane");
+        app.dispatch(
+            Action::MouseClick {
+                col: sb_rect.x + 1,
+                row: sb_rect.bottom().saturating_sub(1),
+            },
+            &mut ui,
+        );
+        assert!(ui.inline_editor.is_none());
+        assert_eq!(ui.focus, Focus::Sidebar);
+    }
+
+    #[test]
+    fn p1_overlay_mouse_wheel_help_clamp_and_pane_paging() {
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..15 {
+            fs::write(tmp.path().join(format!("N{i:02}.md")), format!("# N{i:02}\n")).unwrap();
+        }
+        let (mut app, mut ui) = make_harness(tmp.path(), "ScrollVault");
+
+        // PageDown/PageUp/JumpBottom/JumpTop respect Sidebar focus
+        ui.focus = Focus::Sidebar;
+        ui.sidebar_selected = 0;
+        app.dispatch(Action::PageDown, &mut ui);
+        assert_eq!(ui.sidebar_selected, 10);
+        app.dispatch(Action::JumpBottom, &mut ui);
+        assert_eq!(ui.sidebar_selected, 14);
+        app.dispatch(Action::JumpTop, &mut ui);
+        assert_eq!(ui.sidebar_selected, 0);
+
+        // Help overlay clamps scroll and supports PageDown/PageUp/End/Home
+        app.dispatch(Action::OpenOverlay(OverlayKind::Help), &mut ui);
+        app.dispatch(Action::CursorEnd, &mut ui);
+        draw_frame(&app, &mut ui, 100, 28);
+        let clamped_after_end = match ui.overlay {
+            Some(Overlay::Help { scroll }) => scroll,
+            _ => panic!("expected Help overlay"),
+        };
+        app.dispatch(Action::MouseScrollDown { col: 50, row: 14 }, &mut ui);
+        draw_frame(&app, &mut ui, 100, 28);
+        if let Some(Overlay::Help { scroll }) = ui.overlay {
+            assert_eq!(scroll, clamped_after_end, "Help scroll must clamp to max");
+        }
+        app.dispatch(Action::CursorHome, &mut ui);
+        assert!(matches!(ui.overlay, Some(Overlay::Help { scroll: 0 })));
+        app.dispatch(Action::CloseOverlay, &mut ui);
+
+        // Mouse wheel works in QuickSwitcher and Settings overlays
+        app.dispatch(Action::OpenOverlay(OverlayKind::Settings), &mut ui);
+        app.dispatch(Action::MouseScrollDown { col: 50, row: 14 }, &mut ui);
+        assert!(matches!(
+            ui.overlay,
+            Some(Overlay::Settings(ref s)) if s.selected == 1
+        ));
+        app.dispatch(Action::MouseScrollUp { col: 50, row: 14 }, &mut ui);
+        assert!(matches!(
+            ui.overlay,
+            Some(Overlay::Settings(ref s)) if s.selected == 0
+        ));
     }
 }

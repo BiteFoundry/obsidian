@@ -79,21 +79,40 @@ impl Overlay {
             Self::NoteForm(ov) => ov.handle(action),
             Self::Confirm(ov) => ov.handle(action),
             Self::ContextMenu(ov) => ov.handle(action),
-            Self::Help { scroll } => match action {
-                Action::CloseOverlay | Action::Input('q') | Action::Input('?') => {
-                    OverlayOutcome::Close
+            Self::Help { scroll } => {
+                let max_cap = help_total_lines().saturating_sub(1).min(u16::MAX as usize) as u16;
+                match action {
+                    Action::CloseOverlay | Action::Input('q') | Action::Input('?') => {
+                        OverlayOutcome::Close
+                    }
+                    Action::MoveDown | Action::Input('j') | Action::MouseScrollDown { .. } => {
+                        *scroll = scroll.saturating_add(1).min(max_cap);
+                        OverlayOutcome::Handled
+                    }
+                    Action::MoveUp | Action::Input('k') | Action::MouseScrollUp { .. } => {
+                        *scroll = scroll.saturating_sub(1);
+                        OverlayOutcome::Handled
+                    }
+                    Action::PageDown => {
+                        *scroll = scroll.saturating_add(10).min(max_cap);
+                        OverlayOutcome::Handled
+                    }
+                    Action::PageUp => {
+                        *scroll = scroll.saturating_sub(10);
+                        OverlayOutcome::Handled
+                    }
+                    Action::CursorHome | Action::JumpTop | Action::Input('g') => {
+                        *scroll = 0;
+                        OverlayOutcome::Handled
+                    }
+                    Action::CursorEnd | Action::JumpBottom | Action::Input('G') => {
+                        *scroll = max_cap;
+                        OverlayOutcome::Handled
+                    }
+                    Action::Quit | Action::QuitConfirm => OverlayOutcome::NotHandled,
+                    _ => OverlayOutcome::Handled,
                 }
-                Action::MoveDown | Action::Input('j') | Action::MouseScrollDown { .. } => {
-                    *scroll = scroll.saturating_add(1);
-                    OverlayOutcome::Handled
-                }
-                Action::MoveUp | Action::Input('k') | Action::MouseScrollUp { .. } => {
-                    *scroll = scroll.saturating_sub(1);
-                    OverlayOutcome::Handled
-                }
-                Action::Quit | Action::QuitConfirm => OverlayOutcome::NotHandled,
-                _ => OverlayOutcome::Handled,
-            },
+            }
         }
     }
 
@@ -116,9 +135,16 @@ impl Overlay {
             Self::NoteForm(ov) => ov.draw(frame, area, ui, hitmap),
             Self::Confirm(ov) => ov.draw(frame, area, ui, hitmap),
             Self::ContextMenu(ov) => ov.draw(frame, area, ui, hitmap),
-            Self::Help { scroll } => draw_help_overlay(frame, area, ui, hitmap, *scroll),
+            Self::Help { scroll } => draw_help_overlay(frame, area, ui, hitmap, scroll),
         }
     }
+}
+
+fn help_total_lines() -> usize {
+    HELP_SECTIONS
+        .iter()
+        .map(|(_, items)| items.len() + 2)
+        .sum()
 }
 
 pub fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
@@ -134,7 +160,7 @@ fn draw_help_overlay(
     area: Rect,
     ui: &UiState,
     hitmap: &mut HitMap,
-    scroll: u16,
+    scroll: &mut u16,
 ) {
     let theme = &ui.theme;
     let rect = centered_rect(
@@ -198,5 +224,11 @@ fn draw_help_overlay(
         lines.push(Line::from(""));
     }
 
-    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), inner);
+    let max_scroll = lines
+        .len()
+        .saturating_sub(inner.height as usize)
+        .min(u16::MAX as usize) as u16;
+    *scroll = (*scroll).min(max_scroll);
+
+    frame.render_widget(Paragraph::new(lines).scroll((*scroll, 0)), inner);
 }

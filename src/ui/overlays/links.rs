@@ -113,6 +113,20 @@ impl LinkExtractorOverlay {
                 }
                 OverlayOutcome::Handled
             }
+            Action::MouseScrollUp { .. } => {
+                if !self.links.is_empty() {
+                    let cur = self.selected.min(self.links.len() - 1);
+                    self.selected = cur.saturating_sub(1);
+                }
+                OverlayOutcome::Handled
+            }
+            Action::MouseScrollDown { .. } => {
+                if !self.links.is_empty() {
+                    let cur = self.selected.min(self.links.len() - 1);
+                    self.selected = (cur + 1).min(self.links.len() - 1);
+                }
+                OverlayOutcome::Handled
+            }
             Action::Activate | Action::OverlaySubmit => {
                 let Some(link) = self.current() else {
                     return OverlayOutcome::Close;

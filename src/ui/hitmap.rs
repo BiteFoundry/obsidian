@@ -42,6 +42,7 @@ pub enum HitTarget {
     Pane(Focus),
     SidebarTab(SidebarTab),
     SidebarRow(usize),
+    SidebarTaskCheckbox(usize),
     CanvasBlock(usize),
     InlineEditorBody,
     TaskCheckbox { line_no: usize },
@@ -52,7 +53,9 @@ pub enum HitTarget {
     GraphNode(usize),
     InspectorBacklink(usize),
     InspectorOutgoing(usize),
+    InspectorOutline(usize),
     Button(ButtonId),
+    OverlayBackdrop,
     OverlayBody,
     OverlayItem { index: usize },
 }
