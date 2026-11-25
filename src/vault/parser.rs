@@ -22,7 +22,7 @@ use crate::models::{
     WikilinkRef,
 };
 
-const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp"];
+const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"];
 
 pub fn is_image_target(target: &str) -> bool {
     let base = target
@@ -35,7 +35,7 @@ pub fn is_image_target(target: &str) -> bool {
         return false;
     };
     let lower = ext.to_ascii_lowercase();
-    if matches!(lower.as_str(), "svg" | "html" | "htm" | "xhtml") {
+    if matches!(lower.as_str(), "html" | "htm" | "xhtml") {
         return false;
     }
     IMAGE_EXTENSIONS.contains(&lower.as_str())
@@ -1277,22 +1277,22 @@ Inline code `#ignore-tag` and `[[ignore-link]]` stay literal.
     }
 
     #[test]
-    fn test_is_image_target_rejects_html_and_svg() {
+    fn test_is_image_target_accepts_svg_and_rejects_html() {
         assert!(is_image_target("diagram.png"));
         assert!(is_image_target("assets/photo.JPEG?v=2#top"));
         assert!(is_image_target("anim.gif"));
         assert!(is_image_target("pic.webp"));
         assert!(is_image_target("scan.bmp"));
+        assert!(is_image_target("vector.svg"));
+        assert!(is_image_target("icons/logo.SVG?raw=1"));
 
-        // Must never classify SVG or HTML/HTM as raster images
-        assert!(!is_image_target("vector.svg"));
-        assert!(!is_image_target("icons/logo.SVG?raw=1"));
+        // Must never classify HTML/HTM/XHTML or Markdown as images
         assert!(!is_image_target("page.html"));
         assert!(!is_image_target("report.HTM"));
         assert!(!is_image_target("doc.xhtml"));
         assert!(!is_image_target("Note.md"));
 
-        // Standalone embeds of .svg / .html must not produce ImageEmbed blocks
+        // Standalone embeds of .svg / .png produce ImageEmbed blocks; .html does not
         let parsed = parse_markdown(
             "Test.md",
             "Test",
@@ -1306,6 +1306,6 @@ Inline code `#ignore-tag` and `[[ignore-link]]` stay literal.
                 _ => None,
             })
             .collect();
-        assert_eq!(img_embeds, vec!["photo.png"]);
+        assert_eq!(img_embeds, vec!["diagram.svg", "logo.svg", "photo.png"]);
     }
 }

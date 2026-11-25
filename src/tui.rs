@@ -262,10 +262,14 @@ impl PixelLayerTracker {
     }
 }
 
-/// Overlay Z-order guard: only allows modal pixel graphics when `ImagePreview` is the active overlay.
+/// Overlay Z-order guard: allows modal pixel graphics for `ImagePreview`, inline HTML graphics
+/// (`html:`) for `HtmlPreview`, and inline note graphics (`inline:`) when no overlay is open.
 fn pixel_graphics_allowed_for_overlays(overlay: Option<&Overlay>, cache_key: &str) -> bool {
     match overlay {
-        Some(Overlay::ImagePreview(_)) => !cache_key.starts_with("inline:"),
+        Some(Overlay::ImagePreview(_)) => {
+            !cache_key.starts_with("inline:") && !cache_key.starts_with("html:")
+        }
+        Some(Overlay::HtmlPreview(_)) => cache_key.starts_with("html:"),
         None => cache_key.starts_with("inline:"),
         Some(_) => false,
     }
@@ -493,65 +497,85 @@ fn draw_frame(
         let mut desired: Vec<ActivePixelGraphic> = Vec::new();
         let mut resolved_payloads: Vec<(ActivePixelGraphic, String)> = Vec::new();
 
-        if let Some(pending) = ui.pending_pixel.take() {
-            if pixel_graphics_allowed_for_overlays(ui.overlay.as_ref(), &pending.cache_key) {
-                let (base_key, crop) = parse_pixel_key(&pending.cache_key);
-                if let Some(rendered) = app.preview_cache.get(base_key) {
-                    // Never allow pixel graphics to touch the bottom-most status row (`term_height - 1`).
-                    let safe_max_h = ui
-                        .term_height
-                        .saturating_sub(1)
-                        .saturating_sub(pending.rect.y);
-                    let safe_max_w = ui.term_width.saturating_sub(pending.rect.x);
-                    let fit_w = pending.rect.width.min(safe_max_w);
-                    let fit_h = pending.rect.height.min(safe_max_h);
+        for pending in std::mem::take(&mut ui.pending_pixel_graphics) {
+            if !pixel_graphics_allowed_for_overlays(ui.overlay.as_ref(), &pending.cache_key) {
+                continue;
+            }
+            // Never allow pixel graphics to touch the bottom-most status row (`term_height - 1`).
+            let safe_max_h = ui
+                .term_height
+                .saturating_sub(1)
+                .saturating_sub(pending.rect.y);
+            let safe_max_w = ui.term_width.saturating_sub(pending.rect.x);
+            let fit_w = pending.rect.width.min(safe_max_w);
+            let fit_h = pending.rect.height.min(safe_max_h);
 
-                    if fit_w >= 4 && fit_h >= 2 {
-                        let resolved: Option<(Cow<'_, str>, u16, u16)> =
-                            if let Some((sx, sy, vw, vh)) = crop {
-                                let eff_vw = vw.min(safe_max_w);
-                                let eff_vh = vh.min(safe_max_h);
-                                rendered
-                                    .viewport_pixel_payload(sx, sy, eff_vw, eff_vh)
-                                    .map(|(p, dw, dh)| (Cow::Owned(p), dw, dh))
-                                    .or_else(|| {
-                                        if rendered.cols <= eff_vw && rendered.rows <= eff_vh {
-                                            rendered.pixel_payload.as_deref().map(|p| {
-                                                (Cow::Borrowed(p), rendered.cols, rendered.rows)
-                                            })
-                                        } else {
-                                            None
-                                        }
-                                    })
-                            } else if rendered.cols <= fit_w && rendered.rows <= fit_h {
-                                rendered
-                                    .pixel_payload
-                                    .as_deref()
-                                    .map(|p| (Cow::Borrowed(p), rendered.cols, rendered.rows))
-                            } else {
-                                rendered
-                                    .viewport_pixel_payload(0, 0, fit_w, fit_h)
-                                    .map(|(p, dw, dh)| (Cow::Owned(p), dw, dh))
-                            };
+            if fit_w == 0 || fit_h == 0 {
+                continue;
+            }
 
-                        if let Some((payload, draw_cols, draw_rows)) = resolved {
-                            let graphic = ActivePixelGraphic {
-                                cache_key: pending.cache_key,
-                                rect: Rect::new(
-                                    pending.rect.x,
-                                    pending.rect.y,
-                                    draw_cols,
-                                    draw_rows,
-                                ),
-                                protocol: pending.protocol,
-                                cols: draw_cols,
-                                rows: draw_rows,
-                                payload_len: payload.len(),
-                            };
-                            desired.push(graphic.clone());
-                            resolved_payloads.push((graphic, payload.into_owned()));
-                        }
-                    }
+            if let Some(direct_payload) = pending.payload {
+                if direct_payload.is_empty() {
+                    continue;
+                }
+                let graphic = ActivePixelGraphic {
+                    cache_key: pending.cache_key,
+                    rect: Rect::new(pending.rect.x, pending.rect.y, fit_w, fit_h),
+                    protocol: pending.protocol,
+                    cols: fit_w,
+                    rows: fit_h,
+                    payload_len: direct_payload.len(),
+                };
+                desired.push(graphic.clone());
+                resolved_payloads.push((graphic, direct_payload));
+                continue;
+            }
+
+            if fit_w < 4 || fit_h < 2 {
+                continue;
+            }
+
+            let (base_key, crop) = parse_pixel_key(&pending.cache_key);
+            if let Some(rendered) = app.preview_cache.get(base_key) {
+                let resolved: Option<(Cow<'_, str>, u16, u16)> =
+                    if let Some((sx, sy, vw, vh)) = crop {
+                        let eff_vw = vw.min(safe_max_w);
+                        let eff_vh = vh.min(safe_max_h);
+                        rendered
+                            .viewport_pixel_payload(sx, sy, eff_vw, eff_vh)
+                            .map(|(p, dw, dh)| (Cow::Owned(p), dw, dh))
+                            .or_else(|| {
+                                if rendered.cols <= eff_vw && rendered.rows <= eff_vh {
+                                    rendered
+                                        .pixel_payload
+                                        .as_deref()
+                                        .map(|p| (Cow::Borrowed(p), rendered.cols, rendered.rows))
+                                } else {
+                                    None
+                                }
+                            })
+                    } else if rendered.cols <= fit_w && rendered.rows <= fit_h {
+                        rendered
+                            .pixel_payload
+                            .as_deref()
+                            .map(|p| (Cow::Borrowed(p), rendered.cols, rendered.rows))
+                    } else {
+                        rendered
+                            .viewport_pixel_payload(0, 0, fit_w, fit_h)
+                            .map(|(p, dw, dh)| (Cow::Owned(p), dw, dh))
+                    };
+
+                if let Some((payload, draw_cols, draw_rows)) = resolved {
+                    let graphic = ActivePixelGraphic {
+                        cache_key: pending.cache_key,
+                        rect: Rect::new(pending.rect.x, pending.rect.y, draw_cols, draw_rows),
+                        protocol: pending.protocol,
+                        cols: draw_cols,
+                        rows: draw_rows,
+                        payload_len: payload.len(),
+                    };
+                    desired.push(graphic.clone());
+                    resolved_payloads.push((graphic, payload.into_owned()));
                 }
             }
         }
@@ -584,7 +608,7 @@ fn draw_frame(
             terminal.draw(|f| {
                 let _ = ui::draw(f, app, ui);
             })?;
-            ui.pending_pixel = None;
+            ui.pending_pixel_graphics.clear();
         }
 
         if plan.emit_desired {
@@ -911,6 +935,13 @@ mod tests {
         };
         let img_ov =
             Overlay::ImagePreview(ImagePreviewOverlay::from_note(&detail, Some(0)).unwrap());
+        let html_ov = Overlay::HtmlPreview(
+            crate::ui::overlays::html_preview::HtmlPreviewOverlay::new(
+                "Doc",
+                "doc.html",
+                "<p>hi</p>".to_string(),
+            ),
+        );
         let help_ov = Overlay::Help { scroll: 0 };
 
         assert!(pixel_graphics_allowed_for_overlays(
@@ -922,8 +953,24 @@ mod tests {
             "inline:photo.png"
         ));
         assert!(!pixel_graphics_allowed_for_overlays(
+            Some(&img_ov),
+            "html:1:80x6:Sixel"
+        ));
+        assert!(pixel_graphics_allowed_for_overlays(
+            Some(&html_ov),
+            "html:1:80x6:Sixel"
+        ));
+        assert!(!pixel_graphics_allowed_for_overlays(
+            Some(&html_ov),
+            "modal:photo.png:80:100:Sixel"
+        ));
+        assert!(!pixel_graphics_allowed_for_overlays(
             Some(&help_ov),
             "modal:photo.png:80:100:Sixel"
+        ));
+        assert!(!pixel_graphics_allowed_for_overlays(
+            Some(&help_ov),
+            "html:1:80x6:Sixel"
         ));
         assert!(!pixel_graphics_allowed_for_overlays(
             None,

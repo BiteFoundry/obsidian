@@ -105,6 +105,8 @@ pub struct PendingPixelGraphic {
     pub cache_key: String,
     pub rect: ratatui::layout::Rect,
     pub protocol: TerminalImageProtocol,
+    /// Optional pre-encoded terminal graphics payload (used by `HtmlPreviewOverlay` inline graphics).
+    pub payload: Option<String>,
 }
 
 enum EditorDiskState {
@@ -161,7 +163,7 @@ pub struct UiState {
     pub overlay: Option<Overlay>,
     pub toasts: ToastQueue,
     pub keymap: KeyMap,
-    pub pending_pixel: Option<PendingPixelGraphic>,
+    pub pending_pixel_graphics: Vec<PendingPixelGraphic>,
     pub cursor_pos: Option<(u16, u16)>,
     pub term_width: u16,
     pub term_height: u16,
@@ -196,7 +198,7 @@ impl UiState {
             overlay: None,
             toasts: ToastQueue::new(),
             keymap: KeyMap,
-            pending_pixel: None,
+            pending_pixel_graphics: Vec::new(),
             cursor_pos: None,
             term_width: 120,
             term_height: 34,
@@ -550,9 +552,10 @@ impl AppState {
             let prefix = format!("inline:{}:", img.abs_path.to_string_lossy());
             self.preview_cache.retain(|k, _| !k.starts_with(&prefix));
             if let Ok(bytes) = fs::read(&img.abs_path) {
-                if sniff_content_kind(Some(&img.mime_type), Some(&img.display_name), Some(&bytes))
-                    != ContentKind::RasterImage
-                {
+                if !matches!(
+                    sniff_content_kind(Some(&img.mime_type), Some(&img.display_name), Some(&bytes)),
+                    ContentKind::RasterImage | ContentKind::Svg
+                ) {
                     continue;
                 }
                 if let Ok(rendered) = decode_and_render_halfblocks_with_cell_px(

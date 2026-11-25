@@ -23,10 +23,14 @@ use crate::{
     ui::{
         app::{AppState, Focus, UiState},
         hitmap::{ButtonId, HitMap, HitTarget},
-        overlays::html_preview::{block_is_html, is_html_code_language, note_has_html},
+        overlays::html_preview::{
+            block_is_html, extract_raw_block_text, html_theme_from_ui, is_html_code_language,
+            note_has_html,
+        },
         theme::Theme,
         truncate_width,
     },
+    vault::parser::spans_to_plain,
 };
 
 struct RenderedLine {
@@ -413,6 +417,11 @@ fn build_canvas_lines(
                 if block_is_html(detail, b_idx) {
                     let pill = "[H: HTML]";
                     let pill_w = unicode_width::UnicodeWidthStr::width(pill) as u16;
+                    let card_bg = if is_sel {
+                        theme.bg_selected
+                    } else {
+                        theme.bg_card
+                    };
                     out.push(RenderedLine {
                         line: Line::from(vec![
                             Span::styled(" ◈ Embedded HTML · ", theme.muted_style()),
@@ -430,12 +439,103 @@ fn build_canvas_lines(
                         image_idx: None,
                         html_pill: Some((19, pill_w, b_idx)),
                         action_pills: Vec::new(),
-                        bg_override: Some(if is_sel {
-                            theme.bg_selected
-                        } else {
-                            theme.bg_card
-                        }),
+                        bg_override: Some(card_bg),
                     });
+
+                    // Render ONLY a sanitized `bitefoundry_html::render_dom()` summary preview (max 8 lines).
+                    // Never fall through to raw `render_inline_spans()`.
+                    let raw_html = extract_raw_block_text(detail, b_idx)
+                        .unwrap_or_else(|| spans_to_plain(spans));
+                    let doc = bitefoundry_html::DomDocument::parse(&raw_html);
+                    let html_theme = html_theme_from_ui(theme);
+                    let preview_w = width.saturating_sub(2).clamp(12, u16::MAX as usize) as u16;
+                    let rendered_html = bitefoundry_html::render_dom(
+                        &doc,
+                        preview_w,
+                        &html_theme,
+                        None,
+                        None,
+                        ui.show_inline_hrefs,
+                    );
+                    let non_blank: Vec<Line<'static>> = rendered_html
+                        .lines
+                        .into_iter()
+                        .filter(|l| l.spans.iter().any(|s| !s.content.trim().is_empty()))
+                        .collect();
+
+                    const MAX_HTML_PREVIEW_LINES: usize = 8;
+                    let prefix_span = if is_sel {
+                        Span::styled(
+                            "▎ ",
+                            Style::default()
+                                .fg(theme.accent)
+                                .add_modifier(Modifier::BOLD),
+                        )
+                    } else {
+                        Span::styled("  ", theme.muted_style())
+                    };
+
+                    if non_blank.is_empty() {
+                        if !rendered_html.graphics.is_empty() {
+                            out.push(RenderedLine {
+                                line: Line::from(vec![
+                                    prefix_span,
+                                    Span::styled(
+                                        "◇ Embedded graphic · press H to view",
+                                        theme.muted_style(),
+                                    ),
+                                ]),
+                                block_idx: Some(b_idx),
+                                task_checkbox: None,
+                                has_wikilink: false,
+                                image_idx: None,
+                                html_pill: None,
+                                action_pills: Vec::new(),
+                                bg_override: sel_bg,
+                            });
+                        }
+                    } else {
+                        let truncated = non_blank.len() > MAX_HTML_PREVIEW_LINES;
+                        let take_n = if truncated {
+                            MAX_HTML_PREVIEW_LINES - 1
+                        } else {
+                            non_blank.len()
+                        };
+                        for mut line in non_blank.into_iter().take(take_n) {
+                            line.spans.insert(0, prefix_span.clone());
+                            out.push(RenderedLine {
+                                line,
+                                block_idx: Some(b_idx),
+                                task_checkbox: None,
+                                has_wikilink: false,
+                                image_idx: None,
+                                html_pill: None,
+                                action_pills: Vec::new(),
+                                bg_override: sel_bg,
+                            });
+                        }
+                        if truncated {
+                            out.push(RenderedLine {
+                                line: Line::from(vec![
+                                    prefix_span,
+                                    Span::styled(
+                                        "… press H for full HTML preview",
+                                        theme.muted_style(),
+                                    ),
+                                ]),
+                                block_idx: Some(b_idx),
+                                task_checkbox: None,
+                                has_wikilink: false,
+                                image_idx: None,
+                                html_pill: None,
+                                action_pills: Vec::new(),
+                                bg_override: sel_bg,
+                            });
+                        }
+                    }
+
+                    push_plain(&mut out, Line::from(""), None);
+                    continue;
                 }
                 let mut rendered = render_inline_spans(
                     spans,
@@ -1033,4 +1133,85 @@ fn wrap_spans(spans: Vec<Span<'static>>, max_width: usize) -> Vec<Line<'static>>
         lines.push(Line::from(current));
     }
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::sync::{mpsc, watch};
+
+    use super::*;
+    use crate::{
+        config::AppConfig,
+        models::{NoteDetail, NoteSummary},
+        storage::Storage,
+        sync::{FocusTarget, SyncCommand, SyncController},
+        vault::{parser::parse_markdown, vault_from_dir},
+    };
+
+    #[test]
+    fn test_embedded_html_paragraph_leaks_zero_raw_tags_css_or_svg_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault = vault_from_dir(tmp.path(), Some("HtmlLeakVault"));
+        let cfg = AppConfig::default();
+        let storage = Storage::open_in_memory().unwrap();
+        let (focus_tx, _focus_rx) = watch::channel(FocusTarget::default());
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel::<SyncCommand>();
+        let sync_ctrl = SyncController::from_channels(focus_tx, cmd_tx);
+        let app = AppState::new(cfg.clone(), vault, storage, sync_ctrl);
+        let ui = UiState::from_config(&cfg);
+
+        let md = "# Embedded HTML Test\n\n<div><style>.x{color:red}</style><svg><desc>secret</desc><rect width=\"10\" height=\"10\"/></svg><p>Hi</p></div>\n";
+        let parsed = parse_markdown("Embed.md", "Embedded HTML Test", md);
+        let detail = NoteDetail {
+            summary: NoteSummary {
+                rel_path: "Embed.md".into(),
+                title: "Embedded HTML Test".into(),
+                ..Default::default()
+            },
+            raw_markdown: md.to_string(),
+            parsed,
+            backlinks: Vec::new(),
+            outgoing_links: Vec::new(),
+            images: Vec::new(),
+        };
+
+        let rendered = build_canvas_lines(&detail, &app, &ui, &ui.theme, 80, 0, true);
+        let full_text: String = rendered
+            .iter()
+            .map(|rl| {
+                rl.line
+                    .spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            full_text.contains("◈ Embedded HTML"),
+            "expected Embedded HTML banner in:\n{full_text}"
+        );
+        assert!(
+            full_text.contains("Hi"),
+            "expected sanitized paragraph text 'Hi' in:\n{full_text}"
+        );
+        for forbidden in [
+            "<div",
+            "<style",
+            ".x{color:red}",
+            "color:red",
+            "<svg",
+            "<desc>",
+            "secret",
+            "<rect",
+            "<p>",
+            "</div>",
+        ] {
+            assert!(
+                !full_text.contains(forbidden),
+                "raw HTML/CSS/SVG leak detected ({forbidden}) in:\n{full_text}"
+            );
+        }
+    }
 }

@@ -1346,18 +1346,32 @@ pub fn looks_like_html_bytes(bytes: &[u8]) -> bool {
     false
 }
 
-fn reject_html_or_svg_bytes(bytes: &[u8]) -> Result<()> {
-    if looks_like_svg_bytes(bytes) {
-        bail!("Unsupported vector image format: SVG markup cannot be decoded as a raster image");
-    }
+fn reject_html_bytes(bytes: &[u8]) -> Result<()> {
     if looks_like_html_bytes(bytes) {
         bail!("Received HTML document instead of raster image data");
     }
     Ok(())
 }
 
-/// Returns true if a MIME type or filename looks like a supported raster image (`png`, `jpeg`, `jpg`, `gif`, `webp`, `bmp`).
-/// Explicitly rejects HTML (`.html`, `.htm`, `.xhtml`, `text/html`) and SVG (`.svg`, `image/svg+xml`).
+fn svg_raster_bounds(fit: FitBox, cell_px: (u16, u16)) -> (u32, u32) {
+    let zoom = fit.zoom_pct.clamp(25, 300) as u32;
+    let max_w = (fit.view_cols.max(4) as u32)
+        .saturating_mul(cell_px.0.max(1) as u32)
+        .saturating_mul(zoom)
+        / 100;
+    let max_h = if fit.scrollable {
+        2048
+    } else {
+        (fit.view_rows.max(2) as u32)
+            .saturating_mul(cell_px.1.max(1) as u32)
+            .saturating_mul(zoom)
+            / 100
+    };
+    (max_w.clamp(64, 2048), max_h.clamp(64, 2048))
+}
+
+/// Returns true if a MIME type or filename looks like a supported image (`png`, `jpeg`, `jpg`, `gif`, `webp`, `bmp`, `svg`).
+/// Explicitly rejects HTML (`.html`, `.htm`, `.xhtml`, `text/html`, `application/xhtml+xml`).
 pub fn is_image_mime_or_name(content_type: &str, file_name: Option<&str>) -> bool {
     let ct = content_type
         .split(';')
@@ -1365,10 +1379,7 @@ pub fn is_image_mime_or_name(content_type: &str, file_name: Option<&str>) -> boo
         .unwrap_or(content_type)
         .trim()
         .to_ascii_lowercase();
-    if matches!(
-        ct.as_str(),
-        "text/html" | "application/xhtml+xml" | "image/svg+xml"
-    ) {
+    if matches!(ct.as_str(), "text/html" | "application/xhtml+xml") {
         return false;
     }
     if let Some(name) = file_name {
@@ -1378,11 +1389,7 @@ pub fn is_image_mime_or_name(content_type: &str, file_name: Option<&str>) -> boo
             .unwrap_or(name)
             .trim()
             .to_ascii_lowercase();
-        if base.ends_with(".html")
-            || base.ends_with(".htm")
-            || base.ends_with(".xhtml")
-            || base.ends_with(".svg")
-        {
+        if base.ends_with(".html") || base.ends_with(".htm") || base.ends_with(".xhtml") {
             return false;
         }
         if base.ends_with(".png")
@@ -1391,6 +1398,7 @@ pub fn is_image_mime_or_name(content_type: &str, file_name: Option<&str>) -> boo
             || base.ends_with(".gif")
             || base.ends_with(".webp")
             || base.ends_with(".bmp")
+            || base.ends_with(".svg")
         {
             return true;
         }
@@ -1403,6 +1411,7 @@ pub fn is_image_mime_or_name(content_type: &str, file_name: Option<&str>) -> boo
             | "image/gif"
             | "image/webp"
             | "image/bmp"
+            | "image/svg+xml"
             | "hostedcontent"
     )
 }
@@ -1431,10 +1440,24 @@ pub fn decode_and_render_halfblocks_with_cell_px(
     bg_rgb: (u8, u8, u8),
     cell_px: (u16, u16),
 ) -> Result<RenderedTerminalImage> {
-    reject_html_or_svg_bytes(bytes)?;
-    let guessed = image::guess_format(bytes).ok();
-    let format_label = format_label_for(guessed);
-    let dyn_img = image::load_from_memory(bytes).context("Failed to decode image")?;
+    reject_html_bytes(bytes)?;
+    let svg_rasterized = if looks_like_svg_bytes(bytes) {
+        let (max_px_w, max_px_h) = svg_raster_bounds(fit, cell_px);
+        Some(
+            bitefoundry_html::graphics::rasterize_svg_to_png(bytes, max_px_w, max_px_h, None)
+                .context("Failed to rasterize SVG image")?,
+        )
+    } else {
+        None
+    };
+    let (decode_bytes, format_label) = match svg_rasterized.as_ref() {
+        Some(raster) => (raster.png_bytes.as_ref(), "SVG".to_string()),
+        None => {
+            let guessed = image::guess_format(bytes).ok();
+            (bytes, format_label_for(guessed))
+        }
+    };
+    let dyn_img = image::load_from_memory(decode_bytes).context("Failed to decode image")?;
     let rgba = dyn_img.into_rgba8();
     let (width_px, height_px) = rgba.dimensions();
     if width_px == 0 || height_px == 0 {
@@ -1506,14 +1529,32 @@ pub fn decode_and_render_for_protocol(
     bg_rgb: (u8, u8, u8),
     caps: TerminalGraphicsCaps,
 ) -> Result<RenderedTerminalImage> {
-    reject_html_or_svg_bytes(bytes)?;
+    reject_html_bytes(bytes)?;
     if caps.protocol == TerminalImageProtocol::Halfblock {
         return decode_and_render_halfblocks_with_cell_px(bytes, fit, bg_rgb, caps.cell_px);
     }
 
-    let guessed = image::guess_format(bytes).ok();
-    let format_label = format_label_for(guessed);
-    let dyn_img = image::load_from_memory(bytes).context("Failed to decode image")?;
+    let svg_rasterized = if looks_like_svg_bytes(bytes) {
+        let (max_px_w, max_px_h) = svg_raster_bounds(fit, caps.cell_px);
+        Some(
+            bitefoundry_html::graphics::rasterize_svg_to_png(bytes, max_px_w, max_px_h, None)
+                .context("Failed to rasterize SVG image")?,
+        )
+    } else {
+        None
+    };
+    let (decode_bytes, guessed, format_label) = match svg_rasterized.as_ref() {
+        Some(raster) => (
+            raster.png_bytes.as_ref(),
+            Some(ImageFormat::Png),
+            "SVG".to_string(),
+        ),
+        None => {
+            let guessed = image::guess_format(bytes).ok();
+            (bytes, guessed, format_label_for(guessed))
+        }
+    };
+    let dyn_img = image::load_from_memory(decode_bytes).context("Failed to decode image")?;
     let (width_px, height_px) = (dyn_img.width(), dyn_img.height());
     if width_px == 0 || height_px == 0 {
         bail!("Image dimensions are 0x0");
@@ -1539,7 +1580,7 @@ pub fn decode_and_render_for_protocol(
                 && width_px <= MAX_RENDER_PX_W
                 && height_px <= MAX_RENDER_PX_H
             {
-                bytes
+                decode_bytes
             } else {
                 png_owned = encode_png(&source_img)?;
                 &png_owned
@@ -1569,11 +1610,11 @@ pub fn decode_and_render_for_protocol(
             let raw_bytes: &[u8] = if matches!(
                 guessed,
                 Some(ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::Gif | ImageFormat::WebP)
-            ) && bytes.len() <= MAX_ITERM2_RAW_BYTES
+            ) && decode_bytes.len() <= MAX_ITERM2_RAW_BYTES
                 && width_px <= MAX_RENDER_PX_W
                 && height_px <= MAX_RENDER_PX_H
             {
-                bytes
+                decode_bytes
             } else {
                 encoded_owned = encode_png(&source_img)?;
                 &encoded_owned
@@ -2311,12 +2352,25 @@ fn render_ansi_stdout_with_caps(
     max_rows: u16,
     caps: TerminalGraphicsCaps,
 ) -> Result<String> {
-    reject_html_or_svg_bytes(bytes)?;
+    reject_html_bytes(bytes)?;
     let fit = FitBox::fit_to_box(max_cols, max_rows);
+    let svg_rasterized = if looks_like_svg_bytes(bytes) {
+        let (max_px_w, max_px_h) = svg_raster_bounds(fit, caps.cell_px);
+        Some(
+            bitefoundry_html::graphics::rasterize_svg_to_png(bytes, max_px_w, max_px_h, None)
+                .context("Failed to rasterize SVG image")?,
+        )
+    } else {
+        None
+    };
+    let decode_bytes = svg_rasterized
+        .as_ref()
+        .map(|r| r.png_bytes.as_ref())
+        .unwrap_or(bytes);
     match caps.protocol {
         TerminalImageProtocol::ITerm2 => {
-            let guessed = image::guess_format(bytes).ok();
-            let dyn_img = image::load_from_memory(bytes).context("Failed to decode image")?;
+            let guessed = image::guess_format(decode_bytes).ok();
+            let dyn_img = image::load_from_memory(decode_bytes).context("Failed to decode image")?;
             let (width_px, height_px) = (dyn_img.width(), dyn_img.height());
             if width_px == 0 || height_px == 0 {
                 bail!("Image dimensions are 0x0");
@@ -2326,11 +2380,11 @@ fn render_ansi_stdout_with_caps(
             let raw_bytes: &[u8] = if matches!(
                 guessed,
                 Some(ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::Gif | ImageFormat::WebP)
-            ) && bytes.len() <= MAX_ITERM2_RAW_BYTES
+            ) && decode_bytes.len() <= MAX_ITERM2_RAW_BYTES
                 && width_px <= MAX_RENDER_PX_W
                 && height_px <= MAX_RENDER_PX_H
             {
-                bytes
+                decode_bytes
             } else {
                 let bounded = fit_within_max_bounds(&dyn_img, MAX_RENDER_PX_W, MAX_RENDER_PX_H);
                 encoded_owned = encode_png(&bounded)?;
@@ -2343,8 +2397,8 @@ fn render_ansi_stdout_with_caps(
             ))
         }
         TerminalImageProtocol::Kitty => {
-            let guessed = image::guess_format(bytes).ok();
-            let dyn_img = image::load_from_memory(bytes).context("Failed to decode image")?;
+            let guessed = image::guess_format(decode_bytes).ok();
+            let dyn_img = image::load_from_memory(decode_bytes).context("Failed to decode image")?;
             let (width_px, height_px) = (dyn_img.width(), dyn_img.height());
             if width_px == 0 || height_px == 0 {
                 bail!("Image dimensions are 0x0");
@@ -2354,7 +2408,7 @@ fn render_ansi_stdout_with_caps(
                 && width_px <= MAX_RENDER_PX_W
                 && height_px <= MAX_RENDER_PX_H
             {
-                bytes
+                decode_bytes
             } else {
                 let bounded = fit_within_max_bounds(&dyn_img, MAX_RENDER_PX_W, MAX_RENDER_PX_H);
                 png_owned = encode_png(&bounded)?;
@@ -3060,28 +3114,35 @@ mod tests {
         assert!(!looks_like_svg_bytes(b"<!DOCTYPE html><html></html>"));
         assert!(!looks_like_svg_bytes(&make_test_png(4, 4)));
 
-        // is_image_mime_or_name rejects HTML and SVG even if paired with misleading extension/MIME
+        // is_image_mime_or_name rejects HTML even if paired with misleading extension/MIME,
+        // while allowing standalone SVG (`image/svg+xml` / `.svg`).
         assert!(!is_image_mime_or_name("text/html", Some("photo.png")));
         assert!(!is_image_mime_or_name("text/html; charset=utf-8", None));
         assert!(!is_image_mime_or_name(
             "application/xhtml+xml",
             Some("page.png")
         ));
-        assert!(!is_image_mime_or_name("image/svg+xml", Some("icon.svg")));
-        assert!(!is_image_mime_or_name(
+        assert!(is_image_mime_or_name("image/svg+xml", Some("icon.svg")));
+        assert!(is_image_mime_or_name(
             "image/svg+xml; charset=utf-8",
             Some("icon.png")
         ));
-        assert!(!is_image_mime_or_name("image/png", Some("diagram.svg")));
+        assert!(is_image_mime_or_name("image/png", Some("diagram.svg")));
+        assert!(is_image_mime_or_name(
+            "application/octet-stream",
+            Some("vector.SVG?v=1")
+        ));
+        assert!(!is_image_mime_or_name("text/html", Some("spoof.svg")));
+        assert!(!is_image_mime_or_name("image/svg+xml", Some("page.html")));
         assert!(!is_image_mime_or_name("hostedContent", Some("page.html")));
         assert!(!is_image_mime_or_name(
             "application/octet-stream",
             Some("index.HTM?x=1")
         ));
 
-        // Clear descriptive errors from decode_and_render_* and render_ansi_stdout
+        // HTML spoofing stays rejected, while SVG rasterizes natively with format_label == "SVG".
         let html = b"<!DOCTYPE html><html><body>Not an image</body></html>";
-        let svg = b"<?xml version=\"1.0\"?><svg width=\"10\" height=\"10\"></svg>";
+        let svg = b"<?xml version=\"1.0\"?><svg xmlns=\"http://www.w3.org/2000/svg\" width=\"40\" height=\"20\"><rect width=\"40\" height=\"20\" fill=\"#e11d48\"/></svg>";
         let sixel_caps = TerminalGraphicsCaps {
             protocol: TerminalImageProtocol::Sixel,
             cell_px: (8, 16),
@@ -3096,10 +3157,9 @@ mod tests {
             "unexpected error: {html_hb_err}"
         );
 
-        let svg_hb_err = decode_and_render_halfblocks(svg, 20, 10, (0, 0, 0))
-            .unwrap_err()
-            .to_string();
-        assert!(svg_hb_err.contains("SVG"), "unexpected error: {svg_hb_err}");
+        let svg_hb = decode_and_render_halfblocks(svg, 20, 10, (0, 0, 0)).unwrap();
+        assert_eq!(svg_hb.format_label, "SVG");
+        assert!(!svg_hb.lines.is_empty());
 
         let html_proto_err = decode_and_render_for_protocol(
             html,
@@ -3114,18 +3174,50 @@ mod tests {
             "unexpected error: {html_proto_err}"
         );
 
-        let svg_proto_err = decode_and_render_for_protocol(
+        let svg_proto = decode_and_render_for_protocol(
             svg,
             FitBox::fit_to_box(20, 10),
             (0, 0, 0),
             sixel_caps,
         )
-        .unwrap_err()
-        .to_string();
-        assert!(
-            svg_proto_err.contains("SVG"),
-            "unexpected error: {svg_proto_err}"
-        );
+        .unwrap();
+        assert_eq!(svg_proto.format_label, "SVG");
+        assert!(svg_proto
+            .pixel_payload
+            .as_deref()
+            .is_some_and(|p| p.starts_with("\x1bP0;1;q")));
+    }
+
+    #[test]
+    fn test_standalone_svg_native_halfblock_and_pixel_rendering() {
+        let svg = br##"<svg width="80" height="40"><rect width="80" height="40" fill="#e11d48"/></svg>"##;
+        let hb = decode_and_render_halfblocks(svg, 24, 12, (16, 18, 22)).unwrap();
+        assert_eq!(hb.format_label, "SVG");
+        assert_eq!(hb.protocol, TerminalImageProtocol::Halfblock);
+        assert!(hb.cols > 0 && hb.rows > 0);
+        assert!(hb
+            .lines
+            .iter()
+            .any(|l| l.spans.iter().any(|s| s.content.contains('▀'))));
+
+        let kitty_caps = TerminalGraphicsCaps {
+            protocol: TerminalImageProtocol::Kitty,
+            cell_px: (8, 16),
+            cell_px_exact: true,
+        };
+        let kitty = decode_and_render_for_protocol(
+            svg,
+            FitBox::fit_to_box(24, 12),
+            (16, 18, 22),
+            kitty_caps,
+        )
+        .unwrap();
+        assert_eq!(kitty.format_label, "SVG");
+        assert_eq!(kitty.protocol, TerminalImageProtocol::Kitty);
+        assert!(kitty
+            .pixel_payload
+            .as_deref()
+            .is_some_and(|p| p.starts_with("\x1b_Gf=100,")));
     }
 
     #[test]

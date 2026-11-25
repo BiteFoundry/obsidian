@@ -131,7 +131,7 @@ impl Overlay {
             Self::LinkExtractor(ov) => ov.draw(frame, area, ui, hitmap),
             Self::FilePicker(ov) => ov.draw(frame, area, ui, hitmap),
             Self::ImagePreview(ov) => ov.draw(frame, area, app, ui, hitmap),
-            Self::HtmlPreview(ov) => ov.draw(frame, area, ui, hitmap),
+            Self::HtmlPreview(ov) => ov.draw(frame, area, app.graphics_caps, ui, hitmap),
             Self::NoteForm(ov) => ov.draw(frame, area, ui, hitmap),
             Self::Confirm(ov) => ov.draw(frame, area, ui, hitmap),
             Self::ContextMenu(ov) => ov.draw(frame, area, ui, hitmap),

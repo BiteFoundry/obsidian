@@ -44,7 +44,7 @@ pub fn draw(frame: &mut Frame, app: &AppState, ui: &mut UiState) -> HitMap {
     ui.term_width = area.width;
     ui.term_height = area.height;
     let mut hitmap = HitMap::new();
-    ui.pending_pixel = None;
+    ui.pending_pixel_graphics.clear();
     ui.cursor_pos = None;
 
     frame.render_widget(
