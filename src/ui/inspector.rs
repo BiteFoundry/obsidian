@@ -3,12 +3,13 @@
 //! - Outgoing Links (with resolved `→` vs unresolved `◌` indicator)
 //! - Local Graph Mini-Stats (words, backlinks, outgoing links, tags, tasks, modified time).
 
+use bitefoundry_html::{wrap_styled_spans, WrapPrefix};
 use chrono::{DateTime, Local, TimeZone};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Paragraph, Wrap},
     Frame,
 };
 
@@ -81,11 +82,76 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
             Paragraph::new(Span::styled(
                 "  Select a note to inspect.",
                 theme.muted_style(),
-            )),
+            ))
+            .wrap(Wrap { trim: false }),
             inner,
         );
         return;
     };
+
+    let w = inner.width as usize;
+    let done_tasks = detail.parsed.tasks.iter().filter(|t| t.checked).count();
+    let total_tasks = detail.parsed.tasks.len();
+    let mtime_label = format_mtime_short(detail.summary.mtime_ms);
+    let stat_cont = [Span::raw("  ")];
+    let stat_prefix = WrapPrefix {
+        first: &[],
+        cont: &stat_cont,
+    };
+    let mut stats_lines: Vec<Line<'static>> = vec![Line::from(Span::styled(
+        truncate_width(" ◈ Note Stats", w),
+        Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    stats_lines.extend(wrap_styled_spans(
+        &[
+            Span::styled("  Words: ", theme.muted_style()),
+            Span::styled(
+                detail.summary.word_count.to_string(),
+                Style::default().fg(theme.fg_primary),
+            ),
+            Span::styled("  Tags: ", theme.muted_style()),
+            Span::styled(
+                detail.summary.tags.len().to_string(),
+                Style::default().fg(theme.accent_soft),
+            ),
+        ],
+        w,
+        stat_prefix,
+    ));
+    stats_lines.extend(wrap_styled_spans(
+        &[
+            Span::styled("  In: ", theme.muted_style()),
+            Span::styled(
+                detail.backlinks.len().to_string(),
+                Style::default().fg(theme.success),
+            ),
+            Span::styled("  Out: ", theme.muted_style()),
+            Span::styled(
+                detail.outgoing_links.len().to_string(),
+                Style::default().fg(theme.info),
+            ),
+            Span::styled("  Tasks: ", theme.muted_style()),
+            Span::styled(
+                format!("{done_tasks}/{total_tasks}"),
+                Style::default().fg(theme.fg_primary),
+            ),
+        ],
+        w,
+        stat_prefix,
+    ));
+    stats_lines.extend(wrap_styled_spans(
+        &[
+            Span::styled("  Updated: ", theme.muted_style()),
+            Span::styled(mtime_label, theme.muted_style()),
+        ],
+        w,
+        stat_prefix,
+    ));
+    let stats_h = (stats_lines.len() as u16 + 1)
+        .min(inner.height.saturating_sub(4))
+        .max(4);
 
     let show_outline = inner.height >= 18;
     let chunks = if show_outline {
@@ -95,7 +161,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
                 Constraint::Percentage(34),
                 Constraint::Percentage(24),
                 Constraint::Min(5),
-                Constraint::Length(6),
+                Constraint::Length(stats_h),
             ])
             .split(inner)
     } else {
@@ -105,12 +171,11 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
                 Constraint::Percentage(48),
                 Constraint::Percentage(32),
                 Constraint::Length(0),
-                Constraint::Length(6),
+                Constraint::Length(stats_h),
             ])
             .split(inner)
     };
 
-    let w = inner.width as usize;
     let total_bl = detail.backlinks.len();
     let total_ol = detail.outgoing_links.len();
     let total_h = detail.parsed.headings.len();
@@ -121,7 +186,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
     let bl_area = chunks[0];
     frame.render_widget(
         Paragraph::new(Line::from(vec![Span::styled(
-            format!(" ← Linked Mentions ({total_bl}) "),
+            truncate_width(&format!(" ← Linked Mentions ({total_bl}) "), w),
             Style::default()
                 .fg(if focused && total_bl > 0 && sel < total_bl {
                     theme.accent
@@ -135,13 +200,20 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
     );
 
     if detail.backlinks.is_empty() {
-        if bl_area.height > 2 {
+        if bl_area.height > 1 {
             frame.render_widget(
                 Paragraph::new(Span::styled(
                     "  No incoming links yet.",
                     theme.muted_style(),
-                )),
-                Rect::new(bl_area.x, bl_area.y + 1, bl_area.width, 1),
+                ))
+                .wrap(Wrap { trim: false })
+                .style(Style::default().bg(theme.bg_sidebar)),
+                Rect::new(
+                    bl_area.x,
+                    bl_area.y + 1,
+                    bl_area.width,
+                    bl_area.height.saturating_sub(1),
+                ),
             );
         }
     } else {
@@ -202,7 +274,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
     let ol_area = chunks[1];
     frame.render_widget(
         Paragraph::new(Line::from(vec![Span::styled(
-            format!(" → Outgoing Links ({total_ol}) "),
+            truncate_width(&format!(" → Outgoing Links ({total_ol}) "), w),
             Style::default()
                 .fg(
                     if focused && total_ol > 0 && sel >= total_bl && sel < total_bl + total_ol {
@@ -223,8 +295,15 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
                 Paragraph::new(Span::styled(
                     "  No outgoing wikilinks.",
                     theme.muted_style(),
-                )),
-                Rect::new(ol_area.x, ol_area.y + 1, ol_area.width, 1),
+                ))
+                .wrap(Wrap { trim: false })
+                .style(Style::default().bg(theme.bg_sidebar)),
+                Rect::new(
+                    ol_area.x,
+                    ol_area.y + 1,
+                    ol_area.width,
+                    ol_area.height.saturating_sub(1),
+                ),
             );
         }
     } else {
@@ -280,7 +359,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
         let outline_base = total_bl + total_ol;
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                format!(" § Outline ({heading_cnt}) "),
+                truncate_width(&format!(" § Outline ({heading_cnt}) "), w),
                 Style::default()
                     .fg(if focused && total_h > 0 && sel >= outline_base {
                         theme.accent
@@ -305,8 +384,15 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
         if detail.parsed.headings.is_empty() {
             if start_y < heading_limit_y {
                 frame.render_widget(
-                    Paragraph::new(Span::styled("  No headings yet.", theme.muted_style())),
-                    Rect::new(out_area.x, start_y, out_area.width, 1),
+                    Paragraph::new(Span::styled("  No headings yet.", theme.muted_style()))
+                        .wrap(Wrap { trim: false })
+                        .style(Style::default().bg(theme.bg_sidebar)),
+                    Rect::new(
+                        out_area.x,
+                        start_y,
+                        out_area.width,
+                        heading_limit_y.saturating_sub(start_y),
+                    ),
                 );
             }
         } else if h_avail_rows > 0 {
@@ -396,55 +482,12 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
         .style(Style::default().bg(theme.bg_card));
     let stats_inner = stats_block.inner(chunks[3]);
     frame.render_widget(stats_block, chunks[3]);
-
-    let done_tasks = detail.parsed.tasks.iter().filter(|t| t.checked).count();
-    let total_tasks = detail.parsed.tasks.len();
-    let mtime_label = format_mtime_short(detail.summary.mtime_ms);
-    let stats_lines = vec![
-        Line::from(Span::styled(
-            " ◈ Note Stats",
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(vec![
-            Span::styled("  Words: ", theme.muted_style()),
-            Span::styled(
-                format!("{:<6}", detail.summary.word_count),
-                Style::default().fg(theme.fg_primary),
-            ),
-            Span::styled("Tags: ", theme.muted_style()),
-            Span::styled(
-                detail.summary.tags.len().to_string(),
-                Style::default().fg(theme.accent_soft),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("  In: ", theme.muted_style()),
-            Span::styled(
-                format!("{:<4}", detail.backlinks.len()),
-                Style::default().fg(theme.success),
-            ),
-            Span::styled("Out: ", theme.muted_style()),
-            Span::styled(
-                format!("{:<4}", detail.outgoing_links.len()),
-                Style::default().fg(theme.info),
-            ),
-            Span::styled("Tasks: ", theme.muted_style()),
-            Span::styled(
-                format!("{done_tasks}/{total_tasks}"),
-                Style::default().fg(theme.fg_primary),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("  Updated: ", theme.muted_style()),
-            Span::styled(
-                truncate_width(&mtime_label, w.saturating_sub(12)),
-                theme.muted_style(),
-            ),
-        ]),
-    ];
-    frame.render_widget(Paragraph::new(stats_lines), stats_inner);
+    frame.render_widget(
+        Paragraph::new(stats_lines)
+            .wrap(Wrap { trim: false })
+            .style(Style::default().bg(theme.bg_card)),
+        stats_inner,
+    );
 }
 
 fn format_mtime_short(mtime_ms: i64) -> String {

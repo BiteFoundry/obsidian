@@ -15,9 +15,10 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Paragraph},
+    widgets::{Block, Paragraph, Wrap},
     Frame,
 };
+use unicode_width::UnicodeWidthStr;
 
 pub use crate::ui::inline_editor::{InlineNoteEditor, InlineSaveStatus};
 
@@ -29,7 +30,6 @@ use crate::{
         hitmap::{ButtonId, HitMap, HitTarget},
         overlays::html_preview::{html_theme_from_ui, is_html_code_language, note_has_html},
         theme::Theme,
-        truncate_width,
     },
 };
 
@@ -67,7 +67,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiState, hit
                 theme.muted_style(),
             )),
         ];
-        frame.render_widget(Paragraph::new(msg), area);
+        frame.render_widget(Paragraph::new(msg).wrap(Wrap { trim: false }), area);
         return;
     };
 
@@ -206,24 +206,18 @@ fn build_canvas_lines(
     let mut out: Vec<RenderedLine> = Vec::new();
 
     // 1. Note Title + Bookmark indicator
-    let bm = if detail.summary.is_bookmarked {
-        " ★"
-    } else {
-        ""
-    };
-    push_plain(
-        &mut out,
-        Line::from(vec![
-            Span::styled(
-                truncate_width(&detail.summary.title, width.saturating_sub(4)),
-                Style::default()
-                    .fg(theme.fg_primary)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(bm.to_string(), Style::default().fg(theme.warning)),
-        ]),
-        None,
-    );
+    let mut title_spans = vec![Span::styled(
+        detail.summary.title.clone(),
+        Style::default()
+            .fg(theme.fg_primary)
+            .add_modifier(Modifier::BOLD),
+    )];
+    if detail.summary.is_bookmarked {
+        title_spans.push(Span::styled(" ★", Style::default().fg(theme.warning)));
+    }
+    for line in wrap_styled_spans(&title_spans, width, WrapPrefix::empty()) {
+        push_plain(&mut out, line, None);
+    }
 
     // 1b. Interactive Note Action Pill Bar (Bookmark, Width, Append, New, Edit, Links, Hrefs, Img)
     {
@@ -270,15 +264,7 @@ fn build_canvas_lines(
         let mut hit_pills: Vec<(u16, u16, ButtonId)> = Vec::new();
         let mut x_off = 0usize;
         for (label, active, btn) in pills {
-            let lw = unicode_width::UnicodeWidthStr::width(label.as_str());
-            let gap = if x_off > 0 { 1 } else { 0 };
-            if x_off + gap + lw > width {
-                break;
-            }
-            if gap > 0 {
-                spans.push(Span::raw(" "));
-                x_off += 1;
-            }
+            let lw = UnicodeWidthStr::width(label.as_str());
             let style = if active {
                 Style::default()
                     .fg(theme.accent)
@@ -287,6 +273,42 @@ fn build_canvas_lines(
             } else {
                 theme.muted_style()
             };
+            let gap = if x_off > 0 { 1 } else { 0 };
+            if x_off > 0 && x_off + gap + lw > width {
+                out.push(RenderedLine {
+                    line: Line::from(std::mem::take(&mut spans)),
+                    block_idx: None,
+                    task_checkbox: None,
+                    has_wikilink: false,
+                    image_idx: None,
+                    html_pill: None,
+                    action_pills: std::mem::take(&mut hit_pills),
+                    bg_override: None,
+                });
+                x_off = 0;
+            }
+            if lw > width {
+                for wrapped in
+                    wrap_styled_spans(&[Span::styled(label, style)], width, WrapPrefix::empty())
+                {
+                    let ww = wrapped.width().min(width) as u16;
+                    out.push(RenderedLine {
+                        line: wrapped,
+                        block_idx: None,
+                        task_checkbox: None,
+                        has_wikilink: false,
+                        image_idx: None,
+                        html_pill: None,
+                        action_pills: vec![(0, ww, btn)],
+                        bg_override: None,
+                    });
+                }
+                continue;
+            }
+            if x_off > 0 {
+                spans.push(Span::raw(" "));
+                x_off += 1;
+            }
             hit_pills.push((x_off as u16, lw as u16, btn));
             spans.push(Span::styled(label, style));
             x_off += lw;
@@ -340,7 +362,9 @@ fn build_canvas_lines(
         ));
     }
     if !prop_spans.is_empty() {
-        push_plain(&mut out, Line::from(prop_spans), None);
+        for line in wrap_styled_spans(&prop_spans, width, WrapPrefix::empty()) {
+            push_plain(&mut out, line, None);
+        }
     }
 
     if !detail.summary.tags.is_empty() {
@@ -351,7 +375,9 @@ fn build_canvas_lines(
             }
             tag_spans.push(Span::styled(format!(" #{t} "), theme.tag_pill_style()));
         }
-        push_plain(&mut out, Line::from(tag_spans), None);
+        for line in wrap_styled_spans(&tag_spans, width, WrapPrefix::empty()) {
+            push_plain(&mut out, line, None);
+        }
     }
 
     // Subtle divider under frontmatter
@@ -417,9 +443,8 @@ fn render_block_into(
     let show_hrefs = ctx.ui.show_inline_hrefs;
     let prefix_w: usize = outer_prefix
         .iter()
-        .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
+        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
         .sum();
-    let inner_width = width.saturating_sub(prefix_w).max(8);
 
     match block {
         NoteBlock::Heading {
@@ -454,13 +479,15 @@ fn render_block_into(
             };
             let mut first_pfx = outer_prefix.to_vec();
             first_pfx.push(Span::styled(prefix.to_string(), style));
+            let mut cont_pfx = outer_prefix.to_vec();
+            cont_pfx.push(Span::raw(" ".repeat(UnicodeWidthStr::width(prefix))));
             let rendered = render_inline_spans(spans, theme, show_hrefs, style);
             for line in wrap_styled_spans(
                 &rendered,
                 width,
                 WrapPrefix {
                     first: &first_pfx,
-                    cont: outer_prefix,
+                    cont: &cont_pfx,
                 },
             ) {
                 out.push(RenderedLine {
@@ -484,18 +511,25 @@ fn render_block_into(
                     display: true,
                 } = &spans[0]
                 {
-                    let mut hdr = outer_prefix.to_vec();
-                    hdr.push(Span::styled("┌─ math", theme.muted_style()));
-                    out.push(RenderedLine {
-                        line: Line::from(hdr),
-                        block_idx: Some(b_idx),
-                        task_checkbox: None,
-                        has_wikilink: false,
-                        image_idx: None,
-                        html_pill: None,
-                        action_pills: Vec::new(),
-                        bg_override: sel_bg,
-                    });
+                    for line in wrap_styled_spans(
+                        &[Span::styled("┌─ math", theme.muted_style())],
+                        width,
+                        WrapPrefix {
+                            first: outer_prefix,
+                            cont: outer_prefix,
+                        },
+                    ) {
+                        out.push(RenderedLine {
+                            line,
+                            block_idx: Some(b_idx),
+                            task_checkbox: None,
+                            has_wikilink: false,
+                            image_idx: None,
+                            html_pill: None,
+                            action_pills: Vec::new(),
+                            bg_override: sel_bg,
+                        });
+                    }
                     let math_style = Style::default()
                         .fg(theme.accent_soft)
                         .add_modifier(Modifier::ITALIC);
@@ -521,18 +555,25 @@ fn render_block_into(
                             bg_override: sel_bg,
                         });
                     }
-                    let mut ftr = outer_prefix.to_vec();
-                    ftr.push(Span::styled("└─", theme.muted_style()));
-                    out.push(RenderedLine {
-                        line: Line::from(ftr),
-                        block_idx: Some(b_idx),
-                        task_checkbox: None,
-                        has_wikilink: false,
-                        image_idx: None,
-                        html_pill: None,
-                        action_pills: Vec::new(),
-                        bg_override: sel_bg,
-                    });
+                    for line in wrap_styled_spans(
+                        &[Span::styled("└─", theme.muted_style())],
+                        width,
+                        WrapPrefix {
+                            first: outer_prefix,
+                            cont: outer_prefix,
+                        },
+                    ) {
+                        out.push(RenderedLine {
+                            line,
+                            block_idx: Some(b_idx),
+                            task_checkbox: None,
+                            has_wikilink: false,
+                            image_idx: None,
+                            html_pill: None,
+                            action_pills: Vec::new(),
+                            bg_override: sel_bg,
+                        });
+                    }
                     if top_level {
                         push_plain(out, Line::from(""), None);
                     }
@@ -581,39 +622,59 @@ fn render_block_into(
             ..
         } => {
             let pill = "[H: HTML]";
-            let pill_w = unicode_width::UnicodeWidthStr::width(pill) as u16;
+            let pill_w = UnicodeWidthStr::width(pill) as u16;
             let card_bg = if is_sel {
                 theme.bg_selected
             } else {
                 theme.bg_card
             };
-            let mut banner_spans = outer_prefix.to_vec();
-            let banner_label = " ◈ Embedded HTML · ";
-            let pill_x = prefix_w + unicode_width::UnicodeWidthStr::width(banner_label);
-            banner_spans.push(Span::styled(banner_label, theme.muted_style()));
-            banner_spans.push(Span::styled(
-                pill,
-                Style::default()
-                    .fg(theme.accent)
-                    .bg(theme.bg_card)
-                    .add_modifier(Modifier::BOLD),
-            ));
-            out.push(RenderedLine {
-                line: Line::from(banner_spans),
-                block_idx: Some(b_idx),
-                task_checkbox: None,
-                has_wikilink: false,
-                image_idx: None,
-                html_pill: Some((pill_x as u16, pill_w, b_idx)),
-                action_pills: Vec::new(),
-                bg_override: Some(card_bg),
-            });
+            let banner_content = vec![
+                Span::styled(" ◈ Embedded HTML · ", theme.muted_style()),
+                Span::styled(
+                    pill,
+                    Style::default()
+                        .fg(theme.accent)
+                        .bg(theme.bg_card)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ];
+            for wrapped in wrap_styled_spans(
+                &banner_content,
+                width,
+                WrapPrefix {
+                    first: outer_prefix,
+                    cont: outer_prefix,
+                },
+            ) {
+                let mut pill_hit = None;
+                let mut col = 0usize;
+                for sp in &wrapped.spans {
+                    if let Some(pos) = sp.content.find(pill) {
+                        let x_off = col + UnicodeWidthStr::width(&sp.content[..pos]);
+                        pill_hit = Some((x_off as u16, pill_w, b_idx));
+                        break;
+                    }
+                    col += UnicodeWidthStr::width(sp.content.as_ref());
+                }
+                out.push(RenderedLine {
+                    line: wrapped,
+                    block_idx: Some(b_idx),
+                    task_checkbox: None,
+                    has_wikilink: false,
+                    image_idx: None,
+                    html_pill: pill_hit,
+                    action_pills: Vec::new(),
+                    bg_override: Some(card_bg),
+                });
+            }
 
             // Render ONLY a sanitized `bitefoundry_html::render_dom()` summary preview (max 8 lines).
             // Never fall through to raw HTML text.
             let doc = bitefoundry_html::DomDocument::parse(raw_html);
             let html_theme = html_theme_from_ui(theme);
-            let preview_w = inner_width.saturating_sub(2).clamp(12, u16::MAX as usize) as u16;
+            let preview_w = width
+                .saturating_sub(prefix_w + 2)
+                .clamp(1, u16::MAX as usize) as u16;
             let rendered_html = bitefoundry_html::render_dom(
                 &doc,
                 preview_w,
@@ -650,21 +711,28 @@ fn render_block_into(
 
             if non_blank.is_empty() {
                 if !rendered_html.graphics.is_empty() {
-                    let mut spans = body_pfx;
-                    spans.push(Span::styled(
-                        "◇ Embedded graphic · press H to view",
-                        theme.muted_style(),
-                    ));
-                    out.push(RenderedLine {
-                        line: Line::from(spans),
-                        block_idx: Some(b_idx),
-                        task_checkbox: None,
-                        has_wikilink: false,
-                        image_idx: None,
-                        html_pill: None,
-                        action_pills: Vec::new(),
-                        bg_override: sel_bg,
-                    });
+                    for wrapped in wrap_styled_spans(
+                        &[Span::styled(
+                            "◇ Embedded graphic · press H to view",
+                            theme.muted_style(),
+                        )],
+                        width,
+                        WrapPrefix {
+                            first: &body_pfx,
+                            cont: &body_pfx,
+                        },
+                    ) {
+                        out.push(RenderedLine {
+                            line: wrapped,
+                            block_idx: Some(b_idx),
+                            task_checkbox: None,
+                            has_wikilink: false,
+                            image_idx: None,
+                            html_pill: None,
+                            action_pills: Vec::new(),
+                            bg_override: sel_bg,
+                        });
+                    }
                 }
             } else {
                 let truncated = non_blank.len() > MAX_HTML_PREVIEW_LINES;
@@ -674,35 +742,49 @@ fn render_block_into(
                     non_blank.len()
                 };
                 for line in non_blank.into_iter().take(take_n) {
-                    let mut prefixed = body_pfx.clone();
-                    prefixed.extend(line.spans);
-                    out.push(RenderedLine {
-                        line: Line::from(prefixed),
-                        block_idx: Some(b_idx),
-                        task_checkbox: None,
-                        has_wikilink: false,
-                        image_idx: None,
-                        html_pill: None,
-                        action_pills: Vec::new(),
-                        bg_override: sel_bg,
-                    });
+                    for wrapped in wrap_styled_spans(
+                        &line.spans,
+                        width,
+                        WrapPrefix {
+                            first: &body_pfx,
+                            cont: &body_pfx,
+                        },
+                    ) {
+                        out.push(RenderedLine {
+                            line: wrapped,
+                            block_idx: Some(b_idx),
+                            task_checkbox: None,
+                            has_wikilink: false,
+                            image_idx: None,
+                            html_pill: None,
+                            action_pills: Vec::new(),
+                            bg_override: sel_bg,
+                        });
+                    }
                 }
                 if truncated {
-                    let mut spans = body_pfx;
-                    spans.push(Span::styled(
-                        "… press H for full HTML preview",
-                        theme.muted_style(),
-                    ));
-                    out.push(RenderedLine {
-                        line: Line::from(spans),
-                        block_idx: Some(b_idx),
-                        task_checkbox: None,
-                        has_wikilink: false,
-                        image_idx: None,
-                        html_pill: None,
-                        action_pills: Vec::new(),
-                        bg_override: sel_bg,
-                    });
+                    for wrapped in wrap_styled_spans(
+                        &[Span::styled(
+                            "… press H for full HTML preview",
+                            theme.muted_style(),
+                        )],
+                        width,
+                        WrapPrefix {
+                            first: &body_pfx,
+                            cont: &body_pfx,
+                        },
+                    ) {
+                        out.push(RenderedLine {
+                            line: wrapped,
+                            block_idx: Some(b_idx),
+                            task_checkbox: None,
+                            has_wikilink: false,
+                            image_idx: None,
+                            html_pill: None,
+                            action_pills: Vec::new(),
+                            bg_override: sel_bg,
+                        });
+                    }
                 }
             }
 
@@ -729,33 +811,41 @@ fn render_block_into(
                 "┃ ",
                 Style::default().fg(c_color).add_modifier(Modifier::BOLD),
             );
-            let mut header_spans = outer_prefix.to_vec();
-            header_spans.push(bar.clone());
-            header_spans.push(Span::styled(
+            let mut nested_prefix = outer_prefix.to_vec();
+            nested_prefix.push(bar);
+
+            let mut header_content = vec![Span::styled(
                 format!("{fold}{} {} ", callout_kind.glyph(), callout_kind.label()),
                 Style::default().fg(c_color).add_modifier(Modifier::BOLD),
-            ));
+            )];
             if !title.eq_ignore_ascii_case(callout_kind.label()) {
-                header_spans.push(Span::styled(
+                header_content.push(Span::styled(
                     format!("· {title}"),
                     Style::default()
                         .fg(theme.fg_primary)
                         .add_modifier(Modifier::BOLD),
                 ));
             }
-            out.push(RenderedLine {
-                line: Line::from(header_spans),
-                block_idx: Some(b_idx),
-                task_checkbox: None,
-                has_wikilink: has_wl,
-                image_idx: None,
-                html_pill: None,
-                action_pills: Vec::new(),
-                bg_override: Some(card_bg),
-            });
+            for wrapped in wrap_styled_spans(
+                &header_content,
+                width,
+                WrapPrefix {
+                    first: &nested_prefix,
+                    cont: &nested_prefix,
+                },
+            ) {
+                out.push(RenderedLine {
+                    line: wrapped,
+                    block_idx: Some(b_idx),
+                    task_checkbox: None,
+                    has_wikilink: has_wl,
+                    image_idx: None,
+                    html_pill: None,
+                    action_pills: Vec::new(),
+                    bg_override: Some(card_bg),
+                });
+            }
 
-            let mut nested_prefix = outer_prefix.to_vec();
-            nested_prefix.push(bar);
             let body_style = Style::default().fg(theme.fg_secondary);
             for child in body_blocks {
                 render_block_into(
@@ -830,11 +920,14 @@ fn render_block_into(
                     })
                     .add_modifier(Modifier::BOLD),
             ));
+            let marker_w = UnicodeWidthStr::width(pad.as_str())
+                + UnicodeWidthStr::width(cursor)
+                + UnicodeWidthStr::width(checkbox);
             let mut cont_pfx = outer_prefix.to_vec();
-            cont_pfx.push(Span::raw(format!("{pad}    ")));
+            cont_pfx.push(Span::raw(" ".repeat(marker_w)));
 
             let rendered = render_inline_spans(spans, theme, show_hrefs, base_style);
-            let hit_w = (prefix_w + (*indent).min(8) + 6) as u16;
+            let hit_w = (prefix_w + marker_w + 2).min(width) as u16;
             for (li, line) in wrap_styled_spans(
                 &rendered,
                 width,
@@ -862,13 +955,15 @@ fn render_block_into(
         NoteBlock::BulletItem { indent, spans, .. } => {
             let pad = " ".repeat((*indent).min(8));
             let base_style = container_text_style.unwrap_or(Style::default().fg(theme.fg_primary));
+            let marker = format!("{pad}  • ");
+            let cont_spaces = " ".repeat(UnicodeWidthStr::width(marker.as_str()));
             let mut first_pfx = outer_prefix.to_vec();
             first_pfx.push(Span::styled(
-                format!("{pad}  • "),
+                marker,
                 Style::default().fg(theme.accent_soft),
             ));
             let mut cont_pfx = outer_prefix.to_vec();
-            cont_pfx.push(Span::raw(format!("{pad}    ")));
+            cont_pfx.push(Span::raw(cont_spaces));
 
             let rendered = render_inline_spans(spans, theme, show_hrefs, base_style);
             for wrapped in wrap_styled_spans(
@@ -901,7 +996,7 @@ fn render_block_into(
             let pad = " ".repeat((*indent).min(8));
             let base_style = container_text_style.unwrap_or(Style::default().fg(theme.fg_primary));
             let marker = format!("{pad}  {number}. ");
-            let cont_spaces = " ".repeat(unicode_width::UnicodeWidthStr::width(marker.as_str()));
+            let cont_spaces = " ".repeat(UnicodeWidthStr::width(marker.as_str()));
             let mut first_pfx = outer_prefix.to_vec();
             first_pfx.push(Span::styled(
                 marker,
@@ -944,60 +1039,109 @@ fn render_block_into(
                 language.as_str()
             };
             let is_html = is_html_code_language(language) && !code.trim().is_empty();
-            let html_suffix = if is_html { " [H: HTML]" } else { "" };
-            let bar_w = inner_width
-                .saturating_sub(lang_label.len() + 14 + html_suffix.len())
-                .min(50);
-            let mut hdr_spans = outer_prefix.to_vec();
-            hdr_spans.push(Span::styled("╭─ ", Style::default().fg(theme.border)));
-            hdr_spans.push(Span::styled(
-                format!("{lang_label} "),
-                Style::default()
-                    .fg(theme.accent_soft)
-                    .add_modifier(Modifier::BOLD),
-            ));
-            hdr_spans.push(Span::styled(
-                "─".repeat(bar_w),
-                Style::default().fg(theme.border),
-            ));
-            hdr_spans.push(Span::styled(" [y copy]", theme.muted_style()));
+            let lang_w = UnicodeWidthStr::width(lang_label);
+            let html_suffix_w = if is_html { 10 } else { 0 };
+            let fixed_w = 3 + lang_w + 1 + 9 + html_suffix_w;
+            let bar_w = width.saturating_sub(prefix_w + fixed_w).min(50);
 
-            let html_pill = if is_html {
-                let pfx_w: usize = hdr_spans
-                    .iter()
-                    .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
-                    .sum();
-                hdr_spans.push(Span::raw(" "));
-                hdr_spans.push(Span::styled(
+            let mut hdr_content = vec![
+                Span::styled("╭─ ", Style::default().fg(theme.border)),
+                Span::styled(
+                    format!("{lang_label} "),
+                    Style::default()
+                        .fg(theme.accent_soft)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ];
+            if bar_w > 0 {
+                hdr_content.push(Span::styled(
+                    "─".repeat(bar_w),
+                    Style::default().fg(theme.border),
+                ));
+            }
+            hdr_content.push(Span::styled(" [y copy]", theme.muted_style()));
+            if is_html {
+                hdr_content.push(Span::raw(" "));
+                hdr_content.push(Span::styled(
                     "[H: HTML]",
                     Style::default()
                         .fg(theme.accent)
                         .bg(theme.bg_card)
                         .add_modifier(Modifier::BOLD),
                 ));
-                Some(((pfx_w + 1) as u16, 9u16, b_idx))
-            } else {
-                None
-            };
-            out.push(RenderedLine {
-                line: Line::from(hdr_spans),
-                block_idx: Some(b_idx),
-                task_checkbox: None,
-                has_wikilink: false,
-                image_idx: None,
-                html_pill,
-                action_pills: Vec::new(),
-                bg_override: Some(code_bg),
-            });
-            for code_line in code.lines() {
-                let mut spans = outer_prefix.to_vec();
-                spans.push(Span::styled("│ ", Style::default().fg(theme.border)));
-                spans.push(Span::styled(
-                    truncate_width(code_line, inner_width.saturating_sub(3)),
-                    Style::default().fg(theme.code_fg),
-                ));
+            }
+            for wrapped in wrap_styled_spans(
+                &hdr_content,
+                width,
+                WrapPrefix {
+                    first: outer_prefix,
+                    cont: outer_prefix,
+                },
+            ) {
+                let html_pill = if is_html {
+                    let mut col = 0usize;
+                    let mut found = None;
+                    for sp in &wrapped.spans {
+                        if let Some(pos) = sp.content.find("[H: HTML]") {
+                            let x_off = col + UnicodeWidthStr::width(&sp.content[..pos]);
+                            found = Some((x_off as u16, 9u16, b_idx));
+                            break;
+                        }
+                        col += UnicodeWidthStr::width(sp.content.as_ref());
+                    }
+                    found
+                } else {
+                    None
+                };
                 out.push(RenderedLine {
-                    line: Line::from(spans),
+                    line: wrapped,
+                    block_idx: Some(b_idx),
+                    task_checkbox: None,
+                    has_wikilink: false,
+                    image_idx: None,
+                    html_pill,
+                    action_pills: Vec::new(),
+                    bg_override: Some(code_bg),
+                });
+            }
+
+            let mut code_pfx = outer_prefix.to_vec();
+            code_pfx.push(Span::styled("│ ", Style::default().fg(theme.border)));
+            let code_style = Style::default().fg(theme.code_fg);
+            for code_line in code.lines() {
+                for wrapped in wrap_styled_spans(
+                    &[Span::styled(code_line.to_string(), code_style)],
+                    width,
+                    WrapPrefix {
+                        first: &code_pfx,
+                        cont: &code_pfx,
+                    },
+                ) {
+                    out.push(RenderedLine {
+                        line: wrapped,
+                        block_idx: Some(b_idx),
+                        task_checkbox: None,
+                        has_wikilink: false,
+                        image_idx: None,
+                        html_pill: None,
+                        action_pills: Vec::new(),
+                        bg_override: Some(code_bg),
+                    });
+                }
+            }
+
+            let dash_w = width.saturating_sub(prefix_w + 1).min(64);
+            let ftr_text = format!("╰{}", "─".repeat(dash_w));
+            for wrapped in wrap_styled_spans(
+                &[Span::styled(ftr_text, Style::default().fg(theme.border))],
+                width,
+                WrapPrefix {
+                    first: outer_prefix,
+                    cont: outer_prefix,
+                },
+            ) {
+                out.push(RenderedLine {
+                    line: wrapped,
                     block_idx: Some(b_idx),
                     task_checkbox: None,
                     has_wikilink: false,
@@ -1007,21 +1151,6 @@ fn render_block_into(
                     bg_override: Some(code_bg),
                 });
             }
-            let mut ftr = outer_prefix.to_vec();
-            ftr.push(Span::styled(
-                format!("╰{}", "─".repeat(inner_width.saturating_sub(2).min(64))),
-                Style::default().fg(theme.border),
-            ));
-            out.push(RenderedLine {
-                line: Line::from(ftr),
-                block_idx: Some(b_idx),
-                task_checkbox: None,
-                has_wikilink: false,
-                image_idx: None,
-                html_pill: None,
-                action_pills: Vec::new(),
-                bg_override: Some(code_bg),
-            });
             if top_level {
                 push_plain(out, Line::from(""), None);
             }
@@ -1138,25 +1267,30 @@ fn render_block_into(
             } else {
                 format!(" ▣ IMG (missing): {raw_target} ")
             };
-            let mut badge_spans = outer_prefix.to_vec();
-            badge_spans.push(Span::styled(
-                truncate_width(&badge, inner_width),
-                if resolved_path.is_some() {
-                    theme.tag_pill_style()
-                } else {
-                    Style::default().fg(theme.warning).bg(theme.bg_card)
+            let badge_style = if resolved_path.is_some() {
+                theme.tag_pill_style()
+            } else {
+                Style::default().fg(theme.warning).bg(theme.bg_card)
+            };
+            for wrapped in wrap_styled_spans(
+                &[Span::styled(badge, badge_style)],
+                width,
+                WrapPrefix {
+                    first: outer_prefix,
+                    cont: outer_prefix,
                 },
-            ));
-            out.push(RenderedLine {
-                line: Line::from(badge_spans),
-                block_idx: Some(b_idx),
-                task_checkbox: None,
-                has_wikilink: false,
-                image_idx: img_idx,
-                html_pill: None,
-                action_pills: Vec::new(),
-                bg_override: sel_bg,
-            });
+            ) {
+                out.push(RenderedLine {
+                    line: wrapped,
+                    block_idx: Some(b_idx),
+                    task_checkbox: None,
+                    has_wikilink: false,
+                    image_idx: img_idx,
+                    html_pill: None,
+                    action_pills: Vec::new(),
+                    bg_override: sel_bg,
+                });
+            }
 
             // Render inline halfblock preview if cached
             if ctx.app.cfg.inline_images {
@@ -1198,46 +1332,61 @@ fn render_block_into(
                 Some(h) => format!("{target}#{h}"),
                 None => target.clone(),
             };
-            let mut spans = outer_prefix.to_vec();
-            spans.push(Span::styled(
-                "┃ ↗ Embed: ",
-                Style::default().fg(theme.accent),
-            ));
-            spans.push(Span::styled(
-                label,
-                theme.wikilink_style(resolved_path.is_some()),
-            ));
-            out.push(RenderedLine {
-                line: Line::from(spans),
-                block_idx: Some(b_idx),
-                task_checkbox: None,
-                has_wikilink: true,
-                image_idx: None,
-                html_pill: None,
-                action_pills: Vec::new(),
-                bg_override: Some(theme.bg_card),
-            });
+            let mut embed_pfx = outer_prefix.to_vec();
+            embed_pfx.push(Span::styled("┃ ", Style::default().fg(theme.accent)));
+            let embed_content = vec![
+                Span::styled("↗ Embed: ", Style::default().fg(theme.accent)),
+                Span::styled(label, theme.wikilink_style(resolved_path.is_some())),
+            ];
+            let embed_bg = sel_bg.unwrap_or(theme.bg_card);
+            for wrapped in wrap_styled_spans(
+                &embed_content,
+                width,
+                WrapPrefix {
+                    first: &embed_pfx,
+                    cont: &embed_pfx,
+                },
+            ) {
+                out.push(RenderedLine {
+                    line: wrapped,
+                    block_idx: Some(b_idx),
+                    task_checkbox: None,
+                    has_wikilink: true,
+                    image_idx: None,
+                    html_pill: None,
+                    action_pills: Vec::new(),
+                    bg_override: Some(embed_bg),
+                });
+            }
             if top_level {
                 push_plain(out, Line::from(""), None);
             }
         }
 
         NoteBlock::Divider { .. } => {
-            let mut spans = outer_prefix.to_vec();
-            spans.push(Span::styled(
-                "─".repeat(inner_width.min(72)),
-                Style::default().fg(theme.divider),
-            ));
-            out.push(RenderedLine {
-                line: Line::from(spans),
-                block_idx: Some(b_idx),
-                task_checkbox: None,
-                has_wikilink: false,
-                image_idx: None,
-                html_pill: None,
-                action_pills: Vec::new(),
-                bg_override: sel_bg,
-            });
+            let dash_w = width.saturating_sub(prefix_w).clamp(1, 72);
+            for wrapped in wrap_styled_spans(
+                &[Span::styled(
+                    "─".repeat(dash_w),
+                    Style::default().fg(theme.divider),
+                )],
+                width,
+                WrapPrefix {
+                    first: outer_prefix,
+                    cont: outer_prefix,
+                },
+            ) {
+                out.push(RenderedLine {
+                    line: wrapped,
+                    block_idx: Some(b_idx),
+                    task_checkbox: None,
+                    has_wikilink: false,
+                    image_idx: None,
+                    html_pill: None,
+                    action_pills: Vec::new(),
+                    bg_override: sel_bg,
+                });
+            }
         }
     }
 }
@@ -1383,7 +1532,6 @@ fn render_inline_spans(
 #[cfg(test)]
 mod tests {
     use tokio::sync::{mpsc, watch};
-    use unicode_width::UnicodeWidthStr;
 
     use super::*;
     use crate::{
@@ -1647,5 +1795,500 @@ mod tests {
         assert!(now_checked);
         let updated = std::fs::read_to_string(&note_file).unwrap();
         assert!(updated.contains("- [x] Verify exact line_no toggle"));
+    }
+
+    fn is_box_table_line(l: &str) -> bool {
+        let t = l.trim();
+        (t.starts_with('┌') && t.ends_with('┐'))
+            || (t.starts_with('│') && t.ends_with('│'))
+            || (t.starts_with('├') && t.ends_with('┤'))
+            || (t.starts_with('└') && t.ends_with('┘'))
+    }
+
+    fn normalize_non_table_text(lines: &[String]) -> String {
+        lines
+            .iter()
+            .filter(|l| !is_box_table_line(l))
+            .map(|l| {
+                l.replace("[w Wide]", "[w Mode]")
+                    .replace("[w Center]", "[w Mode]")
+            })
+            .collect::<String>()
+            .chars()
+            .filter(|ch| {
+                !ch.is_whitespace()
+                    && !matches!(
+                        ch,
+                        '┃' | '│' | '▎' | '┌' | '┬' | '┐' | '├' | '┼' | '┤' | '└' | '┴' | '┘'
+                            | '╭' | '╰' | '─'
+                    )
+            })
+            .collect()
+    }
+
+    fn extract_table_columns(lines: &[String]) -> (Vec<String>, Vec<Vec<usize>>) {
+        let mut cols: Vec<String> = Vec::new();
+        let mut border_cols_per_row: Vec<Vec<usize>> = Vec::new();
+
+        for line in lines {
+            let trimmed = line.trim();
+            if !is_box_table_line(trimmed) {
+                continue;
+            }
+            let mut col_pos = 0usize;
+            let mut positions = Vec::new();
+            for ch in trimmed.chars() {
+                if matches!(
+                    ch,
+                    '┌' | '┬' | '┐' | '├' | '┼' | '┤' | '└' | '┴' | '┘' | '│'
+                ) {
+                    positions.push(col_pos);
+                }
+                col_pos += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            }
+            border_cols_per_row.push(positions);
+
+            if trimmed.starts_with('│') {
+                let inner = trimmed
+                    .strip_prefix('│')
+                    .and_then(|s| s.strip_suffix('│'))
+                    .unwrap_or(trimmed);
+                for (c_idx, cell) in inner.split('│').enumerate() {
+                    if cols.len() <= c_idx {
+                        cols.resize(c_idx + 1, String::new());
+                    }
+                    for ch in cell.chars() {
+                        if !ch.is_whitespace() {
+                            cols[c_idx].push(ch);
+                        }
+                    }
+                }
+            }
+        }
+        (cols, border_cols_per_row)
+    }
+
+    fn render_full_canvas_via_test_backend(
+        app: &AppState,
+        ui: &mut UiState,
+        mode: PageWidthMode,
+        total_visual_lines: usize,
+    ) -> (Vec<String>, usize) {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        ui.page_width = mode;
+        ui.canvas_follow_selected = false;
+        let term_w = 160u16;
+        let term_h = 40u16;
+        let content_x = match mode {
+            PageWidthMode::Centered => (term_w - 86) / 2,
+            PageWidthMode::Full => 1,
+        };
+        let content_w = match mode {
+            PageWidthMode::Centered => 86u16,
+            PageWidthMode::Full => term_w - 2,
+        };
+
+        let mut collected: Vec<String> = Vec::new();
+        let mut offset = 0usize;
+        let page_h = term_h as usize;
+
+        while offset < total_visual_lines {
+            let remaining = total_visual_lines - offset;
+            let take = remaining.min(page_h);
+            // `draw()` clamps `scroll` to `total_lines.saturating_sub(visible)`, so when the
+            // final page is shorter than `page_h`, read only the trailing `take` rows.
+            let max_scroll = total_visual_lines.saturating_sub(page_h);
+            let actual_scroll = offset.min(max_scroll);
+            let row_start = offset - actual_scroll;
+
+            ui.canvas_scroll = offset;
+            let backend = TestBackend::new(term_w, term_h);
+            let mut terminal = Terminal::new(backend).unwrap();
+            let mut hitmap = HitMap::new();
+            terminal
+                .draw(|f| {
+                    let area = f.area();
+                    draw(f, area, app, ui, &mut hitmap);
+                })
+                .unwrap();
+
+            let buf = terminal.backend().buffer();
+            for y in row_start..(row_start + take) {
+                let y_u16 = y as u16;
+                // Margins outside `content_area` must remain completely blank (0 overflow).
+                for x in 0..content_x {
+                    assert_eq!(
+                        buf[(x, y_u16)].symbol(),
+                        " ",
+                        "left margin overflow at ({x},{y_u16}) in {mode:?}"
+                    );
+                }
+                for x in (content_x + content_w)..term_w {
+                    assert_eq!(
+                        buf[(x, y_u16)].symbol(),
+                        " ",
+                        "right margin overflow at ({x},{y_u16}) in {mode:?}"
+                    );
+                }
+                let mut row_str = String::new();
+                let mut x = content_x;
+                while x < content_x + content_w {
+                    let sym = buf[(x, y_u16)].symbol();
+                    let w = UnicodeWidthStr::width(sym).max(1) as u16;
+                    row_str.push_str(sym);
+                    x += w;
+                }
+                collected.push(row_str.trim_end().to_string());
+            }
+            offset += take;
+        }
+        (collected, content_w as usize)
+    }
+
+    #[test]
+    fn test_centered_and_full_width_modes_lossless_parity() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let md = concat!(
+            "---\n",
+            "status: active\n",
+            "owner: 플랫폼아키텍처팀\n",
+            "quarter: 2026-Q4\n",
+            "priority: critical\n",
+            "reviewer: 김철수\n",
+            "tags: [architecture, rust, obsidian, korean-wrap, layout, terminal-ui, parity-test, unicode-width]\n",
+            "---\n\n",
+            "# 트랙D 무손실 텍스트 래핑 동등성 테스트 문서 제목이 매우 길어서 여든여섯 컬럼을 초과합니다\n\n",
+            "## 한국어 헤딩이 여든여섯 컬럼을 훨씬 초과하더라도 행잉 인덴트와 함께 무손실로 줄바꿈되어야 합니다\n\n",
+            "- [ ] 태스크 항목의 체크박스 히트 영역은 첫 번째 줄에 유지되면서 아주 긴 한국어 설명 문장은 다음 줄로 깔끔하게 정렬되어 손실 없이 표시되어야 합니다\n\n",
+            "> 인용문 블록 내부에서도 한국어 장문 텍스트가 여든여섯 컬럼 제한을 넘어가면 연속 줄마다 왼쪽 세로 막대 접두사가 유지되면서 단 한 글자도 사라지지 않아야 합니다.\n\n",
+            "> [!tip] 콜아웃 헤더 제목도 매우 길게 작성되어 여든여섯 컬럼을 넘어갈 때 세로 막대와 카드 배경을 유지하며 줄바꿈됩니다\n",
+            "> 바깥쪽 콜아웃 본문 역시 아주 긴 한국어 문장으로 작성되어 중앙 정렬 모드와 전체 폭 모드에서 동일한 텍스트를 무손실로 보여줍니다.\n",
+            ">> [!note] 중첩 콜아웃 헤더도 길게 작성하여 여든여섯 컬럼 이상에서 안전하게 줄바꿈되는지 검증합니다\n",
+            ">> 중첩된 콜아웃 본문도 손실 없이 안전하게 래핑됩니다.\n\n",
+            "![[한국어_임베드_대상_노트_제목이_매우_길어서_여든여섯_컬럼을_초과하는_경우의_테스트_문서#세부섹션헤더]]\n\n",
+            "![[architecture_diagram_2026_final_very_long_filename_아키텍처설계도.png|아주 긴 이미지 대체 텍스트 설명이 잘리지 않고 래핑됩니다]]\n\n",
+            "공백없이연속으로이어지는매우긴한국어문자열테스트가여든여섯컬럼을초과할때도단한글자도유실되지않고안전하게분할되어야합니다 ",
+            "https://example.com/very/long/path/without/any/spaces/for/lossless/wrapping/verification/2026/track-d ",
+            "[[아주긴위키링크대상문서이름공백없이이어짐|표시별칭도매우긴한국어공백없는문자열테스트]]\n\n",
+            "| 항목 | 담당 팀 | 설명 및 비고 | 상태 |\n",
+            "| :--- | :---: | :--- | ---: |\n",
+            "| 텍스트 래핑 | 플랫폼팀 | 한글과 English가 섞인 긴 셀 설명 텍스트가 여러 줄로 감깁니다 | 완료 |\n",
+            "| 폭 모드 동등성 | 코어팀 | Centered 86 컬럼과 Full 폭 모드에서 단 한 글자도 사라지지 않음 | 검증중 |\n\n",
+            "```rust\n",
+            "\tfn verify_lossless_code_block_wrapping_with_tabs_and_long_identifier(viewport_width: usize, expected_token: &str) -> bool { viewport_width >= 10 && !expected_token.is_empty() }\n",
+            "```\n",
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("ParityNote.md"), md).unwrap();
+        std::fs::write(root.join("Backlinker.md"), "# Backlinker\n\nLinks to [[ParityNote]]!\n")
+            .unwrap();
+
+        let vault = vault_from_dir(root, Some("ParityVault"));
+        let mut cfg = AppConfig::default();
+        cfg.upsert_vault(vault.clone(), true);
+        let storage = Storage::open_in_memory().unwrap();
+        storage.sync_vault(&vault).unwrap();
+
+        let (focus_tx, _focus_rx) = watch::channel(FocusTarget::default());
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel::<SyncCommand>();
+        let sync_ctrl = SyncController::from_channels(focus_tx, cmd_tx);
+        let mut app = AppState::new(cfg.clone(), vault.clone(), storage, sync_ctrl);
+        let mut ui = UiState::from_config(&cfg);
+        app.reload_from_storage(&mut ui);
+        app.open_note(&mut ui, "ParityNote.md", false);
+
+        let detail = app.active_note.as_ref().expect("ParityNote loaded");
+        assert!(detail.summary.frontmatter.len() >= 5);
+        assert_eq!(detail.summary.tags.len(), 8);
+
+        // 1. Direct width invariants across narrow, centered (86), and full (158) widths.
+        for &w in &[26usize, 48, 86, 158] {
+            ui.page_width = if w == 86 {
+                PageWidthMode::Centered
+            } else {
+                PageWidthMode::Full
+            };
+            let rendered = build_canvas_lines(detail, &app, &ui, &ui.theme, w, 0, true);
+            for (idx, rl) in rendered.iter().enumerate() {
+                let lw = rl.line.width();
+                assert!(
+                    lw <= w,
+                    "canvas line {idx} exceeded width {w} (got {lw}): {:?}",
+                    rl.line
+                );
+                for &(x_off, pw, _btn) in &rl.action_pills {
+                    assert!(
+                        (x_off as usize) + (pw as usize) <= w,
+                        "action pill exceeded width {w} on line {idx}: x={x_off}, w={pw}"
+                    );
+                }
+            }
+            // All 9 quick action pills must survive via multi-line flow wrap even at narrow width.
+            let total_pills: usize = rendered.iter().map(|rl| rl.action_pills.len()).sum();
+            assert_eq!(
+                total_pills, 9,
+                "expected all 9 quick action pills preserved at width {w}, got {total_pills}"
+            );
+        }
+
+        // Verify structural continuation prefixes and hits at Centered (86) width.
+        ui.page_width = PageWidthMode::Centered;
+        let centered_rendered = build_canvas_lines(detail, &app, &ui, &ui.theme, 86, 0, true);
+        let centered_text = lines_to_text(&centered_rendered);
+        assert!(
+            centered_rendered.iter().any(|rl| {
+                let s: String = rl.line.spans.iter().map(|sp| sp.content.as_ref()).collect();
+                s.starts_with("   ") && s.contains("줄바꿈되어야")
+            }),
+            "expected wrapped Heading continuation with 3-space hanging indent in:\n{centered_text}"
+        );
+        let task_lines: Vec<&RenderedLine> = centered_rendered
+            .iter()
+            .filter(|rl| {
+                let s: String = rl.line.spans.iter().map(|sp| sp.content.as_ref()).collect();
+                s.contains("태스크 항목") || s.contains("표시되어야 합니다")
+            })
+            .collect();
+        assert!(
+            task_lines.len() >= 2,
+            "expected wrapped Task to span >= 2 lines at width 86"
+        );
+        assert!(
+            task_lines[0].task_checkbox.is_some(),
+            "task_checkbox hit must stay on first wrapped Task row"
+        );
+        assert!(
+            task_lines[1].task_checkbox.is_none(),
+            "task_checkbox hit must not duplicate onto continuation rows"
+        );
+        let callout_cont_lines: Vec<&RenderedLine> = centered_rendered
+            .iter()
+            .filter(|rl| {
+                let s: String = rl.line.spans.iter().map(|sp| sp.content.as_ref()).collect();
+                s.starts_with("┃ ") && rl.bg_override == Some(ui.theme.bg_card)
+            })
+            .collect();
+        assert!(
+            callout_cont_lines.len() >= 6,
+            "expected wrapped Callout header + body + nested callout lines with ┃ prefix & card_bg"
+        );
+        assert!(
+            centered_text.contains("│     fn")
+                && centered_text.contains("verify_lossless_code_block_wrapping"),
+            "expected \\t -> 4-space expansion in CodeBlock:\n{centered_text}"
+        );
+        assert!(
+            centered_text.contains("!expected_token.is_empty() }"),
+            "expected 120-char CodeBlock tail preserved without truncation:\n{centered_text}"
+        );
+
+        ui.page_width = PageWidthMode::Full;
+        let full_rendered = build_canvas_lines(detail, &app, &ui, &ui.theme, 158, 0, true);
+
+        // 2. TestBackend::new(160, 40) Centered (86) <-> Full (158) lossless parity check.
+        let (centered_buf_lines, _) = render_full_canvas_via_test_backend(
+            &app,
+            &mut ui,
+            PageWidthMode::Centered,
+            centered_rendered.len(),
+        );
+        let (full_buf_lines, _) = render_full_canvas_via_test_backend(
+            &app,
+            &mut ui,
+            PageWidthMode::Full,
+            full_rendered.len(),
+        );
+
+        let norm_centered = normalize_non_table_text(&centered_buf_lines);
+        let norm_full = normalize_non_table_text(&full_buf_lines);
+        assert_eq!(
+            norm_centered, norm_full,
+            "Centered(86) and Full(158) non-table normalized content must match losslessly"
+        );
+
+        // Table column-by-column lossless parity + exact `│` vertical border alignment.
+        let (c_cols, c_borders) = extract_table_columns(&centered_buf_lines);
+        let (f_cols, f_borders) = extract_table_columns(&full_buf_lines);
+        assert_eq!(c_cols.len(), 4, "expected 4 table columns in centered mode");
+        assert_eq!(
+            c_cols, f_cols,
+            "Centered(86) and Full(158) table column content must match losslessly"
+        );
+        assert!(
+            c_borders.len() >= 5 && f_borders.len() >= 5,
+            "expected box table border rows"
+        );
+        for (mode_name, borders) in [("centered", &c_borders), ("full", &f_borders)] {
+            let expected_pos = &borders[0];
+            assert_eq!(
+                expected_pos.len(),
+                5,
+                "{mode_name}: 4-col box table must have 5 vertical border columns"
+            );
+            for (r_idx, row_pos) in borders.iter().enumerate() {
+                assert_eq!(
+                    row_pos, expected_pos,
+                    "{mode_name}: table row {r_idx} vertical border columns misaligned: {row_pos:?} vs {expected_pos:?}"
+                );
+            }
+        }
+
+        // Spot-check critical tokens present in both modes.
+        let joined_centered = centered_buf_lines.join("\n");
+        for must_have in [
+            "플랫폼아키텍처팀",
+            "김철수",
+            "#unicode-width",
+            "#parity-test",
+            "줄바꿈되어야",
+            "표시되어야",
+            "중첩된",
+            "세부섹션헤더",
+            "verify_lossless_code_block_wrapping",
+            "expected_token.is_empty()",
+            "track-d",
+            "표시별칭도매우긴한국어",
+        ] {
+            let needle: String = must_have.chars().filter(|c| !c.is_whitespace()).collect();
+            assert!(
+                norm_centered.contains(&needle),
+                "missing expected token `{must_have}` in Centered(86) output:\n{joined_centered}"
+            );
+        }
+
+        // 3. Inspector 25-col 0 overflow (both populated note & empty note states).
+        {
+            let backend = TestBackend::new(40, 28);
+            let mut terminal = Terminal::new(backend).unwrap();
+            let mut hitmap = HitMap::new();
+            let insp_rect = Rect::new(0, 0, 25, 28);
+            terminal
+                .draw(|f| {
+                    crate::ui::inspector::draw(f, insp_rect, &app, &ui, &mut hitmap);
+                })
+                .unwrap();
+            let buf = terminal.backend().buffer();
+            let mut insp_text = String::new();
+            for y in 0..28u16 {
+                for x in 25..40u16 {
+                    assert_eq!(
+                        buf[(x, y)].symbol(),
+                        " ",
+                        "inspector overflowed past 25 cols at ({x},{y})"
+                    );
+                }
+                let mut x = 0u16;
+                while x < 25 {
+                    let sym = buf[(x, y)].symbol();
+                    insp_text.push_str(sym);
+                    x += UnicodeWidthStr::width(sym).max(1) as u16;
+                }
+                insp_text.push('\n');
+            }
+            assert!(
+                insp_text.contains("Tasks:") && insp_text.contains("0/1"),
+                "25-col inspector must wrap and preserve Tasks stat:\n{insp_text}"
+            );
+            assert!(
+                insp_text.contains("Linked Mentions"),
+                "25-col inspector must render clamped Linked Mentions header:\n{insp_text}"
+            );
+
+            // Empty-note state at 25 cols must wrap `"Select a note to inspect."` without clipping.
+            let mut empty_app = AppState::new(
+                cfg.clone(),
+                vault.clone(),
+                Storage::open_in_memory().unwrap(),
+                {
+                    let (ftx, _frx) = watch::channel(FocusTarget::default());
+                    let (ctx, _crx) = mpsc::unbounded_channel::<SyncCommand>();
+                    SyncController::from_channels(ftx, ctx)
+                },
+            );
+            empty_app.active_note = None;
+            let backend_empty = TestBackend::new(40, 20);
+            let mut term_empty = Terminal::new(backend_empty).unwrap();
+            let mut hm_empty = HitMap::new();
+            term_empty
+                .draw(|f| {
+                    crate::ui::inspector::draw(
+                        f,
+                        Rect::new(0, 0, 25, 20),
+                        &empty_app,
+                        &ui,
+                        &mut hm_empty,
+                    );
+                })
+                .unwrap();
+            let ebuf = term_empty.backend().buffer();
+            let mut empty_text = String::new();
+            for y in 0..20u16 {
+                for x in 25..40u16 {
+                    assert_eq!(
+                        ebuf[(x, y)].symbol(),
+                        " ",
+                        "empty inspector overflowed past 25 cols at ({x},{y})"
+                    );
+                }
+                for x in 0..25u16 {
+                    empty_text.push_str(ebuf[(x, y)].symbol());
+                }
+                empty_text.push('\n');
+            }
+            assert!(
+                empty_text.contains("Select a note") && empty_text.contains("inspect."),
+                "25-col empty inspector must wrap full message:\n{empty_text}"
+            );
+        }
+
+        // 4. Sidebar TagHeader 0 overflow at narrow 24-col width.
+        {
+            ui.sidebar_tab = crate::models::SidebarTab::Tags;
+            ui.active_tag_filter = Some(
+                "아주긴한글태그이름_very_long_nested/subtag/architecture_2026_overflow_check"
+                    .to_string(),
+            );
+            let backend = TestBackend::new(40, 20);
+            let mut terminal = Terminal::new(backend).unwrap();
+            let mut hitmap = HitMap::new();
+            let side_rect = Rect::new(0, 0, 24, 20);
+            terminal
+                .draw(|f| {
+                    crate::ui::sidebar::draw(f, side_rect, &app, &ui, &mut hitmap);
+                })
+                .unwrap();
+            let buf = terminal.backend().buffer();
+            let mut side_text = String::new();
+            for y in 0..20u16 {
+                // Right border of sidebar must stay intact at x = 23 and columns 24..40 blank.
+                assert_eq!(
+                    buf[(23, y)].symbol(),
+                    "│",
+                    "sidebar right border overwritten at row {y}"
+                );
+                for x in 24..40u16 {
+                    assert_eq!(
+                        buf[(x, y)].symbol(),
+                        " ",
+                        "sidebar TagHeader overflowed past 24 cols at ({x},{y})"
+                    );
+                }
+                let mut x = 0u16;
+                while x < 23 {
+                    let sym = buf[(x, y)].symbol();
+                    side_text.push_str(sym);
+                    x += UnicodeWidthStr::width(sym).max(1) as u16;
+                }
+                side_text.push('\n');
+            }
+            assert!(
+                side_text.contains("▾") && side_text.contains("…") && side_text.contains("notes"),
+                "narrow sidebar TagHeader must clamp with ellipsis and preserve count:\n{side_text}"
+            );
+        }
     }
 }

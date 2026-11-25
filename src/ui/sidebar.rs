@@ -7,9 +7,10 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, Paragraph, Wrap},
     Frame,
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
     models::{NoteSummary, SidebarTab},
@@ -361,6 +362,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
         };
         frame.render_widget(
             Paragraph::new(Span::styled(empty_msg, theme.muted_style()))
+                .wrap(Wrap { trim: false })
                 .style(Style::default().bg(theme.bg_sidebar)),
             list_area,
         );
@@ -403,7 +405,9 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
             } => {
                 let indent = "  ".repeat(*depth);
                 let arrow = if *expanded { "▾" } else { "▸" };
-                let avail = w.saturating_sub(indent.len() + 7);
+                let count_suffix = format!(" ({count})");
+                let count_w = UnicodeWidthStr::width(count_suffix.as_str());
+                let avail = w.saturating_sub(1 + indent.len() + 2 + count_w);
                 Line::from(vec![
                     Span::raw(format!(" {indent}")),
                     Span::styled(format!("{arrow} "), Style::default().fg(theme.accent_soft)),
@@ -413,7 +417,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
                             .fg(theme.fg_secondary)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(format!(" ({count})"), theme.subtle_style()),
+                    Span::styled(count_suffix, theme.subtle_style()),
                 ])
             }
             SidebarEntry::Note {
@@ -492,17 +496,36 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
                     Span::styled(" HTML", Style::default().fg(theme.info)),
                 ])
             }
-            SidebarEntry::TagHeader { tag, count } => Line::from(vec![
-                Span::styled(" ▾ ", Style::default().fg(theme.accent)),
-                Span::styled(format!("#{tag}"), theme.tag_pill_style()),
-                Span::styled(format!("  {count} notes"), theme.muted_style()),
-            ]),
+            SidebarEntry::TagHeader { tag, count } => {
+                let suffix = format!("  {count} notes");
+                let suffix_w = UnicodeWidthStr::width(suffix.as_str());
+                let prefix_w = 3; // " ▾ "
+                if prefix_w + 1 + suffix_w < w {
+                    let avail = w - prefix_w - 1 - suffix_w;
+                    Line::from(vec![
+                        Span::styled(" ▾ ", Style::default().fg(theme.accent)),
+                        Span::styled(
+                            format!("#{}", truncate_width(tag, avail)),
+                            theme.tag_pill_style(),
+                        ),
+                        Span::styled(suffix, theme.muted_style()),
+                    ])
+                } else {
+                    let full = format!(" ▾ #{tag}{suffix}");
+                    Line::from(Span::styled(
+                        truncate_width(&full, w),
+                        theme.tag_pill_style(),
+                    ))
+                }
+            }
             SidebarEntry::Tag {
                 tag,
                 count,
                 active_filter,
             } => {
-                let avail = w.saturating_sub(10);
+                let count_suffix = format!(" ({count})");
+                let count_w = UnicodeWidthStr::width(count_suffix.as_str());
+                let avail = w.saturating_sub(4 + count_w);
                 Line::from(vec![
                     Span::styled(
                         if *active_filter { " ▸ " } else { "   " },
@@ -518,7 +541,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
                             Style::default().fg(theme.accent_soft)
                         },
                     ),
-                    Span::styled(format!(" ({count})"), theme.muted_style()),
+                    Span::styled(count_suffix, theme.muted_style()),
                 ])
             }
             SidebarEntry::Heading { level, text, .. } => {
