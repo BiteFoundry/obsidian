@@ -62,6 +62,7 @@ pub enum Action {
     OpenQuickAppend,
     OpenNewNoteModal,
     OpenNoteEditor,
+    ToggleEditorMode,
     SaveInlineEdit,
     FinishInlineEdit,
     InlineEditTick,

@@ -20,7 +20,7 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-pub use crate::ui::inline_editor::{InlineNoteEditor, InlineSaveStatus};
+pub use crate::ui::inline_editor::{EditorMode, InlineNoteEditor, InlineSaveStatus};
 
 use crate::{
     config::PageWidthMode,
@@ -89,6 +89,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiState, hit
     if width < 10 || content_area.height < 3 {
         return;
     }
+    ui.last_note_content_area = content_area;
 
     // In-place inline live editor directly inside `note_view`'s `content_area` (ZERO popup window!)
     if let Some(mut editor) = ui.inline_editor.take() {
@@ -127,7 +128,15 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiState, hit
     };
     ui.canvas_scroll = scroll;
 
+    let body_start = lines
+        .iter()
+        .position(|rl| rl.block_idx.is_some())
+        .unwrap_or(lines.len());
+    let mut rendered_rows = 0usize;
+
     for (i, rl) in lines.iter().skip(scroll).take(visible).enumerate() {
+        rendered_rows = i + 1;
+        let abs_idx = scroll + i;
         let y = content_area.y + i as u16;
         let row_rect = Rect::new(content_area.x, y, content_area.width, 1);
         let bg = rl.bg_override.unwrap_or(theme.bg_canvas);
@@ -151,6 +160,8 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiState, hit
             if let Some(img_i) = rl.image_idx {
                 hitmap.add(row_rect, HitTarget::ImageChip(img_i));
             }
+        } else if abs_idx >= body_start {
+            hitmap.add(row_rect, HitTarget::NoteBodyEmpty);
         }
         if let Some((x_off, w, b_idx)) = rl.html_pill {
             if x_off < content_area.width {
@@ -169,6 +180,13 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiState, hit
                 hitmap.add_line(content_area.x + x_off, y, clamped_w, HitTarget::Button(btn));
             }
         }
+    }
+    for i in rendered_rows..visible {
+        let y = content_area.y + i as u16;
+        hitmap.add(
+            Rect::new(content_area.x, y, content_area.width, 1),
+            HitTarget::NoteBodyEmpty,
+        );
     }
 }
 

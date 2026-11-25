@@ -169,6 +169,7 @@ pub struct UiState {
     pub term_height: u16,
     pub should_quit: bool,
     pub last_hitmap: HitMap,
+    pub last_note_content_area: ratatui::layout::Rect,
 }
 
 impl UiState {
@@ -204,6 +205,7 @@ impl UiState {
             term_height: 34,
             should_quit: false,
             last_hitmap: HitMap::new(),
+            last_note_content_area: ratatui::layout::Rect::default(),
         }
     }
 
@@ -892,6 +894,17 @@ impl AppState {
             self.finish_inline_edit(ui);
             return;
         }
+        self.open_inline_edit_at(ui, None, None);
+    }
+
+    /// Opens the in-place Live Preview inline editor directly inside `note_view`, optionally
+    /// positioning the cursor at a 0-based logical line and display column.
+    pub fn open_inline_edit_at(
+        &mut self,
+        ui: &mut UiState,
+        target_line: Option<usize>,
+        target_col: Option<usize>,
+    ) {
         let Some(d) = self.active_note.as_ref() else {
             ui.toasts.info("Open a note to edit");
             return;
@@ -913,15 +926,17 @@ impl AppState {
                 (text, hash)
             });
         let initial_scroll = ui.canvas_scroll.min(u16::MAX as usize) as u16;
+        let mut editor =
+            InlineNoteEditor::with_base_hash(rel_path, title, &raw, base_hash, initial_scroll);
+        if ui.last_note_content_area.width >= 10 {
+            editor.last_content_width = ui.last_note_content_area.width;
+        }
+        if let Some(line_idx) = target_line {
+            editor.place_cursor_at_logical_line_col(line_idx, target_col.unwrap_or(0));
+        }
         ui.canvas_mode = CanvasMode::Note;
         ui.focus = Focus::Canvas;
-        ui.inline_editor = Some(InlineNoteEditor::with_base_hash(
-            rel_path,
-            title,
-            &raw,
-            base_hash,
-            initial_scroll,
-        ));
+        ui.inline_editor = Some(editor);
     }
 
     /// Re-parses the active note's Markdown in memory (< 0.2ms) on every keystroke so
@@ -1331,6 +1346,12 @@ impl AppState {
         // Route inline editor keys directly when in-place editing is active inside `note_view`
         if ui.overlay.is_none() && ui.inline_editor.is_some() {
             match &action {
+                Action::ToggleEditorMode => {
+                    if let Some(ref mut ed) = ui.inline_editor {
+                        ed.toggle_mode();
+                    }
+                    return;
+                }
                 Action::SaveInlineEdit | Action::OverlaySubmit => {
                     self.flush_inline_save(ui);
                     return;
@@ -1620,8 +1641,23 @@ impl AppState {
                         if let Some(node) = self.graph.nodes.get(ui.graph_selected).cloned() {
                             self.open_note(ui, &node.id, true);
                         }
-                    } else {
-                        self.dispatch_core(Action::FollowSelectedWikilink, ui);
+                    } else if let Some(d) = &self.active_note {
+                        match d.parsed.blocks.get(ui.canvas_selected_block) {
+                            Some(block) if block.first_wikilink().is_some() => {
+                                self.dispatch_core(Action::FollowSelectedWikilink, ui);
+                            }
+                            Some(NoteBlock::Task { .. }) => {
+                                self.dispatch_core(Action::FollowSelectedWikilink, ui);
+                            }
+                            Some(NoteBlock::ImageEmbed { .. } | NoteBlock::HtmlEmbed { .. }) => {}
+                            Some(block) => {
+                                let target_line = block.line_no().saturating_sub(1);
+                                self.open_inline_edit_at(ui, Some(target_line), None);
+                            }
+                            None => {
+                                self.open_inline_edit_at(ui, Some(0), None);
+                            }
+                        }
                     }
                 }
                 Focus::Inspector => self.activate_inspector_selected(ui),
@@ -1899,6 +1935,11 @@ impl AppState {
             }
             Action::OpenNoteEditor => {
                 self.toggle_inline_edit(ui);
+            }
+            Action::ToggleEditorMode => {
+                if let Some(ref mut ed) = ui.inline_editor {
+                    ed.toggle_mode();
+                }
             }
             Action::SaveInlineEdit => {
                 self.flush_inline_save(ui);
@@ -2556,6 +2597,7 @@ impl AppState {
             ) => Focus::Inspector,
             Some(
                 HitTarget::CanvasBlock(_)
+                | HitTarget::NoteBodyEmpty
                 | HitTarget::InlineEditorBody
                 | HitTarget::TaskCheckbox { .. }
                 | HitTarget::WikilinkBlock(_)
@@ -2701,6 +2743,24 @@ impl AppState {
             HitTarget::CanvasBlock(idx) => {
                 ui.focus = Focus::Canvas;
                 ui.canvas_selected_block = idx;
+                let target_line = self
+                    .active_note
+                    .as_ref()
+                    .and_then(|d| d.parsed.blocks.get(idx))
+                    .map(|b| b.line_no().saturating_sub(1));
+                let rel_col = col.saturating_sub(ui.last_note_content_area.x) as usize;
+                self.open_inline_edit_at(ui, target_line, Some(rel_col));
+            }
+            HitTarget::NoteBodyEmpty => {
+                ui.focus = Focus::Canvas;
+                let target_line = self.active_note.as_ref().map(|d| {
+                    let approx = ui
+                        .canvas_scroll
+                        .saturating_add(row.saturating_sub(ui.last_note_content_area.y) as usize);
+                    let total_lines = d.raw_markdown.lines().count();
+                    approx.min(total_lines.saturating_sub(1))
+                });
+                self.open_inline_edit_at(ui, target_line, Some(0));
             }
             HitTarget::InlineEditorBody => {
                 ui.focus = Focus::Canvas;
@@ -2807,6 +2867,7 @@ impl AppState {
                 ButtonId::QuickAppend => self.dispatch_core(Action::OpenQuickAppend, ui),
                 ButtonId::NewNote => self.dispatch_core(Action::OpenNewNoteModal, ui),
                 ButtonId::EditNote => self.dispatch_core(Action::OpenNoteEditor, ui),
+                ButtonId::ToggleEditorMode => self.dispatch_core(Action::ToggleEditorMode, ui),
                 ButtonId::FinishInlineEdit => {
                     self.finish_inline_edit(ui);
                 }
@@ -3478,5 +3539,172 @@ mod tests {
         assert_eq!(app.notes.len(), 1);
         assert_eq!(app.notes[0].rel_path, "Two.md");
         assert_eq!(diag.initial_scans.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn test_ctrl_m_toggles_live_preview_and_source_mode() {
+        use crate::ui::inline_editor::EditorMode;
+
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("ModeNote.md"),
+            "# Mode Heading\n\nSome **bold** text.\n",
+        )
+        .unwrap();
+        let (mut app, mut ui) = make_harness(tmp.path(), "ModeVault");
+        app.open_note(&mut ui, "ModeNote.md", false);
+
+        // Pressing `i` enters LivePreview immediately
+        let act_i = key_to_action(
+            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+            ui.focus,
+            ui.canvas_mode,
+            &ui.keymap,
+            ui.is_text_input_active(),
+        );
+        assert_eq!(act_i, Some(Action::OpenNoteEditor));
+        app.dispatch(act_i.unwrap(), &mut ui);
+        assert_eq!(
+            ui.inline_editor.as_ref().unwrap().mode,
+            EditorMode::LivePreview
+        );
+
+        // Ctrl+M maps to Action::ToggleEditorMode and toggles LivePreview -> Source -> LivePreview
+        let act_m = key_to_action(
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL),
+            ui.focus,
+            ui.canvas_mode,
+            &ui.keymap,
+            ui.is_text_input_active(),
+        );
+        assert_eq!(act_m, Some(Action::ToggleEditorMode));
+        app.dispatch(act_m.unwrap(), &mut ui);
+        assert_eq!(ui.inline_editor.as_ref().unwrap().mode, EditorMode::Source);
+
+        // Clicking the `[Src]` pill in the inline header bar toggles back to LivePreview
+        let hitmap = draw_frame(&app, &mut ui, 120, 30);
+        let pill = hitmap
+            .region_of(HitTarget::Button(ButtonId::ToggleEditorMode))
+            .expect("mode toggle pill must be registered in hitmap");
+        app.dispatch(
+            Action::MouseClick {
+                col: pill.x + 1,
+                row: pill.y,
+            },
+            &mut ui,
+        );
+        assert_eq!(
+            ui.inline_editor.as_ref().unwrap().mode,
+            EditorMode::LivePreview
+        );
+    }
+
+    #[test]
+    fn test_click_rendered_note_line_and_enter_launch_live_preview_without_breaking_direct_actions()
+    {
+        use crate::ui::inline_editor::EditorMode;
+
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("ClickNote.md"),
+            "# ClickNote\n\nPlain editable paragraph line\n\n- [ ] Direct toggle task\n\nSee [[TargetNote]] link\n",
+        )
+        .unwrap();
+        fs::write(tmp.path().join("TargetNote.md"), "# TargetNote\n\nLinked!\n").unwrap();
+
+        let (mut app, mut ui) = make_harness(tmp.path(), "ClickVault");
+        app.open_note(&mut ui, "ClickNote.md", false);
+        ui.focus = Focus::Canvas;
+
+        // 1. Clicking an ordinary rendered paragraph immediately enters LivePreview at that line/col
+        let hitmap = draw_frame(&app, &mut ui, 120, 30);
+        let para_idx = app
+            .active_note
+            .as_ref()
+            .unwrap()
+            .parsed
+            .blocks
+            .iter()
+            .position(|b| {
+                matches!(b, NoteBlock::Paragraph { spans, .. } if spans.iter().any(|s| s.plain_text().contains("Plain editable")))
+            })
+            .expect("paragraph block");
+        let para_rect = hitmap
+            .region_of(HitTarget::CanvasBlock(para_idx))
+            .expect("paragraph CanvasBlock rect");
+        app.dispatch(
+            Action::MouseClick {
+                col: para_rect.x + 6,
+                row: para_rect.y,
+            },
+            &mut ui,
+        );
+        let ed = ui
+            .inline_editor
+            .as_ref()
+            .expect("clicking rendered paragraph must enter LivePreview immediately");
+        assert_eq!(ed.mode, EditorMode::LivePreview);
+        let (ln, col) = ed.cursor_line_col();
+        assert_eq!(ln, 3, "cursor must land on paragraph source line 3");
+        assert!(col >= 5, "cursor col should land near clicked column, got {col}");
+
+        // Esc cleanly exits inline edit back to Canvas navigation
+        app.dispatch(Action::FinishInlineEdit, &mut ui);
+        assert!(ui.inline_editor.is_none());
+
+        // 2. Pressing Enter on an ordinary text block enters LivePreview immediately
+        ui.focus = Focus::Canvas;
+        ui.canvas_selected_block = para_idx;
+        app.dispatch(Action::Activate, &mut ui);
+        assert!(ui.inline_editor.is_some());
+        assert_eq!(
+            ui.inline_editor.as_ref().unwrap().mode,
+            EditorMode::LivePreview
+        );
+        app.dispatch(Action::FinishInlineEdit, &mut ui);
+        assert!(ui.inline_editor.is_none());
+
+        // 3. Direct click on checkbox STILL toggles task without entering inline editor
+        let hitmap2 = draw_frame(&app, &mut ui, 120, 30);
+        let task_ln = app.active_note.as_ref().unwrap().parsed.tasks[0].line_no;
+        let cb_rect = hitmap2
+            .region_of(HitTarget::TaskCheckbox { line_no: task_ln })
+            .expect("task checkbox rect");
+        app.dispatch(
+            Action::MouseClick {
+                col: cb_rect.x + 2,
+                row: cb_rect.y,
+            },
+            &mut ui,
+        );
+        assert!(ui.inline_editor.is_none());
+        assert!(app.active_note.as_ref().unwrap().parsed.tasks[0].checked);
+
+        // 4. Direct click on wikilink block STILL navigates to TargetNote without entering inline editor
+        let hitmap3 = draw_frame(&app, &mut ui, 120, 30);
+        let wl_idx = app
+            .active_note
+            .as_ref()
+            .unwrap()
+            .parsed
+            .blocks
+            .iter()
+            .position(|b| b.first_wikilink().is_some())
+            .expect("wikilink block");
+        let wl_rect = hitmap3
+            .region_of(HitTarget::WikilinkBlock(wl_idx))
+            .expect("wikilink rect");
+        app.dispatch(
+            Action::MouseClick {
+                col: wl_rect.x + 4,
+                row: wl_rect.y,
+            },
+            &mut ui,
+        );
+        assert!(ui.inline_editor.is_none());
+        assert_eq!(
+            app.active_note.as_ref().unwrap().summary.rel_path,
+            "TargetNote.md"
+        );
     }
 }

@@ -104,7 +104,7 @@ impl KeyMap {
             KeyCode::Char('b') => Some(KeyCommand::ToggleBookmark),
             KeyCode::Char('a') => Some(KeyCommand::QuickAppend),
             KeyCode::Char('n') => Some(KeyCommand::NewNote),
-            KeyCode::Char('e') => Some(KeyCommand::EditNote),
+            KeyCode::Char('e') | KeyCode::Char('i') => Some(KeyCommand::EditNote),
             KeyCode::Char('X') if shift => Some(KeyCommand::DeleteNote),
             KeyCode::Char('u') => Some(KeyCommand::OpenLinkExtractor),
             KeyCode::Char('h') => Some(KeyCommand::ToggleShowLinkUrls),

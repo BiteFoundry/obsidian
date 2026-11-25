@@ -149,6 +149,7 @@ pub fn key_to_action(
         if ctrl && !alt {
             match key.code {
                 KeyCode::Char('s') | KeyCode::Char('S') => return Some(Action::SaveInlineEdit),
+                KeyCode::Char('m') | KeyCode::Char('M') => return Some(Action::ToggleEditorMode),
                 KeyCode::Char('z') | KeyCode::Char('Z') => return Some(Action::Undo),
                 KeyCode::Char('y') | KeyCode::Char('Y') => return Some(Action::Redo),
                 KeyCode::Char('e') | KeyCode::Char('E') => {

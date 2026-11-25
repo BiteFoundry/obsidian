@@ -4,9 +4,12 @@
 
 use std::{
     borrow::Cow,
-    io::{self, Stdout, Write},
+    io::{self, BufWriter, Stdout, Write},
     path::Path,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -15,16 +18,15 @@ use anyhow::Result;
 use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::{
     event::{
-        DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, EventStream,
+        DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent,
         KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
-    execute,
+    execute, queue,
     terminal::{
         disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, BeginSynchronizedUpdate,
         EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
     },
 };
-use futures::StreamExt;
 use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
 use tokio::sync::mpsc;
 
@@ -304,7 +306,7 @@ impl TerminalGuard {
         image_protocol: ImageProtocolPreference,
     ) -> Result<(
         Self,
-        Terminal<CrosstermBackend<Stdout>>,
+        Terminal<CrosstermBackend<BufWriter<Stdout>>>,
         TerminalGraphicsCaps,
     )> {
         #[cfg(windows)]
@@ -348,7 +350,7 @@ impl TerminalGuard {
             let _ = write_vt_mouse_enable(&mut stdout);
         }
 
-        let backend = CrosstermBackend::new(stdout);
+        let backend = CrosstermBackend::new(BufWriter::with_capacity(64 * 1024, stdout));
         let mut terminal = Terminal::new(backend)?;
         terminal.hide_cursor()?;
         terminal.clear()?;
@@ -366,7 +368,7 @@ impl TerminalGuard {
         ))
     }
 
-    fn resume_after_editor(&mut self) -> Result<Terminal<CrosstermBackend<Stdout>>> {
+    fn resume_after_editor(&mut self) -> Result<Terminal<CrosstermBackend<BufWriter<Stdout>>>> {
         self.pixel_tracker.clear();
         enable_raw_mode()?;
         let mut stdout = io::stdout();
@@ -399,7 +401,7 @@ impl TerminalGuard {
             let _ = write_vt_mouse_enable(&mut stdout);
         }
 
-        let backend = CrosstermBackend::new(stdout);
+        let backend = CrosstermBackend::new(BufWriter::with_capacity(64 * 1024, stdout));
         let mut terminal = Terminal::new(backend)?;
         terminal.hide_cursor()?;
         terminal.clear()?;
@@ -473,8 +475,117 @@ fn install_panic_hook(keyboard_enhanced: bool, orig_conin_mode: Option<u32>) {
     }));
 }
 
+const EVENT_READER_POLL: Duration = Duration::from_millis(25);
+const MAX_COALESCED_EVENTS: usize = 32;
+
+enum ReaderMsg {
+    Event(CrosstermEvent),
+    Eof,
+}
+
+/// Lock-free terminal event reader backed by a dedicated OS thread and Tokio unbounded channel.
+///
+/// Avoids `crossterm::event::EventStream` polling stalls and Windows `INTERNAL_EVENT_READER`
+/// contention while allowing clean pause/resume around external `$EDITOR` and Windows VT probes.
+struct TerminalEventReader {
+    rx: mpsc::UnboundedReceiver<ReaderMsg>,
+    tx: mpsc::UnboundedSender<ReaderMsg>,
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl TerminalEventReader {
+    fn start() -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut reader = Self {
+            rx,
+            tx,
+            stop,
+            handle: None,
+        };
+        reader.resume();
+        reader
+    }
+
+    #[cfg(test)]
+    fn from_channel(
+        tx: mpsc::UnboundedSender<ReaderMsg>,
+        rx: mpsc::UnboundedReceiver<ReaderMsg>,
+    ) -> Self {
+        Self {
+            rx,
+            tx,
+            stop: Arc::new(AtomicBool::new(true)),
+            handle: None,
+        }
+    }
+
+    fn resume(&mut self) {
+        if self.handle.is_some() {
+            return;
+        }
+        self.stop.store(false, Ordering::Release);
+        let stop = self.stop.clone();
+        let tx = self.tx.clone();
+        self.handle = std::thread::Builder::new()
+            .name("tui-event-reader".to_string())
+            .spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    match crossterm::event::poll(EVENT_READER_POLL) {
+                        Ok(true) => match crossterm::event::read() {
+                            Ok(ev) => {
+                                if tx.send(ReaderMsg::Event(ev)).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => {
+                                let _ = tx.send(ReaderMsg::Eof);
+                                break;
+                            }
+                        },
+                        Ok(false) => continue,
+                        Err(_) => {
+                            let _ = tx.send(ReaderMsg::Eof);
+                            break;
+                        }
+                    }
+                }
+            })
+            .ok();
+    }
+
+    fn pause(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+
+    async fn recv(&mut self) -> Option<CrosstermEvent> {
+        match self.rx.recv().await {
+            Some(ReaderMsg::Event(ev)) => Some(ev),
+            Some(ReaderMsg::Eof) | None => None,
+        }
+    }
+
+    fn try_recv(&mut self) -> std::result::Result<CrosstermEvent, mpsc::error::TryRecvError> {
+        match self.rx.try_recv() {
+            Ok(ReaderMsg::Event(ev)) => Ok(ev),
+            Ok(ReaderMsg::Eof) => Err(mpsc::error::TryRecvError::Disconnected),
+            Err(err) => Err(err),
+        }
+    }
+}
+
+impl Drop for TerminalEventReader {
+    fn drop(&mut self) {
+        self.pause();
+    }
+}
+
 fn draw_frame(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    terminal: &mut Terminal<CrosstermBackend<BufWriter<Stdout>>>,
     app: &mut AppState,
     ui: &mut UiState,
     guard: &mut TerminalGuard,
@@ -486,8 +597,7 @@ fn draw_frame(
     // Ensure HD modal image is rendered before draw (and auto-route HTML attachments to HtmlPreview)
     app.prepare_active_overlay(ui, size.width, size.height);
 
-    let mut stdout = io::stdout();
-    let _ = execute!(stdout, BeginSynchronizedUpdate);
+    let _ = queue!(terminal.backend_mut(), BeginSynchronizedUpdate);
 
     let draw_res: Result<()> = (|| {
         terminal.draw(|f| {
@@ -587,8 +697,12 @@ fn draw_frame(
 
         if plan.erase_and_redraw {
             if plan.delete_kitty {
-                let _ = stdout.write_all(img_preview::kitty_delete_preview_sequence().as_bytes());
-                let _ = stdout.write_all(img_preview::kitty_delete_all_sequence().as_bytes());
+                let _ = terminal
+                    .backend_mut()
+                    .write_all(img_preview::kitty_delete_preview_sequence().as_bytes());
+                let _ = terminal
+                    .backend_mut()
+                    .write_all(img_preview::kitty_delete_all_sequence().as_bytes());
             }
             for rect in &plan.erase_rects {
                 let erase = img_preview::erase_pixel_rect_sequence(
@@ -600,10 +714,10 @@ fn draw_frame(
                     ui.term_height,
                 );
                 if !erase.is_empty() {
-                    let _ = stdout.write_all(erase.as_bytes());
+                    let _ = terminal.backend_mut().write_all(erase.as_bytes());
                 }
             }
-            let _ = stdout.flush();
+            let _ = terminal.backend_mut().flush();
             terminal.clear()?;
             terminal.draw(|f| {
                 let _ = ui::draw(f, app, ui);
@@ -614,13 +728,14 @@ fn draw_frame(
         if plan.emit_desired {
             for (graphic, payload) in &resolved_payloads {
                 let move_seq = format!("\x1b[{};{}H", graphic.rect.y + 1, graphic.rect.x + 1);
-                let _ = stdout.write_all(move_seq.as_bytes());
-                let _ = stdout.write_all(payload.as_bytes());
+                let _ = terminal.backend_mut().write_all(move_seq.as_bytes());
+                let _ = terminal.backend_mut().write_all(payload.as_bytes());
                 if graphic.protocol == TerminalImageProtocol::Kitty {
                     guard.kitty_used = true;
                     KITTY_USED_GLOBAL.store(true, Ordering::Relaxed);
                 }
             }
+            let _ = terminal.backend_mut().flush();
         } else if plan.delete_kitty {
             guard.kitty_used = false;
         }
@@ -635,9 +750,55 @@ fn draw_frame(
         Ok(())
     })();
 
-    let _ = execute!(stdout, EndSynchronizedUpdate);
-    let _ = stdout.flush();
+    let _ = execute!(terminal.backend_mut(), EndSynchronizedUpdate);
     draw_res
+}
+
+fn handle_crossterm_event(
+    ev: CrosstermEvent,
+    app: &mut AppState,
+    ui: &mut UiState,
+    resized_to: &mut Option<(u16, u16)>,
+) -> bool {
+    match ev {
+        CrosstermEvent::Key(key) => {
+            let text_input = ui.is_text_input_active();
+            let effective_focus = if ui.overlay.is_some() {
+                ui::app::Focus::Overlay
+            } else {
+                ui.focus
+            };
+            if let Some(act) = event::key_to_action(
+                key,
+                effective_focus,
+                ui.canvas_mode,
+                &ui.keymap,
+                text_input,
+            ) {
+                app.dispatch(act, ui);
+            }
+            false
+        }
+        CrosstermEvent::Mouse(mouse) => {
+            if let Some(act) = event::mouse_to_action(mouse) {
+                app.dispatch(act, ui);
+            }
+            true
+        }
+        CrosstermEvent::Paste(pasted) => {
+            if ui.is_text_input_active() {
+                app.dispatch(ui::action::Action::Paste(pasted), ui);
+            }
+            false
+        }
+        CrosstermEvent::Resize(w, h) => {
+            ui.term_width = w;
+            ui.term_height = h;
+            *resized_to = Some((w, h));
+            true
+        }
+        _ => false,
+    }
 }
 
 pub async fn run_tui(cfg: AppConfig, vault: VaultProfile, storage: Storage) -> Result<()> {
@@ -672,7 +833,7 @@ pub async fn run_tui(cfg: AppConfig, vault: VaultProfile, storage: Storage) -> R
             .warning("config.toml could not be parsed: using defaults, settings will not be saved");
     }
 
-    let mut reader = EventStream::new();
+    let mut reader = TerminalEventReader::start();
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     let mut physics_tick = tokio::time::interval(Duration::from_millis(33));
     physics_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -694,13 +855,13 @@ pub async fn run_tui(cfg: AppConfig, vault: VaultProfile, storage: Storage) -> R
             continue;
         }
 
-        // Handle external `$EDITOR` launch cleanly (restore terminal -> edit -> path-scoped reindex -> re-enter)
+        // Handle external `$EDITOR` launch cleanly (pause reader -> restore terminal -> edit -> re-enter -> resume reader)
         if let Some(edit_path) = app.pending_external_editor.take() {
-            drop(reader);
+            reader.pause();
             guard.restore();
             let edit_res = launch_external_editor(&edit_path);
             terminal = guard.resume_after_editor()?;
-            reader = EventStream::new();
+            reader.resume();
             let sync_res = edit_res.and_then(|()| {
                 let canon_root = std::fs::canonicalize(&app.active_vault.path).ok();
                 if let Some(rel) = crate::vault::fs::rel_path_in_vault(
@@ -730,6 +891,7 @@ pub async fn run_tui(cfg: AppConfig, vault: VaultProfile, storage: Storage) -> R
             ui.canvas_mode == ui::app::CanvasMode::Graph && ui.graph_sim.is_active();
 
         let mut resized_to: Option<(u16, u16)> = None;
+        let mut reader_eof = false;
         redraw = tokio::select! {
             _ = physics_tick.tick(), if graph_animating => {
                 app.dispatch(ui::action::Action::GraphTick, &mut ui);
@@ -743,56 +905,55 @@ pub async fn run_tui(cfg: AppConfig, vault: VaultProfile, storage: Storage) -> R
                 app.handle_core_event(core_ev, &mut ui);
                 true
             }
-            maybe_ev = reader.next() => {
+            maybe_ev = reader.recv() => {
                 match maybe_ev {
-                    Some(Ok(CrosstermEvent::Key(key))) => {
-                        let text_input = ui.is_text_input_active();
-                        let effective_focus = if ui.overlay.is_some() {
-                            ui::app::Focus::Overlay
-                        } else {
-                            ui.focus
-                        };
-                        if let Some(act) = event::key_to_action(
-                            key,
-                            effective_focus,
-                            ui.canvas_mode,
-                            &ui.keymap,
-                            text_input,
-                        ) {
-                            app.dispatch(act, &mut ui);
+                    Some(ev) => {
+                        let mut break_coalesce =
+                            handle_crossterm_event(ev, &mut app, &mut ui, &mut resized_to);
+                        let mut drained = 0usize;
+                        while !break_coalesce
+                            && drained < MAX_COALESCED_EVENTS
+                            && !ui.should_quit
+                            && app.pending_external_editor.is_none()
+                            && app.pending_html_serve.is_none()
+                        {
+                            match reader.try_recv() {
+                                Ok(next_ev) => {
+                                    drained += 1;
+                                    break_coalesce = handle_crossterm_event(
+                                        next_ev,
+                                        &mut app,
+                                        &mut ui,
+                                        &mut resized_to,
+                                    );
+                                }
+                                Err(mpsc::error::TryRecvError::Empty) => break,
+                                Err(mpsc::error::TryRecvError::Disconnected) => {
+                                    reader_eof = true;
+                                    break;
+                                }
+                            }
                         }
                     }
-                    Some(Ok(CrosstermEvent::Mouse(mouse))) => {
-                        if let Some(act) = event::mouse_to_action(mouse) {
-                            app.dispatch(act, &mut ui);
-                        }
-                    }
-                    Some(Ok(CrosstermEvent::Paste(pasted))) => {
-                        if ui.is_text_input_active() {
-                            app.dispatch(ui::action::Action::Paste(pasted), &mut ui);
-                        }
-                    }
-                    Some(Ok(CrosstermEvent::Resize(w, h))) => {
-                        ui.term_width = w;
-                        ui.term_height = h;
-                        resized_to = Some((w, h));
-                    }
-                    Some(Err(_)) | None => break,
-                    _ => {}
+                    None => reader_eof = true,
                 }
                 true
             }
         };
 
+        if reader_eof {
+            break;
+        }
+
         if let Some((w, h)) = resized_to {
             #[cfg(windows)]
             {
-                drop(reader);
+                reader.pause();
                 img_preview::refresh_cell_pixel_size(&mut app.graphics_caps);
                 win_console::enforce_windows_mouse_capture();
                 let mut stdout = io::stdout();
                 let _ = write_vt_mouse_enable(&mut stdout);
-                reader = EventStream::new();
+                reader.resume();
             }
             #[cfg(not(windows))]
             {
@@ -802,6 +963,7 @@ pub async fn run_tui(cfg: AppConfig, vault: VaultProfile, storage: Storage) -> R
         }
     }
 
+    reader.pause();
     app.html_server.shutdown();
     Ok(())
 }
@@ -1140,5 +1302,68 @@ mod tests {
         let resize_plan = tracker.plan_transition(std::slice::from_ref(&crop1), (150, 42), false);
         assert!(resize_plan.erase_and_redraw);
         assert!(resize_plan.emit_desired);
+    }
+
+    #[tokio::test]
+    async fn terminal_event_reader_try_recv_is_non_blocking_and_wakes_immediately() {
+        use std::time::Instant;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut reader = TerminalEventReader::from_channel(tx.clone(), rx);
+
+        // Empty queue returns immediately without blocking.
+        let t0 = Instant::now();
+        assert!(matches!(
+            reader.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(t0.elapsed() < Duration::from_millis(5));
+
+        // Async recv wakes immediately on single keystroke without waiting for any tick.
+        let tx_bg = tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let _ = tx_bg.send(ReaderMsg::Event(CrosstermEvent::Key(KeyEvent::new(
+                KeyCode::Char('a'),
+                KeyModifiers::NONE,
+            ))));
+        });
+        let t1 = Instant::now();
+        let ev = tokio::time::timeout(Duration::from_millis(100), reader.recv())
+            .await
+            .expect("recv must wake immediately");
+        assert!(matches!(
+            ev,
+            Some(CrosstermEvent::Key(KeyEvent {
+                code: KeyCode::Char('a'),
+                ..
+            }))
+        ));
+        assert!(t1.elapsed() < Duration::from_millis(80));
+
+        // Subsequent try_recv does not poison future async recv wakers.
+        assert!(matches!(
+            reader.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        let _ = tx.send(ReaderMsg::Event(CrosstermEvent::Key(KeyEvent::new(
+            KeyCode::Char('b'),
+            KeyModifiers::NONE,
+        ))));
+        let ev2 = tokio::time::timeout(Duration::from_millis(50), reader.recv())
+            .await
+            .expect("second recv must wake immediately after try_recv");
+        assert!(matches!(
+            ev2,
+            Some(CrosstermEvent::Key(KeyEvent {
+                code: KeyCode::Char('b'),
+                ..
+            }))
+        ));
+
+        // Explicit EOF reports clean termination even while sender handle exists.
+        let _ = tx.send(ReaderMsg::Eof);
+        assert!(reader.recv().await.is_none());
     }
 }

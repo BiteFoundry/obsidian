@@ -1,12 +1,17 @@
 //! In-Place Inline Markdown Note Editor directly inside `note_view`.
 //!
 //! Backed by `crate::ui::composer::MultiLineComposer`, featuring:
+//! - Obsidian-style **Live Preview** (default) & **Source** mode toggleable via `Ctrl+M` or `[Live]`/`[Src]` pill:
+//!   - Inactive logical lines render rich Markdown (styled headings hiding `# `, `☐`/`☑` tasks,
+//!     `• ` bullets, `┃ ` blockquotes/callouts, `──────────` dividers, muted code fences + tinted code,
+//!     muted YAML frontmatter, and hidden inline delimiters for `**bold**`, `*italic*`, `` `code` ``,
+//!     `~~strike~~`, `[[wikilink]]`, `#tag`)
+//!   - Active cursor logical line reveals raw syntax-highlighted Markdown with exact ASCII + Korean/CJK
+//!     hardware cursor `(cx, cy)` across soft-wrapped visual lines
 //! - Compact 1-line inline edit header bar with live status (`✓ Live Saved` / `● Editing...` / `⚠ Error`),
-//!   clickable pills (`[✓ Done]`, `[Ctrl+S Save]`, `[Ext $EDITOR]`), and `Ln X, Col Y`
-//! - Live Markdown syntax highlighting (`#` headings, `[[wikilinks]]`, `#tags`, `- [ ]`/`- [x]` tasks,
-//!   `>` callouts/quotes, `` ` `` code, YAML frontmatter)
-//! - Mouse click-to-place cursor, mouse wheel scrolling + vertical scrollbar, UTF-8/Korean input,
-//!   Tab (2 spaces), clipboard paste, and Undo/Redo
+//!   clickable pills (`[Live]`/`[Src]`, `[✓ Done]`, `[Ctrl+S Save]`, `[Ext $EDITOR]`), and `Ln X, Col Y`
+//! - Mouse click-to-place cursor (accurate in both LivePreview and Source layouts), mouse wheel scrolling
+//!   + vertical scrollbar, UTF-8/Korean input, Tab (2 spaces), clipboard paste, and Undo/Redo
 //! - 250ms debounced auto-save state tracking (`dirty`, `dirty_since`).
 
 use std::time::{Duration, Instant};
@@ -21,9 +26,10 @@ use ratatui::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
+    models::CalloutKind,
     ui::{
         action::Action,
-        composer::{text_layout, truncate_display, MultiLineComposer},
+        composer::{truncate_display, MultiLineComposer},
         hitmap::{ButtonId, HitMap, HitTarget},
         theme::Theme,
     },
@@ -32,6 +38,29 @@ use crate::{
 
 /// Debounce window before automatically flushing inline edits to disk + SQLite.
 pub const INLINE_AUTOSAVE_DEBOUNCE_MS: u64 = 250;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EditorMode {
+    #[default]
+    LivePreview,
+    Source,
+}
+
+impl EditorMode {
+    pub fn toggle(self) -> Self {
+        match self {
+            Self::LivePreview => Self::Source,
+            Self::Source => Self::LivePreview,
+        }
+    }
+
+    pub fn pill_label(self) -> &'static str {
+        match self {
+            Self::LivePreview => "[Live]",
+            Self::Source => "[Src]",
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExternalConflict {
@@ -60,6 +89,7 @@ pub struct InlineNoteEditor {
     pub note_title: String,
     pub base_content_hash: [u8; 32],
     pub external_conflict: Option<ExternalConflict>,
+    pub mode: EditorMode,
     pub composer: MultiLineComposer,
     pub scroll_y: u16,
     pub follow_cursor: bool,
@@ -105,6 +135,7 @@ impl InlineNoteEditor {
             note_title: note_title.into(),
             base_content_hash,
             external_conflict: None,
+            mode: EditorMode::LivePreview,
             composer,
             scroll_y: initial_scroll_y,
             follow_cursor: initial_scroll_y == 0,
@@ -115,6 +146,12 @@ impl InlineNoteEditor {
             dirty_since: None,
             save_status: InlineSaveStatus::Saved,
         }
+    }
+
+    pub fn toggle_mode(&mut self) -> EditorMode {
+        self.mode = self.mode.toggle();
+        self.follow_cursor = true;
+        self.mode
     }
 
     /// Cleanly reloads editor text from disk after an external modification (when buffer is clean).
@@ -185,8 +222,44 @@ impl InlineNoteEditor {
         self.composer.cursor_line_col()
     }
 
+    /// Places the cursor on a 0-based logical line at the UTF-8 byte corresponding to
+    /// `display_col` (respecting LivePreview delimiter hiding when in `LivePreview` mode).
+    pub fn place_cursor_at_logical_line_col(&mut self, zero_based_line: usize, display_col: usize) {
+        let text = self.composer.text();
+        let ctx = build_line_context(text);
+        if ctx.is_empty() {
+            self.composer.set_cursor(0);
+            self.follow_cursor = true;
+            return;
+        }
+        let line_idx = zero_based_line.min(ctx.len().saturating_sub(1));
+        let info = &ctx[line_idx];
+        let new_pos = if display_col == 0 {
+            info.start
+        } else if self.mode == EditorMode::LivePreview {
+            let dummy_theme = Theme::no_color();
+            let line_text = text.get(info.start..info.end).unwrap_or("");
+            let segs = build_live_segments(
+                line_text,
+                info.start,
+                info.kind,
+                self.last_content_width.max(1) as usize,
+                &dummy_theme,
+            );
+            byte_at_live_segments(&segs, info.end, display_col)
+        } else {
+            byte_at_display_col(text, info.start, info.end, display_col)
+        };
+        self.composer.set_cursor(new_pos);
+        self.follow_cursor = true;
+    }
+
     pub fn handle_edit_action(&mut self, action: &Action) -> InlineEditEvent {
         match action {
+            Action::ToggleEditorMode => {
+                self.toggle_mode();
+                InlineEditEvent::CursorOrScrollChanged
+            }
             Action::Input(ch) => {
                 self.composer.insert_char(*ch);
                 self.follow_cursor = true;
@@ -316,7 +389,8 @@ impl InlineNoteEditor {
         }
     }
 
-    /// Places the cursor at the UTF-8 byte position corresponding to terminal screen `(col, row)`.
+    /// Places the cursor at the UTF-8 byte position corresponding to terminal screen `(col, row)`,
+    /// handling both LivePreview visual rows (with hidden Markdown delimiters) and Source rows.
     pub fn place_cursor_at_screen_pos(&mut self, col: u16, row: u16) -> bool {
         if !self.last_editor_area.contains(Position::new(col, row)) {
             return false;
@@ -325,21 +399,33 @@ impl InlineNoteEditor {
         let target_col = (col - self.last_editor_area.x) as usize;
         let width = self.last_content_width.max(1) as usize;
         let text = self.composer.text();
-        let (visual, _, _) = text_layout(text, width, self.composer.cursor());
+        let dummy_theme = Theme::no_color();
+        let layout = build_visual_layout(
+            text,
+            width,
+            self.composer.cursor(),
+            self.mode,
+            self.composer.selection_range(),
+            &dummy_theme,
+        );
 
         let visual_idx = (self.scroll_y as usize).saturating_add(rel_row);
-        let new_pos = if visual_idx >= visual.len() {
+        let new_pos = if visual_idx >= layout.rows.len() {
             text.len()
         } else {
-            let (start, end) = visual[visual_idx];
-            byte_at_display_col(text, start, end, target_col)
+            let vrow = &layout.rows[visual_idx];
+            if let Some((start, end)) = vrow.raw_slice {
+                byte_at_display_col(text, start, end, target_col)
+            } else {
+                byte_at_live_segments(&vrow.live_segs, vrow.raw_line_end, target_col)
+            }
         };
         self.composer.set_cursor(new_pos);
         self.follow_cursor = true;
         true
     }
 
-    /// Renders the 1-line inline edit header bar + syntax-highlighted editable Markdown directly
+    /// Renders the 1-line inline edit header bar + LivePreview/Source Markdown directly
     /// inside `note_view`'s `content_area`, returning the live terminal cursor `(x, y)` if visible.
     pub fn draw(
         &mut self,
@@ -364,11 +450,20 @@ impl InlineNoteEditor {
         }
         self.last_viewport_height = body_h;
 
+        let cursor = self.composer.cursor();
+        let selection = self.composer.selection_range();
+
         // Probe line count to decide whether to reserve 1 col for the right scrollbar
         let probe_w = content_area.width.saturating_sub(1).max(1) as usize;
-        let (probe_visual, _, _) =
-            text_layout(self.composer.text(), probe_w, self.composer.cursor());
-        let show_scrollbar = probe_visual.len() > body_h as usize && content_area.width > 3;
+        let probe_layout = build_visual_layout(
+            self.composer.text(),
+            probe_w,
+            cursor,
+            self.mode,
+            selection,
+            theme,
+        );
+        let show_scrollbar = probe_layout.rows.len() > body_h as usize && content_area.width > 3;
         let content_w = if show_scrollbar {
             content_area.width.saturating_sub(1)
         } else {
@@ -376,11 +471,24 @@ impl InlineNoteEditor {
         };
         self.last_content_width = content_w;
         self.composer.last_inner_width = content_w;
-
         let text = self.composer.text();
-        let (visual, cursor_row, cursor_col) =
-            text_layout(text, content_w.max(1) as usize, self.composer.cursor());
-        let total_rows = visual.len();
+
+        let layout = if content_w as usize == probe_w {
+            probe_layout
+        } else {
+            build_visual_layout(
+                text,
+                content_w.max(1) as usize,
+                cursor,
+                self.mode,
+                selection,
+                theme,
+            )
+        };
+
+        let total_rows = layout.rows.len();
+        let cursor_row = layout.cursor_row;
+        let cursor_col = layout.cursor_col;
         let view_h = body_h as usize;
         let max_scroll = total_rows.saturating_sub(view_h);
 
@@ -399,8 +507,11 @@ impl InlineNoteEditor {
         self.last_editor_area = editor_area;
         hitmap.add(editor_area, HitTarget::InlineEditorBody);
 
-        let surface_style = Style::default().bg(theme.bg_composer).fg(theme.fg_primary);
-        let selection = self.composer.selection_range();
+        let surface_bg = match self.mode {
+            EditorMode::LivePreview => theme.bg_canvas,
+            EditorMode::Source => theme.bg_composer,
+        };
+        let surface_style = Style::default().bg(surface_bg).fg(theme.fg_primary);
         let mut lines: Vec<Line<'static>> = Vec::with_capacity(view_h);
 
         if text.is_empty() {
@@ -412,11 +523,19 @@ impl InlineNoteEditor {
                 theme.muted_style().add_modifier(Modifier::ITALIC),
             )));
         } else {
-            let ctx = build_line_context(text);
-            for &(start, end) in visual.iter().skip(offset).take(view_h) {
-                lines.push(highlight_visual_slice(
-                    text, start, end, &ctx, selection, theme,
-                ));
+            for vrow in layout.rows.iter().skip(offset).take(view_h) {
+                if let Some((start, end)) = vrow.raw_slice {
+                    lines.push(highlight_visual_slice(
+                        text,
+                        start,
+                        end,
+                        &layout.ctx,
+                        selection,
+                        theme,
+                    ));
+                } else {
+                    lines.push(render_live_visual_row(vrow, theme));
+                }
             }
         }
 
@@ -465,17 +584,24 @@ impl InlineNoteEditor {
 
         let (ln, col) = self.cursor_line_col();
         let ln_col_label = format!("Ln {ln}, Col {col}");
+        let mode_pill = self.mode.pill_label();
         let done_pill = "[✓ Done]";
         let save_pill = "[Ctrl+S Save]";
         let ext_pill = "[Ext $EDITOR]";
 
-        let pills_w = (done_pill.width() + 1 + save_pill.width() + 1 + ext_pill.width()) as u16;
+        let pills_w = (mode_pill.width()
+            + 1
+            + done_pill.width()
+            + 1
+            + save_pill.width()
+            + 1
+            + ext_pill.width()) as u16;
         let ln_w = ln_col_label.width() as u16;
         let total_w = area.width;
 
-        // Decide right-side elements: always prioritize clickable pills, add `Ln X, Col Y` when space allows
+        // Prioritize clickable pills + full status; show `Ln X, Col Y` when width comfortably allows both.
         let show_pills = total_w >= pills_w + 10;
-        let show_ln_col = show_pills && total_w >= pills_w + ln_w + 18;
+        let show_ln_col = show_pills && total_w >= pills_w + ln_w + 25;
         let right_w = if show_ln_col {
             pills_w + 1 + ln_w
         } else if show_pills {
@@ -523,8 +649,19 @@ impl InlineNoteEditor {
         );
 
         if show_pills {
+            let mode_style = match self.mode {
+                EditorMode::LivePreview => Style::default()
+                    .fg(theme.bg_canvas)
+                    .bg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+                EditorMode::Source => Style::default()
+                    .fg(theme.accent_soft)
+                    .bg(theme.bg_card)
+                    .add_modifier(Modifier::BOLD),
+            };
             let mut px = area.right().saturating_sub(right_w);
             for (label, btn, style) in [
+                (mode_pill, ButtonId::ToggleEditorMode, mode_style),
                 (
                     done_pill,
                     ButtonId::FinishInlineEdit,
@@ -586,12 +723,890 @@ fn byte_at_display_col(text: &str, start: usize, end: usize, target_col: usize) 
     end
 }
 
+#[derive(Debug, Clone)]
+struct LiveSeg {
+    text: String,
+    style: Style,
+    raw_start: usize,
+    raw_end: usize,
+    is_literal: bool,
+}
+
+#[derive(Debug, Clone)]
+struct VisualRow {
+    raw_line_end: usize,
+    /// When `Some((start, end))`, this row renders raw source `text[start..end]`.
+    raw_slice: Option<(usize, usize)>,
+    /// When `raw_slice` is `None`, this row renders LivePreview styled segments.
+    live_segs: Vec<LiveSeg>,
+    /// Optional line-level background tint (e.g. fenced code body in LivePreview).
+    bg_tint: Option<ratatui::style::Color>,
+}
+
+struct EditorVisualLayout {
+    ctx: Vec<LogicalLineInfo>,
+    rows: Vec<VisualRow>,
+    cursor_row: usize,
+    cursor_col: usize,
+}
+
+fn byte_at_live_segments(segs: &[LiveSeg], fallback_end: usize, target_col: usize) -> usize {
+    let mut col = 0usize;
+    for seg in segs {
+        if seg.is_literal {
+            for (rel_idx, ch) in seg.text.char_indices() {
+                let cw = if ch == '\t' {
+                    4
+                } else {
+                    UnicodeWidthChar::width(ch).unwrap_or(0)
+                };
+                if cw > 0 && target_col < col + cw {
+                    return (seg.raw_start + rel_idx).min(seg.raw_end);
+                }
+                col += cw;
+            }
+        } else {
+            let sw = seg
+                .text
+                .chars()
+                .map(|ch| {
+                    if ch == '\t' {
+                        4
+                    } else {
+                        UnicodeWidthChar::width(ch).unwrap_or(0)
+                    }
+                })
+                .sum::<usize>();
+            if sw > 0 && target_col < col + sw {
+                return if target_col == col && col == 0 {
+                    seg.raw_start
+                } else {
+                    seg.raw_end
+                };
+            }
+            col += sw;
+        }
+    }
+    fallback_end
+}
+
+fn render_live_visual_row(vrow: &VisualRow, _theme: &Theme) -> Line<'static> {
+    if vrow.live_segs.is_empty() {
+        return match vrow.bg_tint {
+            Some(bg) => Line::from(Span::styled(" ", Style::default().bg(bg))),
+            None => Line::from(""),
+        };
+    }
+    let spans: Vec<Span<'static>> = vrow
+        .live_segs
+        .iter()
+        .map(|seg| {
+            let content = if seg.text.contains('\t') {
+                seg.text.replace('\t', "    ")
+            } else {
+                seg.text.clone()
+            };
+            let style = match vrow.bg_tint {
+                Some(bg) if seg.style.bg.is_none() => seg.style.bg(bg),
+                _ => seg.style,
+            };
+            Span::styled(content, style)
+        })
+        .collect();
+    Line::from(spans)
+}
+
+fn build_visual_layout(
+    text: &str,
+    width: usize,
+    cursor: usize,
+    mode: EditorMode,
+    selection: Option<(usize, usize)>,
+    theme: &Theme,
+) -> EditorVisualLayout {
+    let width = width.max(1);
+    let ctx = build_line_context(text);
+    let active_line_idx = ctx
+        .partition_point(|info| info.end < cursor)
+        .min(ctx.len().saturating_sub(1));
+
+    let mut rows: Vec<VisualRow> = Vec::with_capacity(ctx.len());
+    let mut cursor_pos: Option<(usize, usize)> = None;
+
+    for (line_idx, info) in ctx.iter().enumerate() {
+        let sel_overlaps = selection.is_some_and(|(from, to)| from <= info.end && to >= info.start);
+        let render_raw = mode == EditorMode::Source || line_idx == active_line_idx || sel_overlaps;
+
+        if render_raw {
+            let line_slice = text.get(info.start..info.end).unwrap_or("");
+            let mut seg_start = info.start;
+            let mut col = 0usize;
+
+            for (rel_idx, ch) in line_slice.char_indices() {
+                let abs_idx = info.start + rel_idx;
+                let cw = if ch == '\t' {
+                    4
+                } else {
+                    UnicodeWidthChar::width(ch).unwrap_or(0)
+                };
+                if col > 0 && col + cw > width {
+                    rows.push(VisualRow {
+                        raw_line_end: info.end,
+                        raw_slice: Some((seg_start, abs_idx)),
+                        live_segs: Vec::new(),
+                        bg_tint: None,
+                    });
+                    seg_start = abs_idx;
+                    col = 0;
+                }
+                if abs_idx == cursor {
+                    cursor_pos = Some((rows.len(), col));
+                }
+                col += cw;
+            }
+            if cursor == info.end && line_idx == active_line_idx {
+                cursor_pos = Some((rows.len(), col));
+            }
+            rows.push(VisualRow {
+                raw_line_end: info.end,
+                raw_slice: Some((seg_start, info.end)),
+                live_segs: Vec::new(),
+                bg_tint: None,
+            });
+        } else {
+            let line_slice = text.get(info.start..info.end).unwrap_or("");
+            let segs = build_live_segments(line_slice, info.start, info.kind, width, theme);
+            let bg_tint = (info.kind == LogicalLineKind::CodeBody).then_some(theme.bg_code);
+            wrap_live_segments(segs, info.end, width, bg_tint, &mut rows);
+        }
+    }
+
+    let (cursor_row, cursor_col) = cursor_pos.unwrap_or((rows.len().saturating_sub(1), 0));
+    EditorVisualLayout {
+        ctx,
+        rows,
+        cursor_row,
+        cursor_col,
+    }
+}
+
+fn wrap_live_segments(
+    segs: Vec<LiveSeg>,
+    raw_line_end: usize,
+    width: usize,
+    bg_tint: Option<ratatui::style::Color>,
+    out: &mut Vec<VisualRow>,
+) {
+    let width = width.max(1);
+    let mut cur_segs: Vec<LiveSeg> = Vec::new();
+    let mut col = 0usize;
+
+    for seg in segs {
+        if seg.text.is_empty() {
+            continue;
+        }
+        let mut run = String::new();
+        let mut run_raw_start = seg.raw_start;
+        for (rel_idx, ch) in seg.text.char_indices() {
+            let cw = if ch == '\t' {
+                4
+            } else {
+                UnicodeWidthChar::width(ch).unwrap_or(0)
+            };
+            if col > 0 && col + cw > width {
+                if !run.is_empty() {
+                    let run_raw_end = if seg.is_literal {
+                        (seg.raw_start + rel_idx).min(seg.raw_end)
+                    } else {
+                        seg.raw_end
+                    };
+                    cur_segs.push(LiveSeg {
+                        text: std::mem::take(&mut run),
+                        style: seg.style,
+                        raw_start: run_raw_start,
+                        raw_end: run_raw_end,
+                        is_literal: seg.is_literal,
+                    });
+                    if seg.is_literal {
+                        run_raw_start = run_raw_end;
+                    }
+                }
+                out.push(VisualRow {
+                    raw_line_end,
+                    raw_slice: None,
+                    live_segs: std::mem::take(&mut cur_segs),
+                    bg_tint,
+                });
+                col = 0;
+            }
+            run.push(ch);
+            col += cw;
+        }
+        if !run.is_empty() {
+            cur_segs.push(LiveSeg {
+                text: run,
+                style: seg.style,
+                raw_start: run_raw_start,
+                raw_end: seg.raw_end,
+                is_literal: seg.is_literal,
+            });
+        }
+    }
+
+    out.push(VisualRow {
+        raw_line_end,
+        raw_slice: None,
+        live_segs: cur_segs,
+        bg_tint,
+    });
+}
+
+fn is_horizontal_rule(trimmed: &str) -> bool {
+    let mut rule_ch: Option<char> = None;
+    let mut count = 0usize;
+    for ch in trimmed.chars() {
+        if ch == ' ' || ch == '\t' {
+            continue;
+        }
+        if !matches!(ch, '-' | '*' | '_') {
+            return false;
+        }
+        match rule_ch {
+            None => {
+                rule_ch = Some(ch);
+                count = 1;
+            }
+            Some(prev) if prev == ch => count += 1,
+            Some(_) => return false,
+        }
+    }
+    count >= 3
+}
+
+/// Converts a single inactive Markdown logical line into rich styled LivePreview segments
+/// with raw Markdown delimiters hidden and exact raw-byte hit mappings preserved.
+fn build_live_segments(
+    line: &str,
+    line_start: usize,
+    kind: LogicalLineKind,
+    content_w: usize,
+    theme: &Theme,
+) -> Vec<LiveSeg> {
+    let mut out = Vec::new();
+    let line_end = line_start + line.len();
+
+    match kind {
+        LogicalLineKind::FrontmatterDelimiter => {
+            let bar_w = content_w.clamp(3, 32);
+            out.push(LiveSeg {
+                text: "─".repeat(bar_w),
+                style: theme.subtle_style(),
+                raw_start: line_start,
+                raw_end: line_end,
+                is_literal: false,
+            });
+            return out;
+        }
+        LogicalLineKind::FrontmatterBody => {
+            if let Some(colon) = line.find(':') {
+                let key_end = colon + 1;
+                out.push(LiveSeg {
+                    text: line[..key_end].to_string(),
+                    style: theme.muted_style().add_modifier(Modifier::BOLD),
+                    raw_start: line_start,
+                    raw_end: line_start + key_end,
+                    is_literal: true,
+                });
+                if key_end < line.len() {
+                    out.push(LiveSeg {
+                        text: line[key_end..].to_string(),
+                        style: theme.muted_style(),
+                        raw_start: line_start + key_end,
+                        raw_end: line_end,
+                        is_literal: true,
+                    });
+                }
+            } else {
+                out.push(LiveSeg {
+                    text: line.to_string(),
+                    style: theme.muted_style(),
+                    raw_start: line_start,
+                    raw_end: line_end,
+                    is_literal: true,
+                });
+            }
+            return out;
+        }
+        LogicalLineKind::CodeFenceOpen => {
+            let trimmed = line.trim();
+            let fence_ch = trimmed.chars().next().unwrap_or('`');
+            let fence_len = trimmed.chars().take_while(|&c| c == fence_ch).count();
+            let lang = trimmed[fence_len..].trim();
+            let marker = if lang.is_empty() {
+                "╭─ code".to_string()
+            } else {
+                format!("╭─ {lang}")
+            };
+            out.push(LiveSeg {
+                text: marker,
+                style: Style::default()
+                    .fg(theme.code_fg)
+                    .add_modifier(Modifier::DIM),
+                raw_start: line_start,
+                raw_end: line_end,
+                is_literal: false,
+            });
+            return out;
+        }
+        LogicalLineKind::CodeFenceClose => {
+            out.push(LiveSeg {
+                text: "╰───".to_string(),
+                style: Style::default()
+                    .fg(theme.code_fg)
+                    .add_modifier(Modifier::DIM),
+                raw_start: line_start,
+                raw_end: line_end,
+                is_literal: false,
+            });
+            return out;
+        }
+        LogicalLineKind::CodeBody => {
+            if !line.is_empty() {
+                out.push(LiveSeg {
+                    text: line.to_string(),
+                    style: Style::default().fg(theme.code_fg).bg(theme.bg_code),
+                    raw_start: line_start,
+                    raw_end: line_end,
+                    is_literal: true,
+                });
+            }
+            return out;
+        }
+        LogicalLineKind::Normal => {}
+    }
+
+    let trimmed_start = line.len() - line.trim_start().len();
+    let indent = &line[..trimmed_start];
+    let rest = &line[trimmed_start..];
+    let trimmed = rest.trim_end();
+
+    if trimmed.is_empty() {
+        return out;
+    }
+
+    // 1. Horizontal rule (`---`, `***`, `___`)
+    if is_horizontal_rule(trimmed) {
+        let bar_w = content_w.clamp(10, 48);
+        out.push(LiveSeg {
+            text: "─".repeat(bar_w),
+            style: Style::default().fg(theme.divider),
+            raw_start: line_start,
+            raw_end: line_end,
+            is_literal: false,
+        });
+        return out;
+    }
+
+    // 2. ATX Headings (`#`–`###### `) -> hide leading `# ` markers, render bold/accent heading text
+    let hashes = rest.bytes().take_while(|&b| b == b'#').count();
+    if (1..=6).contains(&hashes)
+        && rest
+            .as_bytes()
+            .get(hashes)
+            .is_none_or(|&b| b == b' ' || b == b'\t')
+    {
+        let h_style = match hashes {
+            1 => Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+            2 => Style::default()
+                .fg(theme.accent_soft)
+                .add_modifier(Modifier::BOLD),
+            _ => Style::default()
+                .fg(theme.fg_primary)
+                .add_modifier(Modifier::BOLD),
+        };
+        let after_hashes = &rest[hashes..];
+        let ws = after_hashes.len() - after_hashes.trim_start_matches([' ', '\t']).len();
+        let content_rel = trimmed_start + hashes + ws;
+        parse_live_inline_segments(
+            &line[content_rel..],
+            line_start + content_rel,
+            h_style,
+            theme,
+            &mut out,
+        );
+        return out;
+    }
+
+    // 3. Blockquotes & Obsidian Callouts (`> `, `>> `, `> [!tip] Title`)
+    if rest.starts_with('>') {
+        if !indent.is_empty() {
+            out.push(LiveSeg {
+                text: indent.to_string(),
+                style: Style::default().fg(theme.fg_primary),
+                raw_start: line_start,
+                raw_end: line_start + trimmed_start,
+                is_literal: true,
+            });
+        }
+        let mut cursor_rel = trimmed_start;
+        let mut depth = 0usize;
+        while line[cursor_rel..].starts_with('>') {
+            depth += 1;
+            cursor_rel += 1;
+            if line[cursor_rel..].starts_with(' ') {
+                cursor_rel += 1;
+            }
+        }
+        let body = &line[cursor_rel..];
+        if let Some(after_open) = body.strip_prefix("[!") {
+            if let Some(close) = after_open.find(']') {
+                let kind_str = &after_open[..close];
+                let ck = CalloutKind::parse_str(kind_str);
+                let c_color = theme.callout_color(ck);
+                let bar_style = Style::default().fg(c_color).add_modifier(Modifier::BOLD);
+                out.push(LiveSeg {
+                    text: "┃ ".repeat(depth),
+                    style: bar_style,
+                    raw_start: line_start + trimmed_start,
+                    raw_end: line_start + cursor_rel,
+                    is_literal: false,
+                });
+                let after_tag_rel = cursor_rel + 2 + close + 1;
+                let rest_after_tag = &line[after_tag_rel..];
+                let sp = rest_after_tag.len() - rest_after_tag.trim_start().len();
+                let title_rel = after_tag_rel + sp;
+                out.push(LiveSeg {
+                    text: format!("{} {}", ck.glyph(), ck.label()),
+                    style: bar_style,
+                    raw_start: line_start + cursor_rel,
+                    raw_end: line_start + after_tag_rel,
+                    is_literal: false,
+                });
+                if title_rel < line.len() {
+                    out.push(LiveSeg {
+                        text: " ".to_string(),
+                        style: bar_style,
+                        raw_start: line_start + after_tag_rel,
+                        raw_end: line_start + title_rel,
+                        is_literal: false,
+                    });
+                    parse_live_inline_segments(
+                        &line[title_rel..],
+                        line_start + title_rel,
+                        Style::default()
+                            .fg(theme.fg_primary)
+                            .add_modifier(Modifier::BOLD),
+                        theme,
+                        &mut out,
+                    );
+                }
+                return out;
+            }
+        }
+        out.push(LiveSeg {
+            text: "┃ ".repeat(depth),
+            style: Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+            raw_start: line_start + trimmed_start,
+            raw_end: line_start + cursor_rel,
+            is_literal: false,
+        });
+        parse_live_inline_segments(
+            body,
+            line_start + cursor_rel,
+            theme.quote_style(),
+            theme,
+            &mut out,
+        );
+        return out;
+    }
+
+    // 4. Task lists (`- [ ] `, `- [x] `, `* [ ] `, `+ [x] `) and Bullet lists (`- `, `* `, `+ `)
+    for prefix in ["- ", "* ", "+ "] {
+        if let Some(after_bullet) = rest.strip_prefix(prefix) {
+            if !indent.is_empty() {
+                out.push(LiveSeg {
+                    text: indent.to_string(),
+                    style: Style::default().fg(theme.fg_primary),
+                    raw_start: line_start,
+                    raw_end: line_start + trimmed_start,
+                    is_literal: true,
+                });
+            }
+            let bullet_end = trimmed_start + prefix.len();
+            let is_unchecked = after_bullet.starts_with("[ ]")
+                && after_bullet
+                    .as_bytes()
+                    .get(3)
+                    .is_none_or(|&b| b == b' ' || b == b'\t');
+            let is_checked = (after_bullet.starts_with("[x]") || after_bullet.starts_with("[X]"))
+                && after_bullet
+                    .as_bytes()
+                    .get(3)
+                    .is_none_or(|&b| b == b' ' || b == b'\t');
+
+            if is_unchecked || is_checked {
+                let mut content_rel = bullet_end + 3;
+                if line.as_bytes().get(content_rel).is_some_and(|&b| b == b' ') {
+                    content_rel += 1;
+                }
+                let (glyph, glyph_style, text_style) = if is_checked {
+                    (
+                        "☑ ",
+                        Style::default()
+                            .fg(theme.success)
+                            .add_modifier(Modifier::BOLD),
+                        theme
+                            .muted_style()
+                            .add_modifier(Modifier::DIM | Modifier::CROSSED_OUT),
+                    )
+                } else {
+                    (
+                        "☐ ",
+                        Style::default()
+                            .fg(theme.accent)
+                            .add_modifier(Modifier::BOLD),
+                        Style::default().fg(theme.fg_primary),
+                    )
+                };
+                out.push(LiveSeg {
+                    text: glyph.to_string(),
+                    style: glyph_style,
+                    raw_start: line_start + trimmed_start,
+                    raw_end: line_start + content_rel,
+                    is_literal: false,
+                });
+                parse_live_inline_segments(
+                    &line[content_rel..],
+                    line_start + content_rel,
+                    text_style,
+                    theme,
+                    &mut out,
+                );
+                return out;
+            }
+
+            // Plain bullet list item
+            out.push(LiveSeg {
+                text: "• ".to_string(),
+                style: Style::default()
+                    .fg(theme.accent_soft)
+                    .add_modifier(Modifier::BOLD),
+                raw_start: line_start + trimmed_start,
+                raw_end: line_start + bullet_end,
+                is_literal: false,
+            });
+            parse_live_inline_segments(
+                &line[bullet_end..],
+                line_start + bullet_end,
+                Style::default().fg(theme.fg_primary),
+                theme,
+                &mut out,
+            );
+            return out;
+        }
+    }
+
+    // 5. Ordinary paragraph / numbered list with inline Markdown formatting
+    parse_live_inline_segments(
+        line,
+        line_start,
+        Style::default().fg(theme.fg_primary),
+        theme,
+        &mut out,
+    );
+    out
+}
+
+/// Parses inline Markdown on an inactive LivePreview line, hiding raw delimiters for
+/// `` `code` ``, `[[wikilink]]`, `***bold italic***`, `**bold**`, `*italic*`, `~~strike~~`,
+/// `==highlight==`, and styling `#tag` badges.
+fn parse_live_inline_segments(
+    slice: &str,
+    base_offset: usize,
+    base_style: Style,
+    theme: &Theme,
+    out: &mut Vec<LiveSeg>,
+) {
+    let bytes = slice.as_bytes();
+    let len = bytes.len();
+    let mut i = 0usize;
+    let mut plain_start = 0usize;
+
+    let flush_plain = |out: &mut Vec<LiveSeg>, from: usize, to: usize| {
+        if to > from {
+            out.push(LiveSeg {
+                text: slice[from..to].to_string(),
+                style: base_style,
+                raw_start: base_offset + from,
+                raw_end: base_offset + to,
+                is_literal: true,
+            });
+        }
+    };
+
+    while i < len {
+        // 1. Inline code `` `...` ``
+        if bytes[i] == b'`' {
+            if let Some(rel_end) = slice[i + 1..].find('`') {
+                if rel_end > 0 {
+                    flush_plain(out, plain_start, i);
+                    let inner_start = i + 1;
+                    let inner_end = inner_start + rel_end;
+                    out.push(LiveSeg {
+                        text: slice[inner_start..inner_end].to_string(),
+                        style: theme.code_style(),
+                        raw_start: base_offset + inner_start,
+                        raw_end: base_offset + inner_end,
+                        is_literal: true,
+                    });
+                    i = inner_end + 1;
+                    plain_start = i;
+                    continue;
+                }
+            }
+        }
+
+        // 2. Wikilinks / embeds: `![[...]]` or `[[...]]`
+        let is_embed = slice[i..].starts_with("![[");
+        let is_wiki = !is_embed && slice[i..].starts_with("[[");
+        if is_embed || is_wiki {
+            let open_len = if is_embed { 3 } else { 2 };
+            if let Some(rel_close) = slice[i + open_len..].find("]]") {
+                if rel_close > 0 {
+                    flush_plain(out, plain_start, i);
+                    let inner_start = i + open_len;
+                    let inner_end = inner_start + rel_close;
+                    let inner = &slice[inner_start..inner_end];
+                    if is_embed {
+                        out.push(LiveSeg {
+                            text: "↗ ".to_string(),
+                            style: Style::default().fg(theme.accent),
+                            raw_start: base_offset + i,
+                            raw_end: base_offset + inner_start,
+                            is_literal: false,
+                        });
+                    }
+                    let (disp_start, disp_end) = if let Some(pipe) = inner.find('|') {
+                        if pipe + 1 < inner.len() {
+                            (inner_start + pipe + 1, inner_end)
+                        } else {
+                            (inner_start, inner_end)
+                        }
+                    } else {
+                        (inner_start, inner_end)
+                    };
+                    out.push(LiveSeg {
+                        text: slice[disp_start..disp_end].to_string(),
+                        style: theme.wikilink_style(true),
+                        raw_start: base_offset + disp_start,
+                        raw_end: base_offset + disp_end,
+                        is_literal: true,
+                    });
+                    i = inner_end + 2;
+                    plain_start = i;
+                    continue;
+                }
+            }
+        }
+
+        // 3. Bold + Italic `***...***`
+        if slice[i..].starts_with("***") {
+            if let Some(rel_end) = slice[i + 3..].find("***") {
+                if rel_end > 0 {
+                    flush_plain(out, plain_start, i);
+                    let inner_start = i + 3;
+                    let inner_end = inner_start + rel_end;
+                    out.push(LiveSeg {
+                        text: slice[inner_start..inner_end].to_string(),
+                        style: base_style.add_modifier(Modifier::BOLD | Modifier::ITALIC),
+                        raw_start: base_offset + inner_start,
+                        raw_end: base_offset + inner_end,
+                        is_literal: true,
+                    });
+                    i = inner_end + 3;
+                    plain_start = i;
+                    continue;
+                }
+            }
+        }
+
+        // 4. Bold `**...**`
+        if slice[i..].starts_with("**") {
+            if let Some(rel_end) = slice[i + 2..].find("**") {
+                if rel_end > 0 {
+                    flush_plain(out, plain_start, i);
+                    let inner_start = i + 2;
+                    let inner_end = inner_start + rel_end;
+                    out.push(LiveSeg {
+                        text: slice[inner_start..inner_end].to_string(),
+                        style: base_style.add_modifier(Modifier::BOLD),
+                        raw_start: base_offset + inner_start,
+                        raw_end: base_offset + inner_end,
+                        is_literal: true,
+                    });
+                    i = inner_end + 2;
+                    plain_start = i;
+                    continue;
+                }
+            }
+        }
+
+        // 5. Strikethrough `~~...~~`
+        if slice[i..].starts_with("~~") {
+            if let Some(rel_end) = slice[i + 2..].find("~~") {
+                if rel_end > 0 {
+                    flush_plain(out, plain_start, i);
+                    let inner_start = i + 2;
+                    let inner_end = inner_start + rel_end;
+                    out.push(LiveSeg {
+                        text: slice[inner_start..inner_end].to_string(),
+                        style: theme.muted_style().add_modifier(Modifier::CROSSED_OUT),
+                        raw_start: base_offset + inner_start,
+                        raw_end: base_offset + inner_end,
+                        is_literal: true,
+                    });
+                    i = inner_end + 2;
+                    plain_start = i;
+                    continue;
+                }
+            }
+        }
+
+        // 6. Highlight `==...==`
+        if slice[i..].starts_with("==") {
+            if let Some(rel_end) = slice[i + 2..].find("==") {
+                if rel_end > 0 {
+                    flush_plain(out, plain_start, i);
+                    let inner_start = i + 2;
+                    let inner_end = inner_start + rel_end;
+                    out.push(LiveSeg {
+                        text: slice[inner_start..inner_end].to_string(),
+                        style: Style::default()
+                            .fg(theme.bg_canvas)
+                            .bg(theme.warning)
+                            .add_modifier(Modifier::BOLD),
+                        raw_start: base_offset + inner_start,
+                        raw_end: base_offset + inner_end,
+                        is_literal: true,
+                    });
+                    i = inner_end + 2;
+                    plain_start = i;
+                    continue;
+                }
+            }
+        }
+
+        // 7. Italic `*...*` (single asterisk, non-whitespace opening/closing)
+        if bytes[i] == b'*'
+            && bytes
+                .get(i + 1)
+                .is_some_and(|&b| b != b'*' && b != b' ' && b != b'\t')
+        {
+            if let Some(rel_end) = slice[i + 1..].find('*') {
+                let inner_start = i + 1;
+                let inner_end = inner_start + rel_end;
+                let last_ok = rel_end > 0
+                    && !matches!(bytes.get(inner_end - 1), Some(b' ') | Some(b'\t'));
+                if last_ok {
+                    flush_plain(out, plain_start, i);
+                    out.push(LiveSeg {
+                        text: slice[inner_start..inner_end].to_string(),
+                        style: base_style.add_modifier(Modifier::ITALIC),
+                        raw_start: base_offset + inner_start,
+                        raw_end: base_offset + inner_end,
+                        is_literal: true,
+                    });
+                    i = inner_end + 1;
+                    plain_start = i;
+                    continue;
+                }
+            }
+        }
+
+        // 8. Italic `_..._` (word-boundary guarded so `snake_case` is preserved)
+        if bytes[i] == b'_'
+            && (i == 0
+                || slice[..i]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|c| !c.is_alphanumeric()))
+            && bytes
+                .get(i + 1)
+                .is_some_and(|&b| b != b'_' && b != b' ' && b != b'\t')
+        {
+            if let Some(rel_end) = slice[i + 1..].find('_') {
+                let inner_start = i + 1;
+                let inner_end = inner_start + rel_end;
+                let after_ok = slice[inner_end + 1..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !c.is_alphanumeric());
+                let last_ok = rel_end > 0
+                    && !matches!(bytes.get(inner_end - 1), Some(b' ') | Some(b'\t'));
+                if last_ok && after_ok {
+                    flush_plain(out, plain_start, i);
+                    out.push(LiveSeg {
+                        text: slice[inner_start..inner_end].to_string(),
+                        style: base_style.add_modifier(Modifier::ITALIC),
+                        raw_start: base_offset + inner_start,
+                        raw_end: base_offset + inner_end,
+                        is_literal: true,
+                    });
+                    i = inner_end + 1;
+                    plain_start = i;
+                    continue;
+                }
+            }
+        }
+
+        // 9. Inline `#tag` styled badge
+        if bytes[i] == b'#' {
+            let valid_prev = i == 0
+                || bytes[i - 1].is_ascii_whitespace()
+                || matches!(bytes[i - 1], b'(' | b'[' | b',' | b';');
+            if valid_prev && i + 1 < len {
+                let mut end = i + 1;
+                for (off, ch) in slice[i + 1..].char_indices() {
+                    if ch.is_alphanumeric() || matches!(ch, '_' | '-' | '/') {
+                        end = i + 1 + off + ch.len_utf8();
+                    } else {
+                        break;
+                    }
+                }
+                if end > i + 1 {
+                    flush_plain(out, plain_start, i);
+                    out.push(LiveSeg {
+                        text: slice[i..end].to_string(),
+                        style: theme.tag_pill_style().add_modifier(Modifier::BOLD),
+                        raw_start: base_offset + i,
+                        raw_end: base_offset + end,
+                        is_literal: true,
+                    });
+                    i = end;
+                    plain_start = i;
+                    continue;
+                }
+            }
+        }
+
+        let ch_len = slice[i..].chars().next().map(char::len_utf8).unwrap_or(1);
+        i += ch_len;
+    }
+
+    flush_plain(out, plain_start, len);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LogicalLineKind {
     Normal,
     FrontmatterDelimiter,
     FrontmatterBody,
-    CodeFence,
+    CodeFenceOpen,
+    CodeFenceClose,
     CodeBody,
 }
 
@@ -625,7 +1640,7 @@ fn build_line_context(text: &str) -> Vec<LogicalLineInfo> {
             let close_len = trimmed.chars().take_while(|&c| c == fence_ch).count();
             if close_len >= fence_len && trimmed[close_len..].trim().is_empty() {
                 in_code_fence = None;
-                LogicalLineKind::CodeFence
+                LogicalLineKind::CodeFenceClose
             } else {
                 LogicalLineKind::CodeBody
             }
@@ -633,7 +1648,7 @@ fn build_line_context(text: &str) -> Vec<LogicalLineInfo> {
             let fence_ch = trimmed.chars().next().unwrap_or('`');
             let fence_len = trimmed.chars().take_while(|&c| c == fence_ch).count();
             in_code_fence = Some((fence_ch, fence_len));
-            LogicalLineKind::CodeFence
+            LogicalLineKind::CodeFenceOpen
         } else {
             LogicalLineKind::Normal
         };
@@ -662,7 +1677,7 @@ fn find_logical_line(ctx: &[LogicalLineInfo], byte_pos: usize) -> Option<&Logica
     ctx.get(idx)
 }
 
-/// Highlights a single soft-wrapped visual slice `text[start..end]` with clean Markdown syntax
+/// Highlights a single soft-wrapped raw visual slice `text[start..end]` with clean Markdown syntax
 /// colors while preserving exact display widths (`\t` -> 4 spaces) and selection overlay.
 fn highlight_visual_slice(
     text: &str,
@@ -702,7 +1717,7 @@ fn highlight_visual_slice(
                 byte_styles.fill(Style::default().fg(theme.fg_secondary));
             }
         }
-        LogicalLineKind::CodeFence => {
+        LogicalLineKind::CodeFenceOpen | LogicalLineKind::CodeFenceClose => {
             byte_styles.fill(
                 Style::default()
                     .fg(theme.code_fg)
@@ -871,6 +1886,32 @@ fn apply_inline_highlights(line: &str, start_from: usize, styles: &mut [Style], 
             }
         }
 
+        // Bold `**...**`
+        if line[i..].starts_with("**") {
+            if let Some(rel_end) = line[i + 2..].find("**") {
+                if rel_end > 0 {
+                    let end = i + 2 + rel_end + 2;
+                    for st in &mut styles[i..end] {
+                        *st = st.add_modifier(Modifier::BOLD);
+                    }
+                    i = end;
+                    continue;
+                }
+            }
+        }
+
+        // Strikethrough `~~...~~`
+        if line[i..].starts_with("~~") {
+            if let Some(rel_end) = line[i + 2..].find("~~") {
+                if rel_end > 0 {
+                    let end = i + 2 + rel_end + 2;
+                    styles[i..end].fill(theme.muted_style().add_modifier(Modifier::CROSSED_OUT));
+                    i = end;
+                    continue;
+                }
+            }
+        }
+
         // Inline `#tag` (must be at line start or preceded by whitespace/opening punct)
         if bytes[i] == b'#' {
             let valid_prev = i == 0
@@ -918,12 +1959,27 @@ mod tests {
             .collect()
     }
 
+    fn buffer_row_text(terminal: &Terminal<TestBackend>, row: u16) -> String {
+        let buf = terminal.backend().buffer();
+        let width = buf.area.width;
+        let mut out = String::new();
+        let mut x = 0u16;
+        while x < width {
+            let sym = buf[(x, row)].symbol();
+            let w = UnicodeWidthStr::width(sym).max(1) as u16;
+            out.push_str(sym);
+            x += w;
+        }
+        out.trim_end().to_string()
+    }
+
     #[test]
     fn test_inline_editor_multiline_korean_utf8_dirty_undo_redo_and_crlf() {
         let mut ed =
             InlineNoteEditor::new("Projects/회의록.md", "회의록", "# 제목\r\n\r\n기존 내용", 0);
         assert!(!ed.dirty);
         assert_eq!(ed.save_status, InlineSaveStatus::Saved);
+        assert_eq!(ed.mode, EditorMode::LivePreview);
         assert_eq!(ed.cursor_line_col(), (1, 1));
 
         // Move to end of line 1, insert newline, Tab (2 spaces), and Korean UTF-8
@@ -1027,10 +2083,14 @@ mod tests {
         let screen = buffer_text(&terminal);
         assert!(screen.contains("✎ EDITING"));
         assert!(screen.contains("✓ Live Saved"));
+        assert!(screen.contains("[Live]"));
         assert!(screen.contains("[✓ Done]"));
         assert!(screen.contains("[Ctrl+S Save]"));
         assert!(screen.contains("[Ext $EDITOR]"));
         assert!(screen.contains("Ln 1, Col 1"));
+        assert!(hitmap
+            .region_of(HitTarget::Button(ButtonId::ToggleEditorMode))
+            .is_some());
         assert!(hitmap
             .region_of(HitTarget::Button(ButtonId::FinishInlineEdit))
             .is_some());
@@ -1061,5 +2121,101 @@ mod tests {
             })
             .unwrap();
         assert_eq!(ed.scroll_y, 3);
+    }
+
+    #[test]
+    fn test_live_preview_hides_inactive_delimiters_and_reveals_active_line_with_cjk_cursor() {
+        let md = [
+            "# Title Heading",
+            "Body with **bold**, *italic*, `code()`, ~~gone~~, [[WikiPage]], #rust",
+            "- [ ] Pending task",
+            "- [x] Completed task",
+            "- Bullet item",
+            "> Blockquote line",
+            "---",
+            "한글 커서",
+        ]
+        .join("\n");
+
+        let mut ed = InlineNoteEditor::new("Notes/Preview.md", "Preview", &md, 0);
+        assert_eq!(ed.mode, EditorMode::LivePreview);
+
+        // Place cursor on line 8 ("한글 커서") right on '글' (byte offset of '글')
+        let line8_start = md.rfind("한글 커서").unwrap();
+        let geul_pos = line8_start + '한'.len_utf8();
+        ed.composer.set_cursor(geul_pos);
+
+        let theme = Theme::obsidian_dark();
+        let mut hitmap = HitMap::new();
+        let mut terminal = Terminal::new(TestBackend::new(86, 16)).unwrap();
+        let mut cursor = None;
+        terminal
+            .draw(|f| {
+                hitmap.clear();
+                cursor = ed.draw(f, f.area(), &theme, &mut hitmap);
+            })
+            .unwrap();
+
+        // Inactive lines (rows 1..=7) hide raw delimiters and render rich Markdown:
+        assert_eq!(buffer_row_text(&terminal, 1), "Title Heading");
+        let row2 = buffer_row_text(&terminal, 2);
+        assert!(row2.contains("Body with bold, italic, code(), gone, WikiPage, #rust"));
+        assert!(!row2.contains("**"));
+        assert!(!row2.contains("~~"));
+        assert!(!row2.contains("[["));
+        assert!(!row2.contains('`'));
+
+        let row3 = buffer_row_text(&terminal, 3);
+        assert!(row3.starts_with("☐ Pending task"));
+        assert!(!row3.contains("- [ ]"));
+
+        let row4 = buffer_row_text(&terminal, 4);
+        assert!(row4.starts_with("☑ Completed task"));
+        assert!(!row4.contains("- [x]"));
+        // Completed task text carries dim + crossed-out modifiers
+        let done_text_cell = &terminal.backend().buffer()[(2u16, 4u16)];
+        assert!(done_text_cell.modifier.contains(Modifier::CROSSED_OUT));
+        assert!(done_text_cell.modifier.contains(Modifier::DIM));
+
+        assert_eq!(buffer_row_text(&terminal, 5), "• Bullet item");
+        assert_eq!(buffer_row_text(&terminal, 6), "┃ Blockquote line");
+        assert!(buffer_row_text(&terminal, 7).starts_with("──────────"));
+
+        // Active line (row 8): raw text + exact Korean/CJK wide-char hardware cursor `(2, 8)`
+        // ('한' has display width 2, body starts at y=1 -> row index 7 is y=8)
+        assert_eq!(buffer_row_text(&terminal, 8), "한글 커서");
+        assert_eq!(cursor, Some((2, 8)));
+
+        // Move cursor to line 1 ("# Title Heading") -> line 1 reveals raw `# Title Heading`
+        ed.composer.set_cursor(0);
+        terminal
+            .draw(|f| {
+                hitmap.clear();
+                cursor = ed.draw(f, f.area(), &theme, &mut hitmap);
+            })
+            .unwrap();
+        assert_eq!(buffer_row_text(&terminal, 1), "# Title Heading");
+        assert_eq!(cursor, Some((0, 1)));
+
+        // Clicking on 'b' of rendered "bold" on inactive row 2 places cursor inside `**bold**`!
+        let bold_col = buffer_row_text(&terminal, 2).find("bold").unwrap() as u16;
+        assert!(ed.place_cursor_at_screen_pos(bold_col, 2));
+        let cur = ed.composer.cursor();
+        assert_eq!(&ed.composer.text()[cur..cur + 4], "bold");
+
+        // Toggle to Source mode -> all lines reveal raw Markdown syntax & pill changes to `[Src]`
+        ed.handle_edit_action(&Action::ToggleEditorMode);
+        assert_eq!(ed.mode, EditorMode::Source);
+        terminal
+            .draw(|f| {
+                hitmap.clear();
+                cursor = ed.draw(f, f.area(), &theme, &mut hitmap);
+            })
+            .unwrap();
+        assert!(buffer_row_text(&terminal, 0).contains("[Src]"));
+        assert_eq!(buffer_row_text(&terminal, 1), "# Title Heading");
+        assert_eq!(buffer_row_text(&terminal, 3), "- [ ] Pending task");
+        assert_eq!(buffer_row_text(&terminal, 5), "- Bullet item");
+        assert_eq!(buffer_row_text(&terminal, 7), "---");
     }
 }
