@@ -106,7 +106,17 @@ impl CalloutKind {
     }
 }
 
-/// Inline formatted span inside a Markdown paragraph, heading, list item, or callout.
+/// Horizontal column alignment inside a Markdown table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TableAlignment {
+    #[default]
+    Left,
+    Center,
+    Right,
+}
+
+/// Inline formatted span inside a Markdown paragraph, heading, list item, table cell, or callout.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum InlineSpan {
@@ -119,6 +129,9 @@ pub enum InlineSpan {
     Italic {
         text: String,
     },
+    Underline {
+        text: String,
+    },
     Code {
         text: String,
     },
@@ -128,6 +141,34 @@ pub enum InlineSpan {
     Highlight {
         text: String,
     },
+    Styled {
+        text: String,
+        #[serde(default)]
+        bold: bool,
+        #[serde(default)]
+        italic: bool,
+        #[serde(default)]
+        strike: bool,
+        #[serde(default)]
+        highlight: bool,
+        #[serde(default)]
+        underline: bool,
+    },
+    Math {
+        text: String,
+        #[serde(default)]
+        display: bool,
+    },
+    FootnoteRef {
+        label: String,
+    },
+    Subscript {
+        text: String,
+    },
+    Superscript {
+        text: String,
+    },
+    LineBreak,
     Wikilink {
         target: String,
         heading: Option<String>,
@@ -149,9 +190,16 @@ impl InlineSpan {
             Self::Text { text }
             | Self::Bold { text }
             | Self::Italic { text }
+            | Self::Underline { text }
             | Self::Code { text }
             | Self::Strikethrough { text }
-            | Self::Highlight { text } => text.clone(),
+            | Self::Highlight { text }
+            | Self::Styled { text, .. }
+            | Self::Math { text, .. }
+            | Self::Subscript { text }
+            | Self::Superscript { text } => text.clone(),
+            Self::FootnoteRef { label } => format!("[^{label}]"),
+            Self::LineBreak => "\n".to_string(),
             Self::Wikilink {
                 target,
                 heading,
@@ -190,7 +238,7 @@ pub enum NoteBlock {
         callout_kind: CalloutKind,
         title: String,
         collapsed: bool,
-        body_lines: Vec<Vec<InlineSpan>>,
+        body_blocks: Vec<NoteBlock>,
         line_no: usize,
     },
     Task {
@@ -217,12 +265,23 @@ pub enum NoteBlock {
         line_no: usize,
     },
     Blockquote {
-        lines: Vec<Vec<InlineSpan>>,
+        blocks: Vec<NoteBlock>,
         line_no: usize,
     },
     Table {
-        headers: Vec<String>,
-        rows: Vec<Vec<String>>,
+        headers: Vec<Vec<InlineSpan>>,
+        rows: Vec<Vec<Vec<InlineSpan>>>,
+        alignments: Vec<TableAlignment>,
+        line_no: usize,
+    },
+    HtmlEmbed {
+        raw_html: String,
+        summary_lines: Vec<String>,
+        line_no: usize,
+    },
+    FootnoteDef {
+        label: String,
+        spans: Vec<InlineSpan>,
         line_no: usize,
     },
     ImageEmbed {
@@ -255,6 +314,8 @@ impl NoteBlock {
             | Self::CodeBlock { line_no, .. }
             | Self::Blockquote { line_no, .. }
             | Self::Table { line_no, .. }
+            | Self::HtmlEmbed { line_no, .. }
+            | Self::FootnoteDef { line_no, .. }
             | Self::ImageEmbed { line_no, .. }
             | Self::NoteEmbed { line_no, .. }
             | Self::Divider { line_no } => *line_no,
@@ -262,32 +323,42 @@ impl NoteBlock {
     }
 
     pub fn first_wikilink(&self) -> Option<(String, Option<String>)> {
-        let spans: Vec<&InlineSpan> = match self {
+        let find_in_spans = |spans: &[InlineSpan]| -> Option<(String, Option<String>)> {
+            spans.iter().find_map(|span| match span {
+                InlineSpan::Wikilink {
+                    target,
+                    resolved_path,
+                    ..
+                } => Some((target.clone(), resolved_path.clone())),
+                _ => None,
+            })
+        };
+        match self {
             Self::Heading { spans, .. }
             | Self::Paragraph { spans, .. }
             | Self::Task { spans, .. }
             | Self::BulletItem { spans, .. }
-            | Self::NumberedItem { spans, .. } => spans.iter().collect(),
-            Self::Callout { body_lines, .. } => body_lines.iter().flatten().collect(),
-            Self::Blockquote { lines, .. } => lines.iter().flatten().collect(),
+            | Self::NumberedItem { spans, .. }
+            | Self::FootnoteDef { spans, .. } => find_in_spans(spans),
+            Self::Callout { body_blocks, .. } => {
+                body_blocks.iter().find_map(NoteBlock::first_wikilink)
+            }
+            Self::Blockquote { blocks, .. } => blocks.iter().find_map(NoteBlock::first_wikilink),
+            Self::Table { headers, rows, .. } => headers
+                .iter()
+                .find_map(|cell| find_in_spans(cell))
+                .or_else(|| {
+                    rows.iter()
+                        .flat_map(|r| r.iter())
+                        .find_map(|cell| find_in_spans(cell))
+                }),
             Self::NoteEmbed {
                 target,
                 resolved_path,
                 ..
-            } => return Some((target.clone(), resolved_path.clone())),
-            _ => Vec::new(),
-        };
-        for span in spans {
-            if let InlineSpan::Wikilink {
-                target,
-                resolved_path,
-                ..
-            } = span
-            {
-                return Some((target.clone(), resolved_path.clone()));
-            }
+            } => Some((target.clone(), resolved_path.clone())),
+            _ => None,
         }
-        None
     }
 }
 

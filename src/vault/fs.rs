@@ -1081,24 +1081,63 @@ pub fn hydrate_parsed_note_links(
     aliases_by_path: &HashMap<String, Vec<String>>,
 ) -> Vec<NoteImageRef> {
     let mut images = Vec::new();
+    hydrate_blocks(
+        vault_root,
+        note_rel_path,
+        &mut parsed.blocks,
+        all_rel_paths,
+        aliases_by_path,
+        &mut images,
+    );
+    images
+}
 
-    for block in &mut parsed.blocks {
+fn hydrate_blocks(
+    vault_root: &Path,
+    note_rel_path: &str,
+    blocks: &mut [NoteBlock],
+    all_rel_paths: &[String],
+    aliases_by_path: &HashMap<String, Vec<String>>,
+    images: &mut Vec<NoteImageRef>,
+) {
+    for block in blocks {
         match block {
             NoteBlock::Heading { spans, .. }
             | NoteBlock::Paragraph { spans, .. }
             | NoteBlock::Task { spans, .. }
             | NoteBlock::BulletItem { spans, .. }
-            | NoteBlock::NumberedItem { spans, .. } => {
+            | NoteBlock::NumberedItem { spans, .. }
+            | NoteBlock::FootnoteDef { spans, .. } => {
                 resolve_spans(spans, note_rel_path, all_rel_paths, aliases_by_path);
             }
-            NoteBlock::Callout { body_lines, .. } => {
-                for line in body_lines {
-                    resolve_spans(line, note_rel_path, all_rel_paths, aliases_by_path);
-                }
+            NoteBlock::Callout { body_blocks, .. } => {
+                hydrate_blocks(
+                    vault_root,
+                    note_rel_path,
+                    body_blocks,
+                    all_rel_paths,
+                    aliases_by_path,
+                    images,
+                );
             }
-            NoteBlock::Blockquote { lines, .. } => {
-                for line in lines {
-                    resolve_spans(line, note_rel_path, all_rel_paths, aliases_by_path);
+            NoteBlock::Blockquote { blocks, .. } => {
+                hydrate_blocks(
+                    vault_root,
+                    note_rel_path,
+                    blocks,
+                    all_rel_paths,
+                    aliases_by_path,
+                    images,
+                );
+            }
+            NoteBlock::Table { headers, rows, .. } => {
+                for cell in headers {
+                    resolve_spans(cell, note_rel_path, all_rel_paths, aliases_by_path);
+                }
+                for row in rows {
+                    for cell in row {
+                        resolve_spans(cell, note_rel_path, all_rel_paths, aliases_by_path);
+                    }
                 }
             }
             NoteBlock::NoteEmbed {
@@ -1134,7 +1173,6 @@ pub fn hydrate_parsed_note_links(
             _ => {}
         }
     }
-    images
 }
 
 fn resolve_spans(

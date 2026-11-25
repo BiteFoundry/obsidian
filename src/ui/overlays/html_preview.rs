@@ -139,6 +139,7 @@ pub fn extract_raw_block_text(detail: &NoteDetail, block_idx: usize) -> Option<S
     }
 
     match block {
+        NoteBlock::HtmlEmbed { raw_html, .. } => Some(raw_html.clone()),
         NoteBlock::CodeBlock { code, .. } => Some(code.clone()),
         NoteBlock::Paragraph { spans, .. } => Some(spans_to_plain(spans)),
         _ => None,
@@ -151,6 +152,7 @@ pub fn block_is_html(detail: &NoteDetail, block_idx: usize) -> bool {
         return false;
     };
     match block {
+        NoteBlock::HtmlEmbed { .. } => true,
         NoteBlock::CodeBlock { language, code, .. } => {
             is_html_code_language(language) && !code.trim().is_empty()
         }
@@ -163,7 +165,7 @@ pub fn block_is_html(detail: &NoteDetail, block_idx: usize) -> bool {
 
 /// Extracts all HTML candidates from a Markdown note:
 /// 1. Fenced ```` ```html ```` / ```` ```htm ```` / ```` ```xhtml ```` code blocks
-/// 2. Embedded raw HTML blocks inside paragraphs
+/// 2. Embedded raw HTML blocks (`NoteBlock::HtmlEmbed` or legacy raw-HTML paragraphs)
 /// 3. Referenced/embedded `.html`/`.htm`/`.xhtml` files inside the vault.
 pub fn extract_note_html_candidates(
     detail: &NoteDetail,
@@ -174,6 +176,17 @@ pub fn extract_note_html_candidates(
 
     for (b_idx, block) in detail.parsed.blocks.iter().enumerate() {
         match block {
+            NoteBlock::HtmlEmbed {
+                raw_html, line_no, ..
+            } if !raw_html.trim().is_empty() => {
+                out.push(HtmlCandidate {
+                    title: format!("{} (Embedded HTML)", detail.summary.title),
+                    source_label: format!("inline HTML · line {line_no}"),
+                    html: raw_html.clone(),
+                    block_idx: Some(b_idx),
+                    file_path: None,
+                });
+            }
             NoteBlock::CodeBlock {
                 language,
                 code,

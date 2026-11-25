@@ -2,14 +2,18 @@
 //!
 //! Renders:
 //! - YAML Frontmatter Properties Strip (key/value pills + `#tag` chips + aliases)
-//! - Rich Obsidian Markdown: Headings (`H1`–`H3`), semantic Callout cards (`┃ ✦ TIP ...`),
+//! - Rich Obsidian Markdown: Headings (`H1`–`H6`), nested semantic Callout cards (`┃ ✦ TIP ...`),
 //!   interactive `- [ ]` / `- [x]` checkboxes (`Space`/`x`), clickable `[[wikilinks]]` (`Enter`),
 //!   inline `![[image.png]]` previews (`v` HD modal), bordered Code blocks (`y` copy),
-//!   Markdown Tables, Blockquotes, and Dividers.
+//!   styled wrapped Markdown Tables (`bitefoundry_html::layout::render_wrapped_table`),
+//!   sanitized `HtmlEmbed` cards (`[H: HTML]`), Math, Footnotes, Blockquotes, and Dividers.
 
+use bitefoundry_html::{
+    render_wrapped_table, wrap_styled_spans, TableAlign, TableBorder, TableSpec, WrapPrefix,
+};
 use ratatui::{
     layout::Rect,
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Paragraph},
     Frame,
@@ -19,18 +23,14 @@ pub use crate::ui::inline_editor::{InlineNoteEditor, InlineSaveStatus};
 
 use crate::{
     config::PageWidthMode,
-    models::{InlineSpan, NoteBlock, NoteDetail},
+    models::{InlineSpan, NoteBlock, NoteDetail, TableAlignment},
     ui::{
         app::{AppState, Focus, UiState},
         hitmap::{ButtonId, HitMap, HitTarget},
-        overlays::html_preview::{
-            block_is_html, extract_raw_block_text, html_theme_from_ui, is_html_code_language,
-            note_has_html,
-        },
+        overlays::html_preview::{html_theme_from_ui, is_html_code_language, note_has_html},
         theme::Theme,
         truncate_width,
     },
-    vault::parser::spans_to_plain,
 };
 
 struct RenderedLine {
@@ -41,7 +41,7 @@ struct RenderedLine {
     image_idx: Option<usize>,
     html_pill: Option<(u16, u16, usize)>,
     action_pills: Vec<(u16, u16, ButtonId)>,
-    bg_override: Option<ratatui::style::Color>,
+    bg_override: Option<Color>,
 }
 
 pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiState, hitmap: &mut HitMap) {
@@ -172,6 +172,28 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiState, hit
     }
 }
 
+fn push_plain(out: &mut Vec<RenderedLine>, line: Line<'static>, bg: Option<Color>) {
+    out.push(RenderedLine {
+        line,
+        block_idx: None,
+        task_checkbox: None,
+        has_wikilink: false,
+        image_idx: None,
+        html_pill: None,
+        action_pills: Vec::new(),
+        bg_override: bg,
+    });
+}
+
+struct BlockRenderCtx<'a> {
+    detail: &'a NoteDetail,
+    app: &'a AppState,
+    ui: &'a UiState,
+    theme: &'a Theme,
+    width: usize,
+    image_counter: usize,
+}
+
 fn build_canvas_lines(
     detail: &NoteDetail,
     app: &AppState,
@@ -182,19 +204,6 @@ fn build_canvas_lines(
     focused: bool,
 ) -> Vec<RenderedLine> {
     let mut out: Vec<RenderedLine> = Vec::new();
-    let push_plain =
-        |out: &mut Vec<RenderedLine>, line: Line<'static>, bg: Option<ratatui::style::Color>| {
-            out.push(RenderedLine {
-                line,
-                block_idx: None,
-                task_checkbox: None,
-                has_wikilink: false,
-                image_idx: None,
-                html_pill: None,
-                action_pills: Vec::new(),
-                bg_override: bg,
-            });
-        };
 
     // 1. Note Title + Bookmark indicator
     let bm = if detail.summary.is_bookmarked {
@@ -356,7 +365,15 @@ fn build_canvas_lines(
     );
 
     // 3. Rendered Obsidian Markdown blocks
-    let mut image_counter = 0usize;
+    let mut ctx = BlockRenderCtx {
+        detail,
+        app,
+        ui,
+        theme,
+        width,
+        image_counter: 0,
+    };
+
     for (b_idx, block) in detail.parsed.blocks.iter().enumerate() {
         let is_sel = focused && b_idx == selected_block;
         let sel_bg = if is_sel {
@@ -365,664 +382,92 @@ fn build_canvas_lines(
             None
         };
         let has_wl = block.first_wikilink().is_some();
+        render_block_into(
+            &mut ctx,
+            block,
+            b_idx,
+            is_sel,
+            sel_bg,
+            has_wl,
+            &[],
+            None,
+            true,
+            &mut out,
+        );
+    }
 
-        match block {
-            NoteBlock::Heading {
-                level, text, spans, ..
-            } => {
-                // Skip duplicate top H1 if identical to note title and first block
-                if b_idx == 0 && *level == 1 && text.eq_ignore_ascii_case(&detail.summary.title) {
-                    continue;
-                }
-                if !out.is_empty() {
-                    push_plain(&mut out, Line::from(""), None);
-                }
-                let prefix = match level {
-                    1 => "▍ ",
-                    2 => "## ",
-                    3 => "### ",
-                    _ => "#### ",
-                };
-                let style = match level {
-                    1 => Style::default()
-                        .fg(theme.accent)
-                        .add_modifier(Modifier::BOLD),
-                    2 => Style::default()
-                        .fg(theme.accent_soft)
-                        .add_modifier(Modifier::BOLD),
-                    _ => Style::default()
-                        .fg(theme.fg_primary)
-                        .add_modifier(Modifier::BOLD),
-                };
-                let mut line_spans = vec![Span::styled(prefix.to_string(), style)];
-                line_spans.extend(render_inline_spans(
-                    spans,
-                    theme,
-                    ui.show_inline_hrefs,
-                    style,
-                ));
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_block_into(
+    ctx: &mut BlockRenderCtx<'_>,
+    block: &NoteBlock,
+    b_idx: usize,
+    is_sel: bool,
+    sel_bg: Option<Color>,
+    has_wl: bool,
+    outer_prefix: &[Span<'static>],
+    container_text_style: Option<Style>,
+    top_level: bool,
+    out: &mut Vec<RenderedLine>,
+) {
+    let theme = ctx.theme;
+    let width = ctx.width;
+    let show_hrefs = ctx.ui.show_inline_hrefs;
+    let prefix_w: usize = outer_prefix
+        .iter()
+        .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
+        .sum();
+    let inner_width = width.saturating_sub(prefix_w).max(8);
+
+    match block {
+        NoteBlock::Heading {
+            level, text, spans, ..
+        } => {
+            if top_level
+                && b_idx == 0
+                && *level == 1
+                && text.eq_ignore_ascii_case(&ctx.detail.summary.title)
+            {
+                return;
+            }
+            if top_level && !out.is_empty() {
+                push_plain(out, Line::from(""), None);
+            }
+            let prefix = match level {
+                1 => "▍ ",
+                2 => "## ",
+                3 => "### ",
+                _ => "#### ",
+            };
+            let style = match level {
+                1 => Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+                2 => Style::default()
+                    .fg(theme.accent_soft)
+                    .add_modifier(Modifier::BOLD),
+                _ => Style::default()
+                    .fg(theme.fg_primary)
+                    .add_modifier(Modifier::BOLD),
+            };
+            let mut first_pfx = outer_prefix.to_vec();
+            first_pfx.push(Span::styled(prefix.to_string(), style));
+            let rendered = render_inline_spans(spans, theme, show_hrefs, style);
+            for line in wrap_styled_spans(
+                &rendered,
+                width,
+                WrapPrefix {
+                    first: &first_pfx,
+                    cont: outer_prefix,
+                },
+            ) {
                 out.push(RenderedLine {
-                    line: Line::from(line_spans),
+                    line,
                     block_idx: Some(b_idx),
                     task_checkbox: None,
                     has_wikilink: has_wl,
-                    image_idx: None,
-                    html_pill: None,
-                    action_pills: Vec::new(),
-                    bg_override: sel_bg,
-                });
-            }
-
-            NoteBlock::Paragraph { spans, .. } => {
-                if block_is_html(detail, b_idx) {
-                    let pill = "[H: HTML]";
-                    let pill_w = unicode_width::UnicodeWidthStr::width(pill) as u16;
-                    let card_bg = if is_sel {
-                        theme.bg_selected
-                    } else {
-                        theme.bg_card
-                    };
-                    out.push(RenderedLine {
-                        line: Line::from(vec![
-                            Span::styled(" ◈ Embedded HTML · ", theme.muted_style()),
-                            Span::styled(
-                                pill,
-                                Style::default()
-                                    .fg(theme.accent)
-                                    .bg(theme.bg_card)
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                        ]),
-                        block_idx: Some(b_idx),
-                        task_checkbox: None,
-                        has_wikilink: false,
-                        image_idx: None,
-                        html_pill: Some((19, pill_w, b_idx)),
-                        action_pills: Vec::new(),
-                        bg_override: Some(card_bg),
-                    });
-
-                    // Render ONLY a sanitized `bitefoundry_html::render_dom()` summary preview (max 8 lines).
-                    // Never fall through to raw `render_inline_spans()`.
-                    let raw_html = extract_raw_block_text(detail, b_idx)
-                        .unwrap_or_else(|| spans_to_plain(spans));
-                    let doc = bitefoundry_html::DomDocument::parse(&raw_html);
-                    let html_theme = html_theme_from_ui(theme);
-                    let preview_w = width.saturating_sub(2).clamp(12, u16::MAX as usize) as u16;
-                    let rendered_html = bitefoundry_html::render_dom(
-                        &doc,
-                        preview_w,
-                        &html_theme,
-                        None,
-                        None,
-                        ui.show_inline_hrefs,
-                    );
-                    let non_blank: Vec<Line<'static>> = rendered_html
-                        .lines
-                        .into_iter()
-                        .filter(|l| l.spans.iter().any(|s| !s.content.trim().is_empty()))
-                        .collect();
-
-                    const MAX_HTML_PREVIEW_LINES: usize = 8;
-                    let prefix_span = if is_sel {
-                        Span::styled(
-                            "▎ ",
-                            Style::default()
-                                .fg(theme.accent)
-                                .add_modifier(Modifier::BOLD),
-                        )
-                    } else {
-                        Span::styled("  ", theme.muted_style())
-                    };
-
-                    if non_blank.is_empty() {
-                        if !rendered_html.graphics.is_empty() {
-                            out.push(RenderedLine {
-                                line: Line::from(vec![
-                                    prefix_span,
-                                    Span::styled(
-                                        "◇ Embedded graphic · press H to view",
-                                        theme.muted_style(),
-                                    ),
-                                ]),
-                                block_idx: Some(b_idx),
-                                task_checkbox: None,
-                                has_wikilink: false,
-                                image_idx: None,
-                                html_pill: None,
-                                action_pills: Vec::new(),
-                                bg_override: sel_bg,
-                            });
-                        }
-                    } else {
-                        let truncated = non_blank.len() > MAX_HTML_PREVIEW_LINES;
-                        let take_n = if truncated {
-                            MAX_HTML_PREVIEW_LINES - 1
-                        } else {
-                            non_blank.len()
-                        };
-                        for mut line in non_blank.into_iter().take(take_n) {
-                            line.spans.insert(0, prefix_span.clone());
-                            out.push(RenderedLine {
-                                line,
-                                block_idx: Some(b_idx),
-                                task_checkbox: None,
-                                has_wikilink: false,
-                                image_idx: None,
-                                html_pill: None,
-                                action_pills: Vec::new(),
-                                bg_override: sel_bg,
-                            });
-                        }
-                        if truncated {
-                            out.push(RenderedLine {
-                                line: Line::from(vec![
-                                    prefix_span,
-                                    Span::styled(
-                                        "… press H for full HTML preview",
-                                        theme.muted_style(),
-                                    ),
-                                ]),
-                                block_idx: Some(b_idx),
-                                task_checkbox: None,
-                                has_wikilink: false,
-                                image_idx: None,
-                                html_pill: None,
-                                action_pills: Vec::new(),
-                                bg_override: sel_bg,
-                            });
-                        }
-                    }
-
-                    push_plain(&mut out, Line::from(""), None);
-                    continue;
-                }
-                let mut rendered = render_inline_spans(
-                    spans,
-                    theme,
-                    ui.show_inline_hrefs,
-                    Style::default().fg(theme.fg_primary),
-                );
-                if is_sel {
-                    rendered.insert(
-                        0,
-                        Span::styled(
-                            "▎ ",
-                            Style::default()
-                                .fg(theme.accent)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                    );
-                }
-                for wrapped in wrap_spans(rendered, width) {
-                    out.push(RenderedLine {
-                        line: wrapped,
-                        block_idx: Some(b_idx),
-                        task_checkbox: None,
-                        has_wikilink: has_wl,
-                        image_idx: None,
-                        html_pill: None,
-                        action_pills: Vec::new(),
-                        bg_override: sel_bg,
-                    });
-                }
-                push_plain(&mut out, Line::from(""), None);
-            }
-
-            NoteBlock::Callout {
-                callout_kind,
-                title,
-                collapsed,
-                body_lines,
-                ..
-            } => {
-                let c_color = theme.callout_color(*callout_kind);
-                let card_bg = if is_sel {
-                    theme.bg_selected
-                } else {
-                    theme.bg_card
-                };
-                let fold = if *collapsed { "▸ " } else { "" };
-                let header = Line::from(vec![
-                    Span::styled(
-                        "┃ ",
-                        Style::default().fg(c_color).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        format!("{fold}{} {} ", callout_kind.glyph(), callout_kind.label()),
-                        Style::default().fg(c_color).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        if title.eq_ignore_ascii_case(callout_kind.label()) {
-                            String::new()
-                        } else {
-                            format!("· {title}")
-                        },
-                        Style::default()
-                            .fg(theme.fg_primary)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ]);
-                out.push(RenderedLine {
-                    line: header,
-                    block_idx: Some(b_idx),
-                    task_checkbox: None,
-                    has_wikilink: has_wl,
-                    image_idx: None,
-                    html_pill: None,
-                    action_pills: Vec::new(),
-                    bg_override: Some(card_bg),
-                });
-
-                for bl in body_lines {
-                    let body_spans = render_inline_spans(
-                        bl,
-                        theme,
-                        ui.show_inline_hrefs,
-                        Style::default().fg(theme.fg_secondary),
-                    );
-                    for mut wrapped in wrap_spans(body_spans, width.saturating_sub(3)) {
-                        wrapped.spans.insert(
-                            0,
-                            Span::styled(
-                                "┃ ",
-                                Style::default().fg(c_color).add_modifier(Modifier::BOLD),
-                            ),
-                        );
-                        out.push(RenderedLine {
-                            line: wrapped,
-                            block_idx: Some(b_idx),
-                            task_checkbox: None,
-                            has_wikilink: has_wl,
-                            image_idx: None,
-                            html_pill: None,
-                            action_pills: Vec::new(),
-                            bg_override: Some(card_bg),
-                        });
-                    }
-                }
-                push_plain(&mut out, Line::from(""), None);
-            }
-
-            NoteBlock::Task {
-                checked,
-                indent,
-                spans,
-                line_no,
-                ..
-            } => {
-                let pad = " ".repeat((*indent).min(8));
-                let cursor = if is_sel { "▸ " } else { "  " };
-                let checkbox = if *checked { "☑ " } else { "☐ " };
-                let base_style = if *checked {
-                    theme.muted_style().add_modifier(Modifier::CROSSED_OUT)
-                } else {
-                    Style::default().fg(theme.fg_primary)
-                };
-                let mut line_spans = vec![
-                    Span::styled(
-                        format!("{pad}{cursor}"),
-                        Style::default()
-                            .fg(theme.accent)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        checkbox.to_string(),
-                        Style::default()
-                            .fg(if *checked {
-                                theme.success
-                            } else {
-                                theme.accent
-                            })
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ];
-                line_spans.extend(render_inline_spans(
-                    spans,
-                    theme,
-                    ui.show_inline_hrefs,
-                    base_style,
-                ));
-                let hit_w = ((*indent).min(8) + 6) as u16;
-                out.push(RenderedLine {
-                    line: Line::from(line_spans),
-                    block_idx: Some(b_idx),
-                    task_checkbox: Some((*line_no, hit_w)),
-                    has_wikilink: has_wl,
-                    image_idx: None,
-                    html_pill: None,
-                    action_pills: Vec::new(),
-                    bg_override: sel_bg,
-                });
-            }
-
-            NoteBlock::BulletItem { indent, spans, .. } => {
-                let pad = " ".repeat((*indent).min(8));
-                let mut line_spans = vec![Span::styled(
-                    format!("{pad}  • "),
-                    Style::default().fg(theme.accent_soft),
-                )];
-                line_spans.extend(render_inline_spans(
-                    spans,
-                    theme,
-                    ui.show_inline_hrefs,
-                    Style::default().fg(theme.fg_primary),
-                ));
-                for wrapped in wrap_spans(line_spans, width) {
-                    out.push(RenderedLine {
-                        line: wrapped,
-                        block_idx: Some(b_idx),
-                        task_checkbox: None,
-                        has_wikilink: has_wl,
-                        image_idx: None,
-                        html_pill: None,
-                        action_pills: Vec::new(),
-                        bg_override: sel_bg,
-                    });
-                }
-            }
-
-            NoteBlock::NumberedItem {
-                number,
-                indent,
-                spans,
-                ..
-            } => {
-                let pad = " ".repeat((*indent).min(8));
-                let mut line_spans = vec![Span::styled(
-                    format!("{pad}  {number}. "),
-                    Style::default().fg(theme.accent_soft),
-                )];
-                line_spans.extend(render_inline_spans(
-                    spans,
-                    theme,
-                    ui.show_inline_hrefs,
-                    Style::default().fg(theme.fg_primary),
-                ));
-                for wrapped in wrap_spans(line_spans, width) {
-                    out.push(RenderedLine {
-                        line: wrapped,
-                        block_idx: Some(b_idx),
-                        task_checkbox: None,
-                        has_wikilink: has_wl,
-                        image_idx: None,
-                        html_pill: None,
-                        action_pills: Vec::new(),
-                        bg_override: sel_bg,
-                    });
-                }
-            }
-
-            NoteBlock::CodeBlock { language, code, .. } => {
-                let code_bg = if is_sel {
-                    theme.bg_selected
-                } else {
-                    theme.bg_code
-                };
-                let lang_label = if language.is_empty() {
-                    "code"
-                } else {
-                    language.as_str()
-                };
-                let is_html = is_html_code_language(language) && !code.trim().is_empty();
-                let html_suffix = if is_html { " [H: HTML]" } else { "" };
-                let bar_w = width
-                    .saturating_sub(lang_label.len() + 14 + html_suffix.len())
-                    .min(50);
-                let mut hdr_spans = vec![
-                    Span::styled("╭─ ", Style::default().fg(theme.border)),
-                    Span::styled(
-                        format!("{lang_label} "),
-                        Style::default()
-                            .fg(theme.accent_soft)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled("─".repeat(bar_w), Style::default().fg(theme.border)),
-                    Span::styled(" [y copy]", theme.muted_style()),
-                ];
-                let html_pill = if is_html {
-                    let prefix_w: usize = hdr_spans
-                        .iter()
-                        .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
-                        .sum();
-                    hdr_spans.push(Span::raw(" "));
-                    hdr_spans.push(Span::styled(
-                        "[H: HTML]",
-                        Style::default()
-                            .fg(theme.accent)
-                            .bg(theme.bg_card)
-                            .add_modifier(Modifier::BOLD),
-                    ));
-                    Some(((prefix_w + 1) as u16, 9u16, b_idx))
-                } else {
-                    None
-                };
-                out.push(RenderedLine {
-                    line: Line::from(hdr_spans),
-                    block_idx: Some(b_idx),
-                    task_checkbox: None,
-                    has_wikilink: false,
-                    image_idx: None,
-                    html_pill,
-                    action_pills: Vec::new(),
-                    bg_override: Some(code_bg),
-                });
-                for code_line in code.lines() {
-                    out.push(RenderedLine {
-                        line: Line::from(vec![
-                            Span::styled("│ ", Style::default().fg(theme.border)),
-                            Span::styled(
-                                truncate_width(code_line, width.saturating_sub(3)),
-                                Style::default().fg(theme.code_fg),
-                            ),
-                        ]),
-                        block_idx: Some(b_idx),
-                        task_checkbox: None,
-                        has_wikilink: false,
-                        image_idx: None,
-                        html_pill: None,
-                        action_pills: Vec::new(),
-                        bg_override: Some(code_bg),
-                    });
-                }
-                out.push(RenderedLine {
-                    line: Line::from(Span::styled(
-                        format!("╰{}", "─".repeat(width.saturating_sub(2).min(64))),
-                        Style::default().fg(theme.border),
-                    )),
-                    block_idx: Some(b_idx),
-                    task_checkbox: None,
-                    has_wikilink: false,
-                    image_idx: None,
-                    html_pill: None,
-                    action_pills: Vec::new(),
-                    bg_override: Some(code_bg),
-                });
-                push_plain(&mut out, Line::from(""), None);
-            }
-
-            NoteBlock::Blockquote { lines: qlines, .. } => {
-                for ql in qlines {
-                    let mut spans = vec![Span::styled("▎ ", Style::default().fg(theme.fg_muted))];
-                    spans.extend(render_inline_spans(
-                        ql,
-                        theme,
-                        ui.show_inline_hrefs,
-                        theme.quote_style(),
-                    ));
-                    out.push(RenderedLine {
-                        line: Line::from(spans),
-                        block_idx: Some(b_idx),
-                        task_checkbox: None,
-                        has_wikilink: has_wl,
-                        image_idx: None,
-                        html_pill: None,
-                        action_pills: Vec::new(),
-                        bg_override: sel_bg,
-                    });
-                }
-                push_plain(&mut out, Line::from(""), None);
-            }
-
-            NoteBlock::Table { headers, rows, .. } => {
-                let cols = headers.len().max(1);
-                let col_w = (width.saturating_sub(cols * 3 + 1) / cols).clamp(8, 28);
-                let hdr_cells: Vec<String> = headers
-                    .iter()
-                    .map(|h| format!("{:<w$}", truncate_width(h, col_w), w = col_w))
-                    .collect();
-                out.push(RenderedLine {
-                    line: Line::from(Span::styled(
-                        format!("│ {} │", hdr_cells.join(" │ ")),
-                        Style::default()
-                            .fg(theme.accent_soft)
-                            .add_modifier(Modifier::BOLD),
-                    )),
-                    block_idx: Some(b_idx),
-                    task_checkbox: None,
-                    has_wikilink: false,
-                    image_idx: None,
-                    html_pill: None,
-                    action_pills: Vec::new(),
-                    bg_override: Some(theme.bg_card),
-                });
-                let sep_cells: Vec<String> = (0..cols).map(|_| "─".repeat(col_w)).collect();
-                out.push(RenderedLine {
-                    line: Line::from(Span::styled(
-                        format!("├─{}─┤", sep_cells.join("─┼─")),
-                        Style::default().fg(theme.border),
-                    )),
-                    block_idx: Some(b_idx),
-                    task_checkbox: None,
-                    has_wikilink: false,
-                    image_idx: None,
-                    html_pill: None,
-                    action_pills: Vec::new(),
-                    bg_override: None,
-                });
-                for r in rows {
-                    let cells: Vec<String> = (0..cols)
-                        .map(|ci| {
-                            let val = r.get(ci).map(String::as_str).unwrap_or("");
-                            format!("{:<w$}", truncate_width(val, col_w), w = col_w)
-                        })
-                        .collect();
-                    out.push(RenderedLine {
-                        line: Line::from(Span::styled(
-                            format!("│ {} │", cells.join(" │ ")),
-                            Style::default().fg(theme.fg_primary),
-                        )),
-                        block_idx: Some(b_idx),
-                        task_checkbox: None,
-                        has_wikilink: false,
-                        image_idx: None,
-                        html_pill: None,
-                        action_pills: Vec::new(),
-                        bg_override: sel_bg,
-                    });
-                }
-                push_plain(&mut out, Line::from(""), None);
-            }
-
-            NoteBlock::ImageEmbed {
-                raw_target,
-                alt,
-                resolved_path,
-                ..
-            } => {
-                let img_idx = if resolved_path.is_some() {
-                    let idx = image_counter;
-                    image_counter += 1;
-                    Some(idx)
-                } else {
-                    None
-                };
-                let badge = if resolved_path.is_some() {
-                    format!(" ▣ IMG: {alt} ({raw_target}) · [v HD Preview] ")
-                } else {
-                    format!(" ▣ IMG (missing): {raw_target} ")
-                };
-                out.push(RenderedLine {
-                    line: Line::from(Span::styled(
-                        truncate_width(&badge, width),
-                        if resolved_path.is_some() {
-                            theme.tag_pill_style()
-                        } else {
-                            Style::default().fg(theme.warning).bg(theme.bg_card)
-                        },
-                    )),
-                    block_idx: Some(b_idx),
-                    task_checkbox: None,
-                    has_wikilink: false,
-                    image_idx: img_idx,
-                    html_pill: None,
-                    action_pills: Vec::new(),
-                    bg_override: sel_bg,
-                });
-
-                // Render inline halfblock preview if cached
-                if app.cfg.inline_images {
-                    if let Some(abs) = resolved_path {
-                        let bg_rgb = crate::img_preview::color_to_rgb(theme.bg_canvas, (19, 19, 24));
-                        let cache_key = crate::ui::app::inline_preview_cache_key(
-                            abs,
-                            bg_rgb,
-                            app.graphics_caps.cell_px,
-                        );
-                        if let Some(rendered) = app.preview_cache.get(&cache_key) {
-                            for img_line in &rendered.lines {
-                                out.push(RenderedLine {
-                                    line: img_line.clone(),
-                                    block_idx: Some(b_idx),
-                                    task_checkbox: None,
-                                    has_wikilink: false,
-                                    image_idx: img_idx,
-                                    html_pill: None,
-                                    action_pills: Vec::new(),
-                                    bg_override: None,
-                                });
-                            }
-                        }
-                    }
-                }
-                push_plain(&mut out, Line::from(""), None);
-            }
-
-            NoteBlock::NoteEmbed {
-                target,
-                heading,
-                resolved_path,
-                ..
-            } => {
-                let label = match heading {
-                    Some(h) => format!("![[{target}#{h}]]"),
-                    None => format!("![[{target}]]"),
-                };
-                out.push(RenderedLine {
-                    line: Line::from(vec![
-                        Span::styled("┃ ↗ Embed: ", Style::default().fg(theme.accent)),
-                        Span::styled(label, theme.wikilink_style(resolved_path.is_some())),
-                    ]),
-                    block_idx: Some(b_idx),
-                    task_checkbox: None,
-                    has_wikilink: true,
-                    image_idx: None,
-                    html_pill: None,
-                    action_pills: Vec::new(),
-                    bg_override: Some(theme.bg_card),
-                });
-                push_plain(&mut out, Line::from(""), None);
-            }
-
-            NoteBlock::Divider { .. } => {
-                out.push(RenderedLine {
-                    line: Line::from(Span::styled(
-                        "─".repeat(width.min(72)),
-                        Style::default().fg(theme.divider),
-                    )),
-                    block_idx: Some(b_idx),
-                    task_checkbox: None,
-                    has_wikilink: false,
                     image_idx: None,
                     html_pill: None,
                     action_pills: Vec::new(),
@@ -1030,9 +475,771 @@ fn build_canvas_lines(
                 });
             }
         }
-    }
 
-    out
+        NoteBlock::Paragraph { spans, .. } => {
+            // Standalone display math block (`$$...$$`) renders as a clean multiline math box.
+            if spans.len() == 1 {
+                if let InlineSpan::Math {
+                    text,
+                    display: true,
+                } = &spans[0]
+                {
+                    let mut hdr = outer_prefix.to_vec();
+                    hdr.push(Span::styled("┌─ math", theme.muted_style()));
+                    out.push(RenderedLine {
+                        line: Line::from(hdr),
+                        block_idx: Some(b_idx),
+                        task_checkbox: None,
+                        has_wikilink: false,
+                        image_idx: None,
+                        html_pill: None,
+                        action_pills: Vec::new(),
+                        bg_override: sel_bg,
+                    });
+                    let math_style = Style::default()
+                        .fg(theme.accent_soft)
+                        .add_modifier(Modifier::ITALIC);
+                    let mut body_pfx = outer_prefix.to_vec();
+                    body_pfx.push(Span::styled("│ ", Style::default().fg(theme.border)));
+                    let trimmed = text.trim_matches('\n');
+                    for line in wrap_styled_spans(
+                        &[Span::styled(trimmed.to_string(), math_style)],
+                        width,
+                        WrapPrefix {
+                            first: &body_pfx,
+                            cont: &body_pfx,
+                        },
+                    ) {
+                        out.push(RenderedLine {
+                            line,
+                            block_idx: Some(b_idx),
+                            task_checkbox: None,
+                            has_wikilink: false,
+                            image_idx: None,
+                            html_pill: None,
+                            action_pills: Vec::new(),
+                            bg_override: sel_bg,
+                        });
+                    }
+                    let mut ftr = outer_prefix.to_vec();
+                    ftr.push(Span::styled("└─", theme.muted_style()));
+                    out.push(RenderedLine {
+                        line: Line::from(ftr),
+                        block_idx: Some(b_idx),
+                        task_checkbox: None,
+                        has_wikilink: false,
+                        image_idx: None,
+                        html_pill: None,
+                        action_pills: Vec::new(),
+                        bg_override: sel_bg,
+                    });
+                    if top_level {
+                        push_plain(out, Line::from(""), None);
+                    }
+                    return;
+                }
+            }
+
+            let base_style = container_text_style.unwrap_or(Style::default().fg(theme.fg_primary));
+            let rendered = render_inline_spans(spans, theme, show_hrefs, base_style);
+            let mut first_pfx = outer_prefix.to_vec();
+            if top_level && is_sel {
+                first_pfx.push(Span::styled(
+                    "▎ ",
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            for wrapped in wrap_styled_spans(
+                &rendered,
+                width,
+                WrapPrefix {
+                    first: &first_pfx,
+                    cont: outer_prefix,
+                },
+            ) {
+                out.push(RenderedLine {
+                    line: wrapped,
+                    block_idx: Some(b_idx),
+                    task_checkbox: None,
+                    has_wikilink: has_wl,
+                    image_idx: None,
+                    html_pill: None,
+                    action_pills: Vec::new(),
+                    bg_override: sel_bg,
+                });
+            }
+            if top_level {
+                push_plain(out, Line::from(""), None);
+            }
+        }
+
+        NoteBlock::HtmlEmbed {
+            raw_html,
+            summary_lines,
+            ..
+        } => {
+            let pill = "[H: HTML]";
+            let pill_w = unicode_width::UnicodeWidthStr::width(pill) as u16;
+            let card_bg = if is_sel {
+                theme.bg_selected
+            } else {
+                theme.bg_card
+            };
+            let mut banner_spans = outer_prefix.to_vec();
+            let banner_label = " ◈ Embedded HTML · ";
+            let pill_x = prefix_w + unicode_width::UnicodeWidthStr::width(banner_label);
+            banner_spans.push(Span::styled(banner_label, theme.muted_style()));
+            banner_spans.push(Span::styled(
+                pill,
+                Style::default()
+                    .fg(theme.accent)
+                    .bg(theme.bg_card)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            out.push(RenderedLine {
+                line: Line::from(banner_spans),
+                block_idx: Some(b_idx),
+                task_checkbox: None,
+                has_wikilink: false,
+                image_idx: None,
+                html_pill: Some((pill_x as u16, pill_w, b_idx)),
+                action_pills: Vec::new(),
+                bg_override: Some(card_bg),
+            });
+
+            // Render ONLY a sanitized `bitefoundry_html::render_dom()` summary preview (max 8 lines).
+            // Never fall through to raw HTML text.
+            let doc = bitefoundry_html::DomDocument::parse(raw_html);
+            let html_theme = html_theme_from_ui(theme);
+            let preview_w = inner_width.saturating_sub(2).clamp(12, u16::MAX as usize) as u16;
+            let rendered_html = bitefoundry_html::render_dom(
+                &doc,
+                preview_w,
+                &html_theme,
+                None,
+                None,
+                show_hrefs,
+            );
+            let mut non_blank: Vec<Line<'static>> = rendered_html
+                .lines
+                .into_iter()
+                .filter(|l| l.spans.iter().any(|s| !s.content.trim().is_empty()))
+                .collect();
+
+            if non_blank.is_empty() && !summary_lines.is_empty() {
+                non_blank = summary_lines
+                    .iter()
+                    .map(|s| Line::from(Span::styled(s.clone(), theme.muted_style())))
+                    .collect();
+            }
+
+            const MAX_HTML_PREVIEW_LINES: usize = 8;
+            let mut body_pfx = outer_prefix.to_vec();
+            body_pfx.push(if top_level && is_sel {
+                Span::styled(
+                    "▎ ",
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::styled("  ", theme.muted_style())
+            });
+
+            if non_blank.is_empty() {
+                if !rendered_html.graphics.is_empty() {
+                    let mut spans = body_pfx;
+                    spans.push(Span::styled(
+                        "◇ Embedded graphic · press H to view",
+                        theme.muted_style(),
+                    ));
+                    out.push(RenderedLine {
+                        line: Line::from(spans),
+                        block_idx: Some(b_idx),
+                        task_checkbox: None,
+                        has_wikilink: false,
+                        image_idx: None,
+                        html_pill: None,
+                        action_pills: Vec::new(),
+                        bg_override: sel_bg,
+                    });
+                }
+            } else {
+                let truncated = non_blank.len() > MAX_HTML_PREVIEW_LINES;
+                let take_n = if truncated {
+                    MAX_HTML_PREVIEW_LINES - 1
+                } else {
+                    non_blank.len()
+                };
+                for line in non_blank.into_iter().take(take_n) {
+                    let mut prefixed = body_pfx.clone();
+                    prefixed.extend(line.spans);
+                    out.push(RenderedLine {
+                        line: Line::from(prefixed),
+                        block_idx: Some(b_idx),
+                        task_checkbox: None,
+                        has_wikilink: false,
+                        image_idx: None,
+                        html_pill: None,
+                        action_pills: Vec::new(),
+                        bg_override: sel_bg,
+                    });
+                }
+                if truncated {
+                    let mut spans = body_pfx;
+                    spans.push(Span::styled(
+                        "… press H for full HTML preview",
+                        theme.muted_style(),
+                    ));
+                    out.push(RenderedLine {
+                        line: Line::from(spans),
+                        block_idx: Some(b_idx),
+                        task_checkbox: None,
+                        has_wikilink: false,
+                        image_idx: None,
+                        html_pill: None,
+                        action_pills: Vec::new(),
+                        bg_override: sel_bg,
+                    });
+                }
+            }
+
+            if top_level {
+                push_plain(out, Line::from(""), None);
+            }
+        }
+
+        NoteBlock::Callout {
+            callout_kind,
+            title,
+            collapsed,
+            body_blocks,
+            ..
+        } => {
+            let c_color = theme.callout_color(*callout_kind);
+            let card_bg = if is_sel {
+                theme.bg_selected
+            } else {
+                theme.bg_card
+            };
+            let fold = if *collapsed { "▸ " } else { "" };
+            let bar = Span::styled(
+                "┃ ",
+                Style::default().fg(c_color).add_modifier(Modifier::BOLD),
+            );
+            let mut header_spans = outer_prefix.to_vec();
+            header_spans.push(bar.clone());
+            header_spans.push(Span::styled(
+                format!("{fold}{} {} ", callout_kind.glyph(), callout_kind.label()),
+                Style::default().fg(c_color).add_modifier(Modifier::BOLD),
+            ));
+            if !title.eq_ignore_ascii_case(callout_kind.label()) {
+                header_spans.push(Span::styled(
+                    format!("· {title}"),
+                    Style::default()
+                        .fg(theme.fg_primary)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            out.push(RenderedLine {
+                line: Line::from(header_spans),
+                block_idx: Some(b_idx),
+                task_checkbox: None,
+                has_wikilink: has_wl,
+                image_idx: None,
+                html_pill: None,
+                action_pills: Vec::new(),
+                bg_override: Some(card_bg),
+            });
+
+            let mut nested_prefix = outer_prefix.to_vec();
+            nested_prefix.push(bar);
+            let body_style = Style::default().fg(theme.fg_secondary);
+            for child in body_blocks {
+                render_block_into(
+                    ctx,
+                    child,
+                    b_idx,
+                    is_sel,
+                    Some(card_bg),
+                    has_wl,
+                    &nested_prefix,
+                    Some(body_style),
+                    false,
+                    out,
+                );
+            }
+            if top_level {
+                push_plain(out, Line::from(""), None);
+            }
+        }
+
+        NoteBlock::Blockquote { blocks, .. } => {
+            let mut nested_prefix = outer_prefix.to_vec();
+            nested_prefix.push(Span::styled("▎ ", Style::default().fg(theme.fg_muted)));
+            for child in blocks {
+                render_block_into(
+                    ctx,
+                    child,
+                    b_idx,
+                    is_sel,
+                    sel_bg,
+                    has_wl,
+                    &nested_prefix,
+                    Some(theme.quote_style()),
+                    false,
+                    out,
+                );
+            }
+            if top_level {
+                push_plain(out, Line::from(""), None);
+            }
+        }
+
+        NoteBlock::Task {
+            checked,
+            indent,
+            spans,
+            line_no,
+            ..
+        } => {
+            let pad = " ".repeat((*indent).min(8));
+            let cursor = if top_level && is_sel { "▸ " } else { "  " };
+            let checkbox = if *checked { "☑ " } else { "☐ " };
+            let base_style = if *checked {
+                theme.muted_style().add_modifier(Modifier::CROSSED_OUT)
+            } else {
+                container_text_style.unwrap_or(Style::default().fg(theme.fg_primary))
+            };
+            let mut first_pfx = outer_prefix.to_vec();
+            first_pfx.push(Span::styled(
+                format!("{pad}{cursor}"),
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            first_pfx.push(Span::styled(
+                checkbox.to_string(),
+                Style::default()
+                    .fg(if *checked {
+                        theme.success
+                    } else {
+                        theme.accent
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ));
+            let mut cont_pfx = outer_prefix.to_vec();
+            cont_pfx.push(Span::raw(format!("{pad}    ")));
+
+            let rendered = render_inline_spans(spans, theme, show_hrefs, base_style);
+            let hit_w = (prefix_w + (*indent).min(8) + 6) as u16;
+            for (li, line) in wrap_styled_spans(
+                &rendered,
+                width,
+                WrapPrefix {
+                    first: &first_pfx,
+                    cont: &cont_pfx,
+                },
+            )
+            .into_iter()
+            .enumerate()
+            {
+                out.push(RenderedLine {
+                    line,
+                    block_idx: Some(b_idx),
+                    task_checkbox: (li == 0).then_some((*line_no, hit_w)),
+                    has_wikilink: has_wl,
+                    image_idx: None,
+                    html_pill: None,
+                    action_pills: Vec::new(),
+                    bg_override: sel_bg,
+                });
+            }
+        }
+
+        NoteBlock::BulletItem { indent, spans, .. } => {
+            let pad = " ".repeat((*indent).min(8));
+            let base_style = container_text_style.unwrap_or(Style::default().fg(theme.fg_primary));
+            let mut first_pfx = outer_prefix.to_vec();
+            first_pfx.push(Span::styled(
+                format!("{pad}  • "),
+                Style::default().fg(theme.accent_soft),
+            ));
+            let mut cont_pfx = outer_prefix.to_vec();
+            cont_pfx.push(Span::raw(format!("{pad}    ")));
+
+            let rendered = render_inline_spans(spans, theme, show_hrefs, base_style);
+            for wrapped in wrap_styled_spans(
+                &rendered,
+                width,
+                WrapPrefix {
+                    first: &first_pfx,
+                    cont: &cont_pfx,
+                },
+            ) {
+                out.push(RenderedLine {
+                    line: wrapped,
+                    block_idx: Some(b_idx),
+                    task_checkbox: None,
+                    has_wikilink: has_wl,
+                    image_idx: None,
+                    html_pill: None,
+                    action_pills: Vec::new(),
+                    bg_override: sel_bg,
+                });
+            }
+        }
+
+        NoteBlock::NumberedItem {
+            number,
+            indent,
+            spans,
+            ..
+        } => {
+            let pad = " ".repeat((*indent).min(8));
+            let base_style = container_text_style.unwrap_or(Style::default().fg(theme.fg_primary));
+            let marker = format!("{pad}  {number}. ");
+            let cont_spaces = " ".repeat(unicode_width::UnicodeWidthStr::width(marker.as_str()));
+            let mut first_pfx = outer_prefix.to_vec();
+            first_pfx.push(Span::styled(
+                marker,
+                Style::default().fg(theme.accent_soft),
+            ));
+            let mut cont_pfx = outer_prefix.to_vec();
+            cont_pfx.push(Span::raw(cont_spaces));
+
+            let rendered = render_inline_spans(spans, theme, show_hrefs, base_style);
+            for wrapped in wrap_styled_spans(
+                &rendered,
+                width,
+                WrapPrefix {
+                    first: &first_pfx,
+                    cont: &cont_pfx,
+                },
+            ) {
+                out.push(RenderedLine {
+                    line: wrapped,
+                    block_idx: Some(b_idx),
+                    task_checkbox: None,
+                    has_wikilink: has_wl,
+                    image_idx: None,
+                    html_pill: None,
+                    action_pills: Vec::new(),
+                    bg_override: sel_bg,
+                });
+            }
+        }
+
+        NoteBlock::CodeBlock { language, code, .. } => {
+            let code_bg = if is_sel {
+                theme.bg_selected
+            } else {
+                theme.bg_code
+            };
+            let lang_label = if language.is_empty() {
+                "code"
+            } else {
+                language.as_str()
+            };
+            let is_html = is_html_code_language(language) && !code.trim().is_empty();
+            let html_suffix = if is_html { " [H: HTML]" } else { "" };
+            let bar_w = inner_width
+                .saturating_sub(lang_label.len() + 14 + html_suffix.len())
+                .min(50);
+            let mut hdr_spans = outer_prefix.to_vec();
+            hdr_spans.push(Span::styled("╭─ ", Style::default().fg(theme.border)));
+            hdr_spans.push(Span::styled(
+                format!("{lang_label} "),
+                Style::default()
+                    .fg(theme.accent_soft)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            hdr_spans.push(Span::styled(
+                "─".repeat(bar_w),
+                Style::default().fg(theme.border),
+            ));
+            hdr_spans.push(Span::styled(" [y copy]", theme.muted_style()));
+
+            let html_pill = if is_html {
+                let pfx_w: usize = hdr_spans
+                    .iter()
+                    .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
+                    .sum();
+                hdr_spans.push(Span::raw(" "));
+                hdr_spans.push(Span::styled(
+                    "[H: HTML]",
+                    Style::default()
+                        .fg(theme.accent)
+                        .bg(theme.bg_card)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                Some(((pfx_w + 1) as u16, 9u16, b_idx))
+            } else {
+                None
+            };
+            out.push(RenderedLine {
+                line: Line::from(hdr_spans),
+                block_idx: Some(b_idx),
+                task_checkbox: None,
+                has_wikilink: false,
+                image_idx: None,
+                html_pill,
+                action_pills: Vec::new(),
+                bg_override: Some(code_bg),
+            });
+            for code_line in code.lines() {
+                let mut spans = outer_prefix.to_vec();
+                spans.push(Span::styled("│ ", Style::default().fg(theme.border)));
+                spans.push(Span::styled(
+                    truncate_width(code_line, inner_width.saturating_sub(3)),
+                    Style::default().fg(theme.code_fg),
+                ));
+                out.push(RenderedLine {
+                    line: Line::from(spans),
+                    block_idx: Some(b_idx),
+                    task_checkbox: None,
+                    has_wikilink: false,
+                    image_idx: None,
+                    html_pill: None,
+                    action_pills: Vec::new(),
+                    bg_override: Some(code_bg),
+                });
+            }
+            let mut ftr = outer_prefix.to_vec();
+            ftr.push(Span::styled(
+                format!("╰{}", "─".repeat(inner_width.saturating_sub(2).min(64))),
+                Style::default().fg(theme.border),
+            ));
+            out.push(RenderedLine {
+                line: Line::from(ftr),
+                block_idx: Some(b_idx),
+                task_checkbox: None,
+                has_wikilink: false,
+                image_idx: None,
+                html_pill: None,
+                action_pills: Vec::new(),
+                bg_override: Some(code_bg),
+            });
+            if top_level {
+                push_plain(out, Line::from(""), None);
+            }
+        }
+
+        NoteBlock::Table {
+            headers,
+            rows,
+            alignments,
+            ..
+        } => {
+            let header_style = Style::default()
+                .fg(theme.accent_soft)
+                .add_modifier(Modifier::BOLD);
+            let cell_style = Style::default().fg(theme.fg_primary);
+            let border_style = Style::default().fg(theme.border);
+
+            let rendered_headers: Vec<Vec<Span<'static>>> = headers
+                .iter()
+                .map(|cell| render_inline_spans(cell, theme, show_hrefs, header_style))
+                .collect();
+            let rendered_rows: Vec<Vec<Vec<Span<'static>>>> = rows
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|cell| render_inline_spans(cell, theme, show_hrefs, cell_style))
+                        .collect()
+                })
+                .collect();
+            let table_aligns: Vec<TableAlign> = alignments
+                .iter()
+                .map(|a| match a {
+                    TableAlignment::Left => TableAlign::Left,
+                    TableAlignment::Center => TableAlign::Center,
+                    TableAlignment::Right => TableAlign::Right,
+                })
+                .collect();
+
+            let spec = TableSpec {
+                headers: &rendered_headers,
+                rows: &rendered_rows,
+                alignments: &table_aligns,
+                border: TableBorder::Box,
+                prefix: outer_prefix,
+                border_style,
+                header_style,
+                cell_style,
+            };
+            let table_lines = render_wrapped_table(&spec, width);
+            for line in table_lines {
+                out.push(RenderedLine {
+                    line,
+                    block_idx: Some(b_idx),
+                    task_checkbox: None,
+                    has_wikilink: has_wl,
+                    image_idx: None,
+                    html_pill: None,
+                    action_pills: Vec::new(),
+                    bg_override: sel_bg,
+                });
+            }
+            if top_level {
+                push_plain(out, Line::from(""), None);
+            }
+        }
+
+        NoteBlock::FootnoteDef { label, spans, .. } => {
+            let mut first_pfx = outer_prefix.to_vec();
+            first_pfx.push(Span::styled(
+                format!("[^{label}]: "),
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            let mut cont_pfx = outer_prefix.to_vec();
+            cont_pfx.push(Span::raw("  "));
+            let rendered = render_inline_spans(spans, theme, show_hrefs, theme.muted_style());
+            for wrapped in wrap_styled_spans(
+                &rendered,
+                width,
+                WrapPrefix {
+                    first: &first_pfx,
+                    cont: &cont_pfx,
+                },
+            ) {
+                out.push(RenderedLine {
+                    line: wrapped,
+                    block_idx: Some(b_idx),
+                    task_checkbox: None,
+                    has_wikilink: has_wl,
+                    image_idx: None,
+                    html_pill: None,
+                    action_pills: Vec::new(),
+                    bg_override: sel_bg,
+                });
+            }
+        }
+
+        NoteBlock::ImageEmbed {
+            raw_target,
+            alt,
+            resolved_path,
+            ..
+        } => {
+            let img_idx = if resolved_path.is_some() {
+                let idx = ctx.image_counter;
+                ctx.image_counter += 1;
+                Some(idx)
+            } else {
+                None
+            };
+            let badge = if resolved_path.is_some() {
+                format!(" ▣ IMG: {alt} ({raw_target}) · [v HD Preview] ")
+            } else {
+                format!(" ▣ IMG (missing): {raw_target} ")
+            };
+            let mut badge_spans = outer_prefix.to_vec();
+            badge_spans.push(Span::styled(
+                truncate_width(&badge, inner_width),
+                if resolved_path.is_some() {
+                    theme.tag_pill_style()
+                } else {
+                    Style::default().fg(theme.warning).bg(theme.bg_card)
+                },
+            ));
+            out.push(RenderedLine {
+                line: Line::from(badge_spans),
+                block_idx: Some(b_idx),
+                task_checkbox: None,
+                has_wikilink: false,
+                image_idx: img_idx,
+                html_pill: None,
+                action_pills: Vec::new(),
+                bg_override: sel_bg,
+            });
+
+            // Render inline halfblock preview if cached
+            if ctx.app.cfg.inline_images {
+                if let Some(abs) = resolved_path {
+                    let bg_rgb = crate::img_preview::color_to_rgb(theme.bg_canvas, (19, 19, 24));
+                    let cache_key = crate::ui::app::inline_preview_cache_key(
+                        abs,
+                        bg_rgb,
+                        ctx.app.graphics_caps.cell_px,
+                    );
+                    if let Some(rendered) = ctx.app.preview_cache.get(&cache_key) {
+                        for img_line in &rendered.lines {
+                            out.push(RenderedLine {
+                                line: img_line.clone(),
+                                block_idx: Some(b_idx),
+                                task_checkbox: None,
+                                has_wikilink: false,
+                                image_idx: img_idx,
+                                html_pill: None,
+                                action_pills: Vec::new(),
+                                bg_override: None,
+                            });
+                        }
+                    }
+                }
+            }
+            if top_level {
+                push_plain(out, Line::from(""), None);
+            }
+        }
+
+        NoteBlock::NoteEmbed {
+            target,
+            heading,
+            resolved_path,
+            ..
+        } => {
+            let label = match heading {
+                Some(h) => format!("{target}#{h}"),
+                None => target.clone(),
+            };
+            let mut spans = outer_prefix.to_vec();
+            spans.push(Span::styled(
+                "┃ ↗ Embed: ",
+                Style::default().fg(theme.accent),
+            ));
+            spans.push(Span::styled(
+                label,
+                theme.wikilink_style(resolved_path.is_some()),
+            ));
+            out.push(RenderedLine {
+                line: Line::from(spans),
+                block_idx: Some(b_idx),
+                task_checkbox: None,
+                has_wikilink: true,
+                image_idx: None,
+                html_pill: None,
+                action_pills: Vec::new(),
+                bg_override: Some(theme.bg_card),
+            });
+            if top_level {
+                push_plain(out, Line::from(""), None);
+            }
+        }
+
+        NoteBlock::Divider { .. } => {
+            let mut spans = outer_prefix.to_vec();
+            spans.push(Span::styled(
+                "─".repeat(inner_width.min(72)),
+                Style::default().fg(theme.divider),
+            ));
+            out.push(RenderedLine {
+                line: Line::from(spans),
+                block_idx: Some(b_idx),
+                task_checkbox: None,
+                has_wikilink: false,
+                image_idx: None,
+                html_pill: None,
+                action_pills: Vec::new(),
+                bg_override: sel_bg,
+            });
+        }
+    }
 }
 
 fn render_inline_spans(
@@ -1053,6 +1260,10 @@ fn render_inline_spans(
                 text.clone(),
                 base_style.add_modifier(Modifier::ITALIC),
             )),
+            InlineSpan::Underline { text } => out.push(Span::styled(
+                text.clone(),
+                base_style.add_modifier(Modifier::UNDERLINED),
+            )),
             InlineSpan::Code { text } => {
                 out.push(Span::styled(format!(" {text} "), theme.code_style()));
             }
@@ -1067,6 +1278,71 @@ fn render_inline_spans(
                     .bg(theme.warning)
                     .add_modifier(Modifier::BOLD),
             )),
+            InlineSpan::Styled {
+                text,
+                bold,
+                italic,
+                strike,
+                highlight,
+                underline,
+            } => {
+                let mut st = if *highlight {
+                    Style::default()
+                        .fg(theme.bg_canvas)
+                        .bg(theme.warning)
+                        .add_modifier(Modifier::BOLD)
+                } else if *strike {
+                    theme.muted_style()
+                } else {
+                    base_style
+                };
+                if *bold {
+                    st = st.add_modifier(Modifier::BOLD);
+                }
+                if *italic {
+                    st = st.add_modifier(Modifier::ITALIC);
+                }
+                if *strike {
+                    st = st.add_modifier(Modifier::CROSSED_OUT);
+                }
+                if *underline {
+                    st = st.add_modifier(Modifier::UNDERLINED);
+                }
+                out.push(Span::styled(text.clone(), st));
+            }
+            InlineSpan::Math { text, .. } => {
+                let st = if theme.no_color {
+                    base_style.add_modifier(Modifier::ITALIC)
+                } else {
+                    Style::default()
+                        .fg(theme.accent_soft)
+                        .bg(theme.bg_code)
+                        .add_modifier(Modifier::ITALIC)
+                };
+                out.push(Span::styled(text.clone(), st));
+            }
+            InlineSpan::FootnoteRef { label } => {
+                let st = if theme.no_color {
+                    Style::default().add_modifier(Modifier::DIM)
+                } else {
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD)
+                };
+                out.push(Span::styled(format!("[^{label}]"), st));
+            }
+            InlineSpan::Subscript { text } => {
+                out.push(Span::styled(text.clone(), theme.muted_style()));
+            }
+            InlineSpan::Superscript { text } => {
+                out.push(Span::styled(
+                    text.clone(),
+                    Style::default().fg(theme.accent_soft),
+                ));
+            }
+            InlineSpan::LineBreak => {
+                out.push(Span::raw("\n"));
+            }
             InlineSpan::Wikilink {
                 target,
                 heading,
@@ -1081,7 +1357,7 @@ fn render_inline_spans(
                     target.clone()
                 };
                 out.push(Span::styled(
-                    format!("[[{display}]]"),
+                    display,
                     theme.wikilink_style(resolved_path.is_some()),
                 ));
             }
@@ -1104,54 +1380,27 @@ fn render_inline_spans(
     out
 }
 
-fn wrap_spans(spans: Vec<Span<'static>>, max_width: usize) -> Vec<Line<'static>> {
-    if max_width < 12 {
-        return vec![Line::from(spans)];
-    }
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut current: Vec<Span<'static>> = Vec::new();
-    let mut col = 0usize;
-
-    for span in spans {
-        let style = span.style;
-        let text = span.content.into_owned();
-        if text.is_empty() {
-            continue;
-        }
-        let words: Vec<&str> = text.split_inclusive(' ').collect();
-        for w in words {
-            let wl = unicode_width::UnicodeWidthStr::width(w);
-            if col > 0 && col + wl > max_width {
-                lines.push(Line::from(std::mem::take(&mut current)));
-                col = 0;
-            }
-            current.push(Span::styled(w.to_string(), style));
-            col += wl;
-        }
-    }
-    if !current.is_empty() || lines.is_empty() {
-        lines.push(Line::from(current));
-    }
-    lines
-}
-
 #[cfg(test)]
 mod tests {
     use tokio::sync::{mpsc, watch};
+    use unicode_width::UnicodeWidthStr;
 
     use super::*;
     use crate::{
         config::AppConfig,
-        models::{NoteDetail, NoteSummary},
+        models::{CalloutKind, NoteDetail, NoteSummary},
         storage::Storage,
         sync::{FocusTarget, SyncCommand, SyncController},
-        vault::{parser::parse_markdown, vault_from_dir},
+        vault::{
+            fs::toggle_task_at_line_verified,
+            parser::parse_markdown,
+            vault_from_dir,
+        },
     };
 
-    #[test]
-    fn test_embedded_html_paragraph_leaks_zero_raw_tags_css_or_svg_text() {
+    fn render_note_lines(md: &str, title: &str, width: usize) -> (NoteDetail, Vec<RenderedLine>) {
         let tmp = tempfile::tempdir().unwrap();
-        let vault = vault_from_dir(tmp.path(), Some("HtmlLeakVault"));
+        let vault = vault_from_dir(tmp.path(), Some("CanvasTestVault"));
         let cfg = AppConfig::default();
         let storage = Storage::open_in_memory().unwrap();
         let (focus_tx, _focus_rx) = watch::channel(FocusTarget::default());
@@ -1160,12 +1409,11 @@ mod tests {
         let app = AppState::new(cfg.clone(), vault, storage, sync_ctrl);
         let ui = UiState::from_config(&cfg);
 
-        let md = "# Embedded HTML Test\n\n<div><style>.x{color:red}</style><svg><desc>secret</desc><rect width=\"10\" height=\"10\"/></svg><p>Hi</p></div>\n";
-        let parsed = parse_markdown("Embed.md", "Embedded HTML Test", md);
+        let parsed = parse_markdown("Test.md", title, md);
         let detail = NoteDetail {
             summary: NoteSummary {
-                rel_path: "Embed.md".into(),
-                title: "Embedded HTML Test".into(),
+                rel_path: "Test.md".into(),
+                title: title.into(),
                 ..Default::default()
             },
             raw_markdown: md.to_string(),
@@ -1174,9 +1422,12 @@ mod tests {
             outgoing_links: Vec::new(),
             images: Vec::new(),
         };
+        let rendered = build_canvas_lines(&detail, &app, &ui, &ui.theme, width, 0, true);
+        (detail, rendered)
+    }
 
-        let rendered = build_canvas_lines(&detail, &app, &ui, &ui.theme, 80, 0, true);
-        let full_text: String = rendered
+    fn lines_to_text(rendered: &[RenderedLine]) -> String {
+        rendered
             .iter()
             .map(|rl| {
                 rl.line
@@ -1186,15 +1437,35 @@ mod tests {
                     .collect::<String>()
             })
             .collect::<Vec<_>>()
-            .join("\n");
+            .join("\n")
+    }
 
+    #[test]
+    fn embedded_html_does_not_fall_through_raw_tags() {
+        let md = "# Embedded HTML Test\n\n<div><style>.x{color:red}</style><svg><desc>secret</desc><rect width=\"10\" height=\"10\"/></svg><p>Hello</p></div>\n";
+        let (detail, rendered) = render_note_lines(md, "Embedded HTML Test", 80);
+        let full_text = lines_to_text(&rendered);
+
+        assert!(
+            detail
+                .parsed
+                .blocks
+                .iter()
+                .any(|b| matches!(b, NoteBlock::HtmlEmbed { .. })),
+            "expected NoteBlock::HtmlEmbed block, got: {:?}",
+            detail.parsed.blocks
+        );
+        assert!(
+            full_text.contains("[H: HTML]"),
+            "expected [H: HTML] badge in:\n{full_text}"
+        );
         assert!(
             full_text.contains("◈ Embedded HTML"),
             "expected Embedded HTML banner in:\n{full_text}"
         );
         assert!(
-            full_text.contains("Hi"),
-            "expected sanitized paragraph text 'Hi' in:\n{full_text}"
+            full_text.contains("Hello"),
+            "expected sanitized paragraph text 'Hello' in:\n{full_text}"
         );
         for forbidden in [
             "<div",
@@ -1213,5 +1484,168 @@ mod tests {
                 "raw HTML/CSS/SVG leak detected ({forbidden}) in:\n{full_text}"
             );
         }
+    }
+
+    #[test]
+    fn table_cells_and_inline_syntax_no_raw_leakage() {
+        let md = concat!(
+            "---\n",
+            "status: active\n",
+            "---\n\n",
+            "# Track C Spec\n\n",
+            "| Item | Description |\n",
+            "| :--- | ---: |\n",
+            "| **Bold** [[Note|Alias]] `code` | 한글 셀 |\n\n",
+            "Inline: _italic_, __bold__, ***both***, \\*esc\\*, $x^2$, ref[^1], <u>under</u>, and %%secret%% hidden.\n\n",
+            "%%\nmultiline hidden secret\n%%\n\n",
+            "> [!note]\n",
+            "> Outer callout\n",
+            ">> [!tip]\n",
+            ">> Nested tip\n\n",
+            "- [ ] Verify exact line_no toggle\n\n",
+            "[^1]: Footnote detail body.\n",
+        );
+
+        let width = 64;
+        let (detail, rendered) = render_note_lines(md, "Track C Spec", width);
+        let full_text = lines_to_text(&rendered);
+
+        // 1. Wikilinks index preserved from table cell `[[Note|Alias]]`
+        assert!(
+            detail
+                .parsed
+                .wikilinks
+                .iter()
+                .any(|w| w.target_raw == "Note" && w.alias.as_deref() == Some("Alias")),
+            "expected wikilink [[Note|Alias]] in index, got: {:?}",
+            detail.parsed.wikilinks
+        );
+
+        // 2. Table cells hold parsed `Vec<InlineSpan>` (no raw `**` / `[[`)
+        let table = detail
+            .parsed
+            .blocks
+            .iter()
+            .find(|b| matches!(b, NoteBlock::Table { .. }))
+            .expect("expected NoteBlock::Table");
+        if let NoteBlock::Table { rows, .. } = table {
+            let cell0 = &rows[0][0];
+            assert!(
+                cell0.iter().any(|s| matches!(s, InlineSpan::Bold { text } if text == "Bold")),
+                "expected Bold span in table cell, got: {cell0:?}"
+            );
+            assert!(
+                cell0
+                    .iter()
+                    .any(|s| matches!(s, InlineSpan::Wikilink { target, alias, .. } if target == "Note" && alias.as_deref() == Some("Alias"))),
+                "expected Wikilink span in table cell, got: {cell0:?}"
+            );
+            assert!(
+                cell0.iter().any(|s| matches!(s, InlineSpan::Code { text } if text == "code")),
+                "expected Code span in table cell, got: {cell0:?}"
+            );
+        }
+
+        // 3. Nested Callout (`> [!note]\n>> [!tip]`) parsed into nested AST
+        let outer_callout = detail
+            .parsed
+            .blocks
+            .iter()
+            .find(|b| matches!(b, NoteBlock::Callout { callout_kind: CalloutKind::Note, .. }))
+            .expect("expected outer Note callout");
+        if let NoteBlock::Callout { body_blocks, .. } = outer_callout {
+            assert!(
+                body_blocks.iter().any(|b| matches!(
+                    b,
+                    NoteBlock::Callout {
+                        callout_kind: CalloutKind::Tip,
+                        ..
+                    }
+                )),
+                "expected nested Tip callout inside Note callout, got: {body_blocks:?}"
+            );
+        }
+
+        // 4. Zero raw Markdown syntax or comment leakage in rendered canvas
+        for forbidden in [
+            "**",
+            "[[",
+            "%%secret%%",
+            "secret",
+            "multiline hidden",
+            "_italic_",
+            "__bold__",
+            "***both***",
+            "\\*esc\\*",
+            "$x^2$",
+            "<u>",
+            "</u>",
+        ] {
+            assert!(
+                !full_text.contains(forbidden),
+                "unexpected raw syntax/comment leak ({forbidden}) in:\n{full_text}"
+            );
+        }
+
+        // 5. Expected rendered content present
+        for expected in [
+            "Bold",
+            "Alias",
+            "code",
+            "한글 셀",
+            "italic",
+            "bold",
+            "both",
+            "*esc*",
+            "x^2",
+            "[^1]",
+            "under",
+            "NOTE",
+            "TIP",
+            "Nested tip",
+            "Footnote detail body.",
+        ] {
+            assert!(
+                full_text.contains(expected),
+                "missing expected rendered text ({expected}) in:\n{full_text}"
+            );
+        }
+
+        // 6. CJK table rows stay strictly aligned within viewport width
+        for rl in &rendered {
+            let line_str: String = rl.line.spans.iter().map(|s| s.content.as_ref()).collect();
+            if line_str.starts_with('┌')
+                || line_str.starts_with('│')
+                || line_str.starts_with('├')
+                || line_str.starts_with('└')
+            {
+                let lw = UnicodeWidthStr::width(line_str.as_str());
+                assert!(
+                    lw <= width,
+                    "table line exceeded width {width} (got {lw}): {line_str}"
+                );
+            }
+        }
+
+        // 7. Exact 1-based `line_no` survives frontmatter + multiline `%%comment%%` + nested callouts
+        let task = detail
+            .parsed
+            .tasks
+            .iter()
+            .find(|t| t.text.contains("Verify exact line_no toggle"))
+            .expect("expected task entry");
+        let tmp = tempfile::tempdir().unwrap();
+        let note_file = tmp.path().join("TrackC.md");
+        std::fs::write(&note_file, md).unwrap();
+        let now_checked = toggle_task_at_line_verified(
+            &note_file,
+            task.line_no,
+            Some(&task.text),
+            Some(false),
+        )
+        .expect("toggle_task_at_line_verified must succeed with exact 1-based line_no");
+        assert!(now_checked);
+        let updated = std::fs::read_to_string(&note_file).unwrap();
+        assert!(updated.contains("- [x] Verify exact line_no toggle"));
     }
 }
