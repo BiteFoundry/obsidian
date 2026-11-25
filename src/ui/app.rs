@@ -12,8 +12,9 @@ use chrono::Local;
 use crate::{
     config::{write_atomic, AppConfig, PageWidthMode, VaultProfile},
     img_preview::{
-        decode_and_render_for_protocol, decode_and_render_halfblocks, detect_graphics_caps,
-        RenderedTerminalImage, TerminalGraphicsCaps, TerminalImageProtocol,
+        color_to_rgb, decode_and_render_for_protocol, decode_and_render_halfblocks_with_cell_px,
+        detect_graphics_caps, FitBox, RenderedTerminalImage, TerminalGraphicsCaps,
+        TerminalImageProtocol,
     },
     models::{
         CodedError, CoreEvent, GraphData, IndexStats, LinkStatus, NoteBlock, NoteDetail,
@@ -58,6 +59,23 @@ use crate::{
         parser::parse_markdown,
     },
 };
+
+/// Builds a theme- and cell-pixel-aware cache key for inline halfblock note previews.
+pub fn inline_preview_cache_key(
+    abs_path: &std::path::Path,
+    bg_rgb: (u8, u8, u8),
+    cell_px: (u16, u16),
+) -> String {
+    format!(
+        "{}:{}_{}_{}:{}x{}",
+        inline_image_cache_key(abs_path),
+        bg_rgb.0,
+        bg_rgb.1,
+        bg_rgb.2,
+        cell_px.0,
+        cell_px.1
+    )
+}
 
 /// Why a note is being opened. Decides whether a target that does not exist may be created.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -301,7 +319,7 @@ impl AppState {
                     } else if let Ok(detail) =
                         self.storage.load_note_detail(&self.active_vault, &ed_path)
                     {
-                        self.cache_inline_images(&detail);
+                        self.cache_inline_images(&detail, ui);
                         self.active_note = Some(detail);
                     }
                 }
@@ -313,7 +331,7 @@ impl AppState {
                         if let Ok(detail) =
                             self.storage.load_note_detail(&self.active_vault, &ed_path)
                         {
-                            self.cache_inline_images(&detail);
+                            self.cache_inline_images(&detail, ui);
                             self.active_note = Some(detail);
                         } else {
                             self.apply_live_inline_parse(ui);
@@ -378,12 +396,12 @@ impl AppState {
 
         if let Some(rp) = current_path {
             if let Ok(detail) = self.storage.load_note_detail(&self.active_vault, &rp) {
-                self.cache_inline_images(&detail);
+                self.cache_inline_images(&detail, ui);
                 self.active_note = Some(detail);
             } else if let Some(first) = self.notes.first() {
                 let first_rp = first.rel_path.clone();
                 if let Ok(detail) = self.storage.load_note_detail(&self.active_vault, &first_rp) {
-                    self.cache_inline_images(&detail);
+                    self.cache_inline_images(&detail, ui);
                     self.active_note = Some(detail);
                 } else {
                     self.active_note = None;
@@ -490,16 +508,42 @@ impl AppState {
         self.clamp_selections(ui);
     }
 
-    fn cache_inline_images(&mut self, detail: &NoteDetail) {
-        self.cache_inline_images_list(&detail.images);
+    fn inline_image_content_width(ui: &UiState) -> u16 {
+        let show_left = ui.show_sidebar && ui.term_width >= 60;
+        let show_right = ui.show_inspector && ui.term_width >= 88;
+        let left_w = if show_left {
+            (ui.term_width / 5).clamp(22, 30)
+        } else {
+            0
+        };
+        let right_w = if show_right {
+            (ui.term_width / 4).clamp(26, 34)
+        } else {
+            0
+        };
+        let canvas_w = ui.term_width.saturating_sub(left_w + right_w).max(24);
+        match ui.page_width {
+            PageWidthMode::Centered if canvas_w > 92 => 86,
+            _ => canvas_w.saturating_sub(2),
+        }
     }
 
-    fn cache_inline_images_list(&mut self, images: &[NoteImageRef]) {
+    fn cache_inline_images(&mut self, detail: &NoteDetail, ui: &UiState) {
+        self.cache_inline_images_list(&detail.images, ui);
+    }
+
+    pub(crate) fn cache_inline_images_list(&mut self, images: &[NoteImageRef], ui: &UiState) {
         if !self.cfg.inline_images {
             return;
         }
+        let bg_rgb = color_to_rgb(ui.theme.bg_canvas, (19, 19, 24));
+        let width = Self::inline_image_content_width(ui);
+        let thumb_cols = width.saturating_sub(4).clamp(24, 72);
+        let thumb_rows = 16u16;
+        let fit = FitBox::fit_to_box(thumb_cols, thumb_rows);
+
         for img in images {
-            let key = inline_image_cache_key(&img.abs_path);
+            let key = inline_preview_cache_key(&img.abs_path, bg_rgb, self.graphics_caps.cell_px);
             if self.preview_cache.contains_key(&key) {
                 continue;
             }
@@ -511,7 +555,12 @@ impl AppState {
                 {
                     continue;
                 }
-                if let Ok(rendered) = decode_and_render_halfblocks(&bytes, 48, 10, (19, 19, 24)) {
+                if let Ok(rendered) = decode_and_render_halfblocks_with_cell_px(
+                    &bytes,
+                    fit,
+                    bg_rgb,
+                    self.graphics_caps.cell_px,
+                ) {
                     self.preview_cache.insert(key, rendered);
                 }
             }
@@ -527,10 +576,18 @@ impl AppState {
         ov: &mut ImagePreviewOverlay,
         term_w: u16,
         term_h: u16,
+        bg_rgb: (u8, u8, u8),
     ) -> Option<HtmlPreviewOverlay> {
         let target = ov.current()?.clone();
-        let (cols, rows) = ov.target_dimensions(term_w, term_h);
-        let key = ImagePreviewOverlay::cache_key(&target, cols, rows, self.graphics_caps.protocol);
+        let (view_cols, view_rows) = ImagePreviewOverlay::viewport_dimensions(term_w, term_h);
+        let key = ImagePreviewOverlay::cache_key(
+            &target,
+            view_cols,
+            view_rows,
+            ov.zoom_pct,
+            self.graphics_caps.cell_px,
+            self.graphics_caps.protocol,
+        );
         if self.preview_cache.contains_key(&key) {
             return None;
         }
@@ -549,13 +606,8 @@ impl AppState {
                             .with_source(HtmlPreviewSource::File(target.abs_path.clone())),
                     );
                 }
-                match decode_and_render_for_protocol(
-                    &bytes,
-                    cols,
-                    rows,
-                    (19, 19, 24),
-                    self.graphics_caps,
-                ) {
+                let fit = FitBox::modal(view_cols, view_rows, ov.zoom_pct);
+                match decode_and_render_for_protocol(&bytes, fit, bg_rgb, self.graphics_caps) {
                     Ok(rendered) => {
                         let prefix = format!("modal:{}:", target.abs_path.to_string_lossy());
                         self.preview_cache.retain(|k, _| !k.starts_with(&prefix));
@@ -572,8 +624,9 @@ impl AppState {
 
     /// Prepares the active overlay prior to drawing (including HTML-vs-Image auto-routing).
     pub fn prepare_active_overlay(&mut self, ui: &mut UiState, term_w: u16, term_h: u16) {
+        let bg_rgb = color_to_rgb(ui.theme.bg_elevated, (19, 19, 24));
         let reroute = if let Some(Overlay::ImagePreview(ref mut ov)) = ui.overlay {
-            self.ensure_modal_image_cached(ov, term_w, term_h)
+            self.ensure_modal_image_cached(ov, term_w, term_h, bg_rgb)
         } else {
             None
         };
@@ -749,7 +802,7 @@ impl AppState {
         match self.storage.load_note_detail(&self.active_vault, target) {
             Ok(detail) => {
                 self.push_history_entry(previous);
-                self.cache_inline_images(&detail);
+                self.cache_inline_images(&detail, ui);
                 self.active_note = Some(detail);
                 ui.canvas_mode = CanvasMode::Note;
                 ui.canvas_selected_block = 0;
@@ -771,7 +824,7 @@ impl AppState {
                                     self.storage.load_note_detail(&self.active_vault, &rel_path)
                                 {
                                     self.push_history_entry(previous);
-                                    self.cache_inline_images(&detail);
+                                    self.cache_inline_images(&detail, ui);
                                     self.active_note = Some(detail);
                                     ui.canvas_mode = CanvasMode::Note;
                                     ui.canvas_selected_block = 0;
@@ -1005,7 +1058,7 @@ impl AppState {
                         .storage
                         .load_note_detail(&self.active_vault, &note_path)
                     {
-                        self.cache_inline_images(&detail);
+                        self.cache_inline_images(&detail, ui);
                         self.active_note = Some(detail);
                     } else {
                         self.apply_live_inline_parse(ui);
@@ -1097,7 +1150,7 @@ impl AppState {
             }
         }
         if let Some(images) = self.active_note.as_ref().map(|d| d.images.clone()) {
-            self.cache_inline_images_list(&images);
+            self.cache_inline_images_list(&images, ui);
         }
         self.refresh_graph(ui);
         true
@@ -2165,6 +2218,10 @@ impl AppState {
             Action::SetTheme(preset) => {
                 self.cfg.theme = preset;
                 ui.theme = Theme::detect(preset);
+                self.preview_cache.clear();
+                if let Some(images) = self.active_note.as_ref().map(|d| d.images.clone()) {
+                    self.cache_inline_images_list(&images, ui);
+                }
                 let _ = self.cfg.save();
             }
             Action::SetPageWidth(w) => {
@@ -2184,7 +2241,7 @@ impl AppState {
                 self.graphics_caps = caps;
                 self.preview_cache.clear();
                 if let Some(images) = self.active_note.as_ref().map(|d| d.images.clone()) {
-                    self.cache_inline_images_list(&images);
+                    self.cache_inline_images_list(&images, ui);
                 }
                 let _ = self.cfg.save();
             }
@@ -2192,7 +2249,7 @@ impl AppState {
                 self.cfg.inline_images = !self.cfg.inline_images;
                 if self.cfg.inline_images {
                     if let Some(images) = self.active_note.as_ref().map(|d| d.images.clone()) {
-                        self.cache_inline_images_list(&images);
+                        self.cache_inline_images_list(&images, ui);
                     }
                 }
                 let _ = self.cfg.save();

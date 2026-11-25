@@ -203,6 +203,26 @@ impl PixelLayerTracker {
             };
         }
 
+        // Avoid full `terminal.clear()` flicker when only the `#crop:...` viewport changed
+        // on the exact same rect and base image for Sixel without a terminal resize.
+        let sixel_crop_only = !term_resized
+            && self.active.len() == 1
+            && desired.len() == 1
+            && self.active[0].protocol == TerminalImageProtocol::Sixel
+            && desired[0].protocol == TerminalImageProtocol::Sixel
+            && self.active[0].rect == desired[0].rect
+            && parse_pixel_key(&self.active[0].cache_key).0
+                == parse_pixel_key(&desired[0].cache_key).0;
+
+        if sixel_crop_only {
+            return PixelReconcilePlan {
+                erase_and_redraw: false,
+                delete_kitty: false,
+                erase_rects: Vec::new(),
+                emit_desired: true,
+            };
+        }
+
         let had_active = !self.active.is_empty();
         let delete_kitty = had_active
             && (kitty_used
@@ -667,6 +687,7 @@ pub async fn run_tui(cfg: AppConfig, vault: VaultProfile, storage: Storage) -> R
         let graph_animating =
             ui.canvas_mode == ui::app::CanvasMode::Graph && ui.graph_sim.is_active();
 
+        let mut resized_to: Option<(u16, u16)> = None;
         redraw = tokio::select! {
             _ = physics_tick.tick(), if graph_animating => {
                 app.dispatch(ui::action::Action::GraphTick, &mut ui);
@@ -712,6 +733,7 @@ pub async fn run_tui(cfg: AppConfig, vault: VaultProfile, storage: Storage) -> R
                     Some(Ok(CrosstermEvent::Resize(w, h))) => {
                         ui.term_width = w;
                         ui.term_height = h;
+                        resized_to = Some((w, h));
                     }
                     Some(Err(_)) | None => break,
                     _ => {}
@@ -719,10 +741,50 @@ pub async fn run_tui(cfg: AppConfig, vault: VaultProfile, storage: Storage) -> R
                 true
             }
         };
+
+        if let Some((w, h)) = resized_to {
+            #[cfg(windows)]
+            {
+                drop(reader);
+                img_preview::refresh_cell_pixel_size(&mut app.graphics_caps);
+                win_console::enforce_windows_mouse_capture();
+                let mut stdout = io::stdout();
+                let _ = write_vt_mouse_enable(&mut stdout);
+                reader = EventStream::new();
+            }
+            #[cfg(not(windows))]
+            {
+                img_preview::refresh_cell_pixel_size(&mut app.graphics_caps);
+            }
+            handle_terminal_resize(&mut app, &mut ui, w, h);
+        }
     }
 
     app.html_server.shutdown();
     Ok(())
+}
+
+fn handle_terminal_resize(app: &mut AppState, ui: &mut UiState, w: u16, h: u16) {
+    ui.term_width = w;
+    ui.term_height = h;
+    let reroute = if let Some(Overlay::ImagePreview(ref mut ov)) = ui.overlay {
+        let bg_rgb = img_preview::color_to_rgb(ui.theme.bg_elevated, (19, 19, 24));
+        app.ensure_modal_image_cached(ov, w, h, bg_rgb)
+    } else {
+        None
+    };
+    if let Some(html_ov) = reroute {
+        let name = html_ov.title.clone();
+        ui.open_overlay(Overlay::HtmlPreview(html_ov));
+        ui.toasts.info(format!(
+            "Detected HTML in '{name}' — routed to interactive HTML preview"
+        ));
+    }
+    if app.cfg.inline_images {
+        if let Some(images) = app.active_note.as_ref().map(|d| d.images.clone()) {
+            app.cache_inline_images_list(&images, ui);
+        }
+    }
 }
 
 pub fn launch_external_editor(path: &Path) -> Result<()> {
@@ -893,5 +955,125 @@ mod tests {
             String::from_utf8(disable_buf).unwrap(),
             "\x1b[?1006l\x1b[?1002l\x1b[?1000l"
         );
+    }
+
+    #[test]
+    fn resize_refreshes_modal_preview_and_sixel_crop_only_skips_clear() {
+        use std::io::Cursor;
+        use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba, RgbaImage};
+        use tokio::sync::{mpsc, watch};
+        use crate::{
+            sync::{FocusTarget, SyncCommand, SyncController},
+            vault::vault_from_dir,
+        };
+
+        // Part 1: Resize immediately reloads active ImagePreview modal for the new viewport & cell_px
+        let tmp = tempfile::tempdir().unwrap();
+        let img: RgbaImage = ImageBuffer::from_pixel(64, 64, Rgba([90, 160, 240, 255]));
+        let mut png_buf = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(img)
+            .write_to(&mut png_buf, ImageFormat::Png)
+            .unwrap();
+        let img_path = tmp.path().join("photo.png");
+        std::fs::write(&img_path, png_buf.into_inner()).unwrap();
+
+        let vault = vault_from_dir(tmp.path(), Some("ResizeVault"));
+        let mut cfg = AppConfig::default();
+        cfg.load_failed = true;
+        let storage = Storage::open_in_memory().unwrap();
+        let (focus_tx, _focus_rx) = watch::channel(FocusTarget::default());
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel::<SyncCommand>();
+        let sync_ctrl = SyncController::from_channels(focus_tx, cmd_tx);
+
+        let mut app = AppState::new(cfg.clone(), vault, storage, sync_ctrl);
+        app.graphics_caps = TerminalGraphicsCaps {
+            protocol: TerminalImageProtocol::Sixel,
+            cell_px: (8, 16),
+            cell_px_exact: true,
+        };
+        let mut ui = UiState::from_config(&cfg);
+        ui.term_width = 100;
+        ui.term_height = 30;
+
+        let detail = NoteDetail {
+            summary: NoteSummary {
+                rel_path: "Note.md".into(),
+                title: "Note".into(),
+                ..Default::default()
+            },
+            raw_markdown: String::new(),
+            parsed: ParsedNote::default(),
+            backlinks: Vec::new(),
+            outgoing_links: Vec::new(),
+            images: vec![NoteImageRef {
+                raw_target: "photo.png".into(),
+                display_name: "photo.png".into(),
+                mime_type: "image/png".into(),
+                abs_path: img_path.clone(),
+                line_no: 1,
+            }],
+        };
+
+        let ov = ImagePreviewOverlay::from_note(&detail, Some(0)).unwrap();
+        let target = ov.current().unwrap().clone();
+        ui.open_overlay(Overlay::ImagePreview(ov));
+        app.prepare_active_overlay(&mut ui, 100, 30);
+
+        let (vc0, vr0) = ImagePreviewOverlay::viewport_dimensions(100, 30);
+        let old_key = ImagePreviewOverlay::cache_key(
+            &target,
+            vc0,
+            vr0,
+            100,
+            (8, 16),
+            TerminalImageProtocol::Sixel,
+        );
+        assert!(app.preview_cache.contains_key(&old_key));
+
+        // Simulate DPI/font change + terminal resize -> modal preview immediately re-rendered
+        app.graphics_caps.cell_px = (12, 24);
+        handle_terminal_resize(&mut app, &mut ui, 140, 42);
+        assert_eq!((ui.term_width, ui.term_height), (140, 42));
+
+        let (vc1, vr1) = ImagePreviewOverlay::viewport_dimensions(140, 42);
+        let new_key = ImagePreviewOverlay::cache_key(
+            &target,
+            vc1,
+            vr1,
+            100,
+            (12, 24),
+            TerminalImageProtocol::Sixel,
+        );
+        assert!(
+            app.preview_cache.contains_key(&new_key),
+            "expected resized modal preview cache key {new_key}"
+        );
+
+        // Part 2: Sixel crop-only scroll on the exact same rect/base key skips erase_and_redraw
+        let mut tracker = PixelLayerTracker::default();
+        let crop0 = sample_graphic(
+            "modal:photo.png:134x38:100%:12x24:Sixel#crop:0,0,80,24",
+            Rect::new(4, 3, 80, 24),
+            TerminalImageProtocol::Sixel,
+            4096,
+        );
+        let crop1 = sample_graphic(
+            "modal:photo.png:134x38:100%:12x24:Sixel#crop:0,10,80,24",
+            Rect::new(4, 3, 80, 24),
+            TerminalImageProtocol::Sixel,
+            4096,
+        );
+        tracker.commit(vec![crop0], (140, 42));
+
+        let scroll_plan = tracker.plan_transition(std::slice::from_ref(&crop1), (140, 42), false);
+        assert!(!scroll_plan.erase_and_redraw);
+        assert!(!scroll_plan.delete_kitty);
+        assert!(scroll_plan.erase_rects.is_empty());
+        assert!(scroll_plan.emit_desired);
+
+        // Terminal resize with Sixel active still triggers erase_and_redraw
+        let resize_plan = tracker.plan_transition(std::slice::from_ref(&crop1), (150, 42), false);
+        assert!(resize_plan.erase_and_redraw);
+        assert!(resize_plan.emit_desired);
     }
 }

@@ -863,7 +863,12 @@ fn build_canvas_lines(
                 // Render inline halfblock preview if cached
                 if app.cfg.inline_images {
                     if let Some(abs) = resolved_path {
-                        let cache_key = crate::vault::fs::inline_image_cache_key(abs);
+                        let bg_rgb = crate::img_preview::color_to_rgb(theme.bg_canvas, (19, 19, 24));
+                        let cache_key = crate::ui::app::inline_preview_cache_key(
+                            abs,
+                            bg_rgb,
+                            app.graphics_caps.cell_px,
+                        );
                         if let Some(rendered) = app.preview_cache.get(&cache_key) {
                             for img_line in &rendered.lines {
                                 out.push(RenderedLine {

@@ -15,7 +15,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    img_preview::TerminalImageProtocol,
+    img_preview::{FitBox, TerminalImageProtocol},
     models::NoteDetail,
     ui::{
         action::Action,
@@ -79,18 +79,23 @@ impl ImagePreviewOverlay {
 
     pub fn cache_key(
         target: &PreviewTarget,
-        cols: u16,
-        rows: u16,
+        view_cols: u16,
+        view_rows: u16,
+        zoom_pct: u16,
+        cell_px: (u16, u16),
         proto: TerminalImageProtocol,
     ) -> String {
         let (mtime_ns, size_bytes) = crate::vault::fs::file_mtime_ns_and_size(&target.abs_path);
         format!(
-            "modal:{}:{}:{}:{}:{}:{:?}",
+            "modal:{}:{}:{}:{}x{}:{}%:{}x{}:{:?}",
             target.abs_path.to_string_lossy(),
             mtime_ns,
             size_bytes,
-            cols,
-            rows,
+            view_cols,
+            view_rows,
+            zoom_pct,
+            cell_px.0,
+            cell_px.1,
             proto
         )
     }
@@ -103,20 +108,16 @@ impl ImagePreviewOverlay {
         )
     }
 
-    pub fn target_dimensions(&self, term_width: u16, term_height: u16) -> (u16, u16) {
+    pub fn viewport_dimensions(term_width: u16, term_height: u16) -> (u16, u16) {
         let rect = Self::modal_rect(Rect::new(0, 0, term_width.max(24), term_height.max(12)));
         let inner_w = rect.width.saturating_sub(2).max(12);
-        let inner_h = rect.height.saturating_sub(3).max(6);
-        let base_cols = rect.width.saturating_sub(4).max(12);
-        let max_cols = inner_w.saturating_mul(2).max(base_cols).min(240);
-        let scaled_cols =
-            ((base_cols as u32 * self.zoom_pct as u32) / 100).clamp(8, max_cols as u32) as u16;
-        // Pass `scrollable_max_rows >= scaled_cols` so `img_preview` fits tall images to width
-        // and lets them scroll vertically immediately at 100% zoom.
-        let scrollable_max_rows = ((inner_h as u32 * 4 * self.zoom_pct as u32) / 100)
-            .max(scaled_cols as u32)
-            .clamp(6, 240) as u16;
-        (scaled_cols, scrollable_max_rows)
+        let inner_h = rect.height.saturating_sub(2).max(6);
+        (inner_w, inner_h)
+    }
+
+    pub fn fit_box(&self, term_width: u16, term_height: u16) -> FitBox {
+        let (view_cols, view_rows) = Self::viewport_dimensions(term_width, term_height);
+        FitBox::modal(view_cols, view_rows, self.zoom_pct)
     }
 
     pub fn handle(&mut self, action: &Action) -> OverlayOutcome {
@@ -293,8 +294,15 @@ impl ImagePreviewOverlay {
 
         let term_w = ui.term_width.max(area.width);
         let term_h = ui.term_height.max(area.height);
-        let (cols, rows) = self.target_dimensions(term_w, term_h);
-        let cache_key = Self::cache_key(target, cols, rows, proto);
+        let (view_cols, view_rows) = Self::viewport_dimensions(term_w, term_h);
+        let cache_key = Self::cache_key(
+            target,
+            view_cols,
+            view_rows,
+            self.zoom_pct,
+            app.graphics_caps.cell_px,
+            proto,
+        );
 
         if let Some(rendered) = app.preview_cache.get(&cache_key) {
             let is_pixel =
@@ -471,10 +479,11 @@ mod tests {
             ui.term_height = 30;
 
             let mut overlay = ImagePreviewOverlay::from_note(&detail, Some(0)).unwrap();
-            let (cols, rows) = overlay.target_dimensions(ui.term_width, ui.term_height);
+            let (view_cols, view_rows) =
+                ImagePreviewOverlay::viewport_dimensions(ui.term_width, ui.term_height);
+            let fit = overlay.fit_box(ui.term_width, ui.term_height);
             let rendered =
-                decode_and_render_for_protocol(&png, cols, rows, (19, 19, 24), app.graphics_caps)
-                    .unwrap();
+                decode_and_render_for_protocol(&png, fit, (19, 19, 24), app.graphics_caps).unwrap();
             let total_rows = if proto == TerminalImageProtocol::Halfblock {
                 rendered.lines.len() as u16
             } else {
@@ -485,8 +494,14 @@ mod tests {
             let expected_max_scroll = total_rows.saturating_sub(inner_h);
             assert!(expected_max_scroll > 0);
 
-            let base_key =
-                ImagePreviewOverlay::cache_key(overlay.current().unwrap(), cols, rows, proto);
+            let base_key = ImagePreviewOverlay::cache_key(
+                overlay.current().unwrap(),
+                view_cols,
+                view_rows,
+                overlay.zoom_pct,
+                app.graphics_caps.cell_px,
+                proto,
+            );
             app.preview_cache.insert(base_key.clone(), rendered);
 
             let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();

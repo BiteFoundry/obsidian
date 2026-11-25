@@ -3231,8 +3231,9 @@ fn test_attachment_preview_cache_refreshes_on_external_overwrite_and_move_preser
 
     use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba, RgbaImage};
     use obsidian_cli::{
-        ui::overlays::image_preview::ImagePreviewOverlay,
-        vault::fs::{inline_image_cache_key, move_note, rewrite_wikilinks_for_move},
+        img_preview::color_to_rgb,
+        ui::{app::inline_preview_cache_key, overlays::image_preview::ImagePreviewOverlay},
+        vault::fs::{move_note, rewrite_wikilinks_for_move},
     };
 
     let make_solid_png = |rgba: [u8; 4]| -> Vec<u8> {
@@ -3282,7 +3283,9 @@ fn test_attachment_preview_cache_refreshes_on_external_overwrite_and_move_preser
     app.reload_from_storage(&mut ui);
     app.open_note(&mut ui, "TargetNote.md", false);
 
-    let key1_inline = inline_image_cache_key(&img_abs);
+    let inline_bg = color_to_rgb(ui.theme.bg_canvas, (19, 19, 24));
+    let modal_bg = color_to_rgb(ui.theme.bg_elevated, (19, 19, 24));
+    let key1_inline = inline_preview_cache_key(&img_abs, inline_bg, app.graphics_caps.cell_px);
     let rendered1_inline = app
         .preview_cache
         .get(&key1_inline)
@@ -3292,12 +3295,14 @@ fn test_attachment_preview_cache_refreshes_on_external_overwrite_and_move_preser
 
     let mut modal =
         ImagePreviewOverlay::from_note(app.active_note.as_ref().unwrap(), Some(0)).unwrap();
-    app.ensure_modal_image_cached(&mut modal, 100, 30);
-    let (cols, rows) = modal.target_dimensions(100, 30);
+    app.ensure_modal_image_cached(&mut modal, 100, 30, modal_bg);
+    let (cols, rows) = ImagePreviewOverlay::viewport_dimensions(100, 30);
     let key1_modal = ImagePreviewOverlay::cache_key(
         modal.current().unwrap(),
         cols,
         rows,
+        modal.zoom_pct,
+        app.graphics_caps.cell_px,
         app.graphics_caps.protocol,
     );
     let rendered1_modal = app.preview_cache.get(&key1_modal).unwrap().lines.clone();
@@ -3314,7 +3319,7 @@ fn test_attachment_preview_cache_refreshes_on_external_overwrite_and_move_preser
         .unwrap();
 
     app.reload_from_storage(&mut ui);
-    let key2_inline = inline_image_cache_key(&img_abs);
+    let key2_inline = inline_preview_cache_key(&img_abs, inline_bg, app.graphics_caps.cell_px);
     assert_ne!(key1_inline, key2_inline);
     let rendered2_inline = app
         .preview_cache
@@ -3327,11 +3332,13 @@ fn test_attachment_preview_cache_refreshes_on_external_overwrite_and_move_preser
         "inline preview must refresh when attachment file is overwritten externally"
     );
 
-    app.ensure_modal_image_cached(&mut modal, 100, 30);
+    app.ensure_modal_image_cached(&mut modal, 100, 30, modal_bg);
     let key2_modal = ImagePreviewOverlay::cache_key(
         modal.current().unwrap(),
         cols,
         rows,
+        modal.zoom_pct,
+        app.graphics_caps.cell_px,
         app.graphics_caps.protocol,
     );
     assert_ne!(key1_modal, key2_modal);
