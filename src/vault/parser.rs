@@ -849,7 +849,9 @@ fn parse_body_events(
                                 fn_def.spans.push(InlineSpan::LineBreak);
                             }
                         }
-                    } else if item_stack.is_empty() {
+                    } else if item_stack.is_empty()
+                        || item_stack.last().is_some_and(|i| i.emitted)
+                    {
                         cur_spans.clear();
                         para_line_start_idx = 0;
                         para_line_embed = None;

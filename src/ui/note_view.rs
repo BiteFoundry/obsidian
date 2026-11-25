@@ -114,15 +114,21 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiState, hit
         .iter()
         .position(|rl| rl.block_idx == Some(selected_block))
         .unwrap_or(0);
+    let selected_last_row = lines
+        .iter()
+        .rposition(|rl| rl.block_idx == Some(selected_block))
+        .unwrap_or(selected_visual_row);
 
     let scroll = if total_lines <= visible {
         0
     } else if !ui.canvas_follow_selected {
         ui.canvas_scroll.min(max_scroll)
-    } else if selected_visual_row >= visible.saturating_sub(4) {
-        selected_visual_row
-            .saturating_sub(visible / 2)
-            .min(max_scroll)
+    } else if selected_last_row >= visible.saturating_sub(2) {
+        let desired = selected_last_row
+            .saturating_add(2)
+            .saturating_sub(visible)
+            .max(selected_visual_row.saturating_sub(visible / 2));
+        desired.min(selected_visual_row).min(max_scroll)
     } else {
         0
     };
@@ -395,6 +401,33 @@ fn build_canvas_lines(
         }
         for line in wrap_styled_spans(&tag_spans, width, WrapPrefix::empty()) {
             push_plain(&mut out, line, None);
+        }
+    }
+
+    // Fallback: if the note has a `--- ... ---` frontmatter block containing freeform/invalid YAML
+    // lines (e.g. text typed inside frontmatter before closing `---`), display them visibly so
+    // edited text never silently disappears in reader view.
+    if detail.parsed.body_start_line > 2 && detail.summary.frontmatter.is_empty() {
+        let raw_no_bom = detail
+            .raw_markdown
+            .strip_prefix('\u{feff}')
+            .unwrap_or(&detail.raw_markdown);
+        let raw_lines: Vec<&str> = raw_no_bom.lines().collect();
+        let fm_end = detail
+            .parsed
+            .body_start_line
+            .saturating_sub(2)
+            .min(raw_lines.len());
+        for fm_line in raw_lines.get(1..fm_end).into_iter().flatten() {
+            if !fm_line.trim().is_empty() {
+                for wrapped in wrap_styled_spans(
+                    &[Span::styled(fm_line.to_string(), theme.muted_style())],
+                    width,
+                    WrapPrefix::empty(),
+                ) {
+                    push_plain(&mut out, wrapped, None);
+                }
+            }
         }
     }
 

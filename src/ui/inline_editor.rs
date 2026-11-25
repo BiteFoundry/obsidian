@@ -97,6 +97,7 @@ pub struct InlineNoteEditor {
     pub last_editor_area: Rect,
     pub last_content_width: u16,
     pub dirty: bool,
+    pub has_edited: bool,
     pub dirty_since: Option<Instant>,
     pub save_status: InlineSaveStatus,
 }
@@ -143,6 +144,7 @@ impl InlineNoteEditor {
             last_editor_area: Rect::default(),
             last_content_width: 72,
             dirty: false,
+            has_edited: false,
             dirty_since: None,
             save_status: InlineSaveStatus::Saved,
         }
@@ -173,6 +175,7 @@ impl InlineNoteEditor {
 
     pub fn mark_dirty(&mut self) {
         self.dirty = true;
+        self.has_edited = true;
         if let Some(conflict) = self.external_conflict.clone() {
             // Keep autosave paused while an external conflict is active.
             self.dirty_since = None;
@@ -1107,36 +1110,38 @@ fn build_live_segments(
         return out;
     }
 
-    // 2. ATX Headings (`#`–`###### `) -> hide leading `# ` markers, render bold/accent heading text
+    // 2. ATX Headings (`#`–`###### `) -> hide leading `# ` markers when heading has text
     let hashes = rest.bytes().take_while(|&b| b == b'#').count();
     if (1..=6).contains(&hashes)
         && rest
             .as_bytes()
             .get(hashes)
-            .is_none_or(|&b| b == b' ' || b == b'\t')
+            .is_some_and(|&b| b == b' ' || b == b'\t')
     {
-        let h_style = match hashes {
-            1 => Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-            2 => Style::default()
-                .fg(theme.accent_soft)
-                .add_modifier(Modifier::BOLD),
-            _ => Style::default()
-                .fg(theme.fg_primary)
-                .add_modifier(Modifier::BOLD),
-        };
         let after_hashes = &rest[hashes..];
         let ws = after_hashes.len() - after_hashes.trim_start_matches([' ', '\t']).len();
         let content_rel = trimmed_start + hashes + ws;
-        parse_live_inline_segments(
-            &line[content_rel..],
-            line_start + content_rel,
-            h_style,
-            theme,
-            &mut out,
-        );
-        return out;
+        if !line[content_rel..].trim().is_empty() {
+            let h_style = match hashes {
+                1 => Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+                2 => Style::default()
+                    .fg(theme.accent_soft)
+                    .add_modifier(Modifier::BOLD),
+                _ => Style::default()
+                    .fg(theme.fg_primary)
+                    .add_modifier(Modifier::BOLD),
+            };
+            parse_live_inline_segments(
+                &line[content_rel..],
+                line_start + content_rel,
+                h_style,
+                theme,
+                &mut out,
+            );
+            return out;
+        }
     }
 
     // 3. Blockquotes & Obsidian Callouts (`> `, `>> `, `> [!tip] Title`)

@@ -925,6 +925,7 @@ impl AppState {
                 let hash = content_sha256_bytes(text.as_bytes());
                 (text, hash)
             });
+        let body_first_line = d.parsed.body_start_line.saturating_sub(1);
         let initial_scroll = ui.canvas_scroll.min(u16::MAX as usize) as u16;
         let mut editor =
             InlineNoteEditor::with_base_hash(rel_path, title, &raw, base_hash, initial_scroll);
@@ -933,6 +934,8 @@ impl AppState {
         }
         if let Some(line_idx) = target_line {
             editor.place_cursor_at_logical_line_col(line_idx, target_col.unwrap_or(0));
+        } else if body_first_line > 0 && initial_scroll == 0 {
+            editor.place_cursor_at_logical_line_col(body_first_line, 0);
         }
         ui.canvas_mode = CanvasMode::Note;
         ui.focus = Focus::Canvas;
@@ -1238,12 +1241,12 @@ impl AppState {
             return false;
         }
         if let Some(ed) = ui.inline_editor.take() {
+            let cursor_line_1based = ed.cursor_line_col().0;
+            let edited_in_session = ed.has_edited;
             let disk_changed = !matches!(
                 self.inspect_editor_disk_state(&ed.note_path, ed.base_content_hash),
                 EditorDiskState::Unchanged
             );
-            ui.canvas_scroll = ed.scroll_y as usize;
-            ui.canvas_follow_selected = false;
             ui.focus = Focus::Canvas;
             if disk_changed {
                 let _ = self.storage.sync_paths(
@@ -1252,6 +1255,23 @@ impl AppState {
                     &[],
                 );
                 self.reload_from_storage_without_html_scan(ui);
+            }
+            if let Some(detail) = self.active_note.as_ref() {
+                if !detail.parsed.blocks.is_empty() {
+                    let target_block = detail
+                        .parsed
+                        .blocks
+                        .iter()
+                        .rposition(|b| b.line_no() <= cursor_line_1based)
+                        .unwrap_or(0);
+                    ui.canvas_selected_block = target_block;
+                }
+            }
+            if edited_in_session {
+                ui.canvas_follow_selected = true;
+            } else {
+                ui.canvas_scroll = ed.scroll_y as usize;
+                ui.canvas_follow_selected = false;
             }
         }
         true
@@ -2754,13 +2774,11 @@ impl AppState {
             HitTarget::NoteBodyEmpty => {
                 ui.focus = Focus::Canvas;
                 let target_line = self.active_note.as_ref().map(|d| {
-                    let approx = ui
-                        .canvas_scroll
-                        .saturating_add(row.saturating_sub(ui.last_note_content_area.y) as usize);
+                    let body_min = d.parsed.body_start_line.saturating_sub(1);
                     let total_lines = d.raw_markdown.lines().count();
-                    approx.min(total_lines.saturating_sub(1))
+                    total_lines.saturating_sub(1).max(body_min)
                 });
-                self.open_inline_edit_at(ui, target_line, Some(0));
+                self.open_inline_edit_at(ui, target_line, Some(usize::MAX));
             }
             HitTarget::InlineEditorBody => {
                 ui.focus = Focus::Canvas;
@@ -3705,6 +3723,69 @@ mod tests {
         assert_eq!(
             app.active_note.as_ref().unwrap().summary.rel_path,
             "TargetNote.md"
+        );
+    }
+
+    #[test]
+    fn test_esc_after_live_edit_keeps_typed_text_visible_across_long_notes_frontmatter_and_lists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut long_md = String::from("---\ntags: [work]\n---\n# Long Note\n\n");
+        for i in 1..=25 {
+            long_md.push_str(&format!("Paragraph line {i}\n\n"));
+        }
+        long_md.push_str("- Parent item\n  - Nested child\n\n  Continuation paragraph after nested list\n");
+        fs::write(tmp.path().join("Long.md"), &long_md).unwrap();
+
+        let (mut app, mut ui) = make_harness(tmp.path(), "LongVault");
+        app.open_note(&mut ui, "Long.md", false);
+
+        // 1. Continuation paragraph inside list item after nested list is NOT dropped by parser.
+        let body_start_line = {
+            let detail = app.active_note.as_ref().unwrap();
+            assert!(
+                detail.parsed.body_plain.contains("Continuation paragraph after nested list"),
+                "continuation paragraph after nested list must not be dropped"
+            );
+            detail.parsed.body_start_line
+        };
+
+        // 2. Pressing `e`/`i` (`OpenNoteEditor`) on a note with YAML frontmatter lands cursor on
+        //    the first body line (AFTER closing `---`), NOT on line 0 inside frontmatter.
+        app.dispatch(Action::OpenNoteEditor, &mut ui);
+        let (ln_on_open, _) = ui.inline_editor.as_ref().unwrap().cursor_line_col();
+        assert_eq!(
+            ln_on_open, body_start_line,
+            "cursor must start at first body line, not inside YAML frontmatter"
+        );
+
+        // 3. Typing at the bottom of the long note and pressing Esc scrolls `note_view` to keep
+        //    the newly typed text visible on screen immediately (never clipped below viewport).
+        if let Some(ref mut ed) = ui.inline_editor {
+            ed.composer.move_doc_end(false);
+        }
+        app.dispatch(Action::Paste("\n\nTypedAtBottomVisibleOnEsc".into()), &mut ui);
+        app.dispatch(Action::FinishInlineEdit, &mut ui);
+        assert!(ui.inline_editor.is_none());
+        assert!(ui.canvas_follow_selected);
+
+        let backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let _ = crate::ui::draw(f, &app, &mut ui);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let mut rendered = String::new();
+        for y in 0..24 {
+            for x in 0..100 {
+                rendered.push_str(buf[(x, y)].symbol());
+            }
+            rendered.push('\n');
+        }
+        assert!(
+            rendered.contains("TypedAtBottomVisibleOnEsc"),
+            "newly typed text at bottom of note must remain visible immediately after Esc, got:\n{rendered}"
         );
     }
 }
