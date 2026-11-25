@@ -915,7 +915,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                         content.as_deref(),
                         &tag_vec,
                     )?;
-                    storage.sync_vault(&vault)?;
+                    storage.sync_paths(&vault, std::slice::from_ref(&rel_path), &[])?;
                     if cli.json {
                         println!(
                             "{}",
@@ -939,7 +939,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     let rel_path = storage.resolve_note_path(&vault.id, &note)?;
                     let abs = safe_vault_path(&vault.path, &rel_path)?;
                     append_to_note(&abs, &text)?;
-                    storage.sync_vault(&vault)?;
+                    storage.sync_paths(&vault, std::slice::from_ref(&rel_path), &[])?;
                     if cli.json {
                         println!(
                             "{}",
@@ -974,7 +974,9 @@ pub async fn run(cli: Cli) -> Result<()> {
                     let rel_path = storage.resolve_note_path(&vault.id, &note)?;
                     let abs = safe_vault_path(&vault.path, &rel_path)?;
                     tui::launch_external_editor(&abs)?;
-                    let stats = storage.sync_vault(&vault)?;
+                    let stats = storage
+                        .sync_paths(&vault, std::slice::from_ref(&rel_path), &[])?
+                        .stats;
                     if cli.json {
                         println!(
                             "{}",
@@ -1010,7 +1012,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     }
                     let rel_path = storage.resolve_note_path(&vault.id, &note)?;
                     let trashed = move_note_to_trash(&vault.path, &rel_path)?;
-                    storage.sync_vault(&vault)?;
+                    storage.sync_paths(&vault, std::slice::from_ref(&rel_path), &[])?;
                     if cli.json {
                         println!(
                             "{}",
@@ -1035,7 +1037,11 @@ pub async fn run(cli: Cli) -> Result<()> {
                 append_to_note(&abs, txt)?;
                 appended = true;
             }
-            storage.sync_vault(&vault)?;
+            if cli.json && appended && !full {
+                storage.sync_paths(&vault, std::slice::from_ref(&rel_path), &[])?;
+            } else {
+                storage.sync_vault(&vault)?;
+            }
             if cli.json {
                 if appended && !full {
                     println!(
@@ -1273,7 +1279,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 expected_text.as_deref(),
                 expected_checked,
             )?;
-            storage.sync_vault(&vault)?;
+            storage.sync_paths(&vault, std::slice::from_ref(&rel_path), &[])?;
             if cli.json {
                 println!(
                     "{}",

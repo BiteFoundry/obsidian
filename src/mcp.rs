@@ -336,7 +336,9 @@ impl McpServer {
                     }
                 };
                 let (rel_path, _) = create_note(&vault.path, title, folder, content, &tags)?;
-                let _ = self.storage.sync_vault(&vault);
+                let _ = self
+                    .storage
+                    .sync_paths(&vault, std::slice::from_ref(&rel_path), &[]);
                 Ok(json!({ "created": true, "rel_path": rel_path }))
             }
             "append_note" => {
@@ -350,7 +352,9 @@ impl McpServer {
                 let rel_path = self.storage.resolve_note_path(&vault.id, note)?;
                 let abs = safe_vault_path(&vault.path, &rel_path)?;
                 append_to_note(&abs, text)?;
-                let _ = self.storage.sync_vault(&vault);
+                let _ = self
+                    .storage
+                    .sync_paths(&vault, std::slice::from_ref(&rel_path), &[]);
                 Ok(json!({ "appended": true, "rel_path": rel_path }))
             }
             "replace_note_text" => {
@@ -383,7 +387,9 @@ impl McpServer {
                 let rel_path = self.storage.resolve_note_path(&vault.id, note)?;
                 let abs = safe_vault_path(&vault.path, &rel_path)?;
                 update_note_frontmatter(&abs, &map)?;
-                let _ = self.storage.sync_vault(&vault);
+                let _ = self
+                    .storage
+                    .sync_paths(&vault, std::slice::from_ref(&rel_path), &[]);
                 Ok(
                     json!({ "updated": true, "rel_path": rel_path, "keys": map.keys().collect::<Vec<_>>() }),
                 )
@@ -400,7 +406,9 @@ impl McpServer {
                 let note = req_str(args, "note")?;
                 let rel_path = self.storage.resolve_note_path(&vault.id, note)?;
                 let trashed = move_note_to_trash(&vault.path, &rel_path)?;
-                let _ = self.storage.sync_vault(&vault);
+                let _ = self
+                    .storage
+                    .sync_paths(&vault, std::slice::from_ref(&rel_path), &[]);
                 Ok(json!({
                     "deleted": true,
                     "rel_path": rel_path,
@@ -425,7 +433,10 @@ impl McpServer {
                     append_to_note(&abs, txt)?;
                     appended = true;
                 }
-                let synced = self.storage.sync_vault(&vault).is_ok();
+                let synced = self
+                    .storage
+                    .sync_paths(&vault, std::slice::from_ref(&rel_path), &[])
+                    .is_ok();
                 if appended {
                     return Ok(json!({
                         "rel_path": rel_path,
@@ -555,7 +566,9 @@ impl McpServer {
                 }
                 let checked =
                     toggle_task_at_line_verified(&abs, line, expected_text, expected_checked)?;
-                let _ = self.storage.sync_vault(&vault);
+                let _ = self
+                    .storage
+                    .sync_paths(&vault, std::slice::from_ref(&rel_path), &[]);
                 Ok(json!({ "rel_path": rel_path, "line": line, "checked": checked }))
             }
             "find_orphans" => {

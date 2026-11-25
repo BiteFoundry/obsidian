@@ -288,16 +288,33 @@ impl AppState {
         }
     }
 
-    /// Refreshes in-memory vault note list, tags, tasks, active note detail, and graph from SQLite.
-    pub fn reload_from_storage(&mut self, ui: &mut UiState) {
+    fn refresh_vault_lists(&mut self) {
         let vid = self.active_vault.id.clone();
         self.notes = self.storage.list_notes(&vid, None).unwrap_or_default();
-        self.html_files = scan_vault_html_files(&self.active_vault.path).unwrap_or_default();
         self.tags = self.storage.list_tags(&vid).unwrap_or_default();
         self.tasks = self
             .storage
             .list_tasks(&vid, TaskFilter::All, None)
             .unwrap_or_default();
+    }
+
+    /// Refreshes in-memory vault note list, HTML files, tags, tasks, active note detail, and (when visible) graph.
+    pub fn reload_from_storage(&mut self, ui: &mut UiState) {
+        self.reload_from_storage_inner(ui, true);
+    }
+
+    /// Refreshes in-memory vault state from SQLite after a Markdown-only mutation without walking the
+    /// filesystem for `.html` files on the UI thread.
+    pub(crate) fn reload_from_storage_without_html_scan(&mut self, ui: &mut UiState) {
+        self.reload_from_storage_inner(ui, false);
+    }
+
+    fn reload_from_storage_inner(&mut self, ui: &mut UiState, refresh_html: bool) {
+        let vid = self.active_vault.id.clone();
+        self.refresh_vault_lists();
+        if refresh_html {
+            self.html_files = scan_vault_html_files(&self.active_vault.path).unwrap_or_default();
+        }
 
         if let Some((ed_path, ed_base_hash, ed_dirty, prev_conflict)) =
             ui.inline_editor.as_ref().map(|e| {
@@ -384,7 +401,9 @@ impl AppState {
                     }
                 }
             }
-            self.refresh_graph(ui);
+            if ui.canvas_mode == CanvasMode::Graph {
+                self.refresh_graph(ui);
+            }
             self.refresh_open_html_preview(ui);
             self.clamp_selections(ui);
             return;
@@ -426,7 +445,9 @@ impl AppState {
             ui.canvas_follow_selected = true;
             ui.inspector_selected = 0;
         }
-        self.refresh_graph(ui);
+        if ui.canvas_mode == CanvasMode::Graph {
+            self.refresh_graph(ui);
+        }
         self.refresh_open_html_preview(ui);
         self.clamp_selections(ui);
     }
@@ -812,7 +833,7 @@ impl AppState {
                 ui.canvas_scroll = 0;
                 ui.canvas_follow_selected = true;
                 ui.inspector_selected = 0;
-                self.refresh_graph(ui);
+                self.clamp_selections(ui);
             }
             Err(err) => {
                 let code = err.downcast_ref::<CodedError>().map(|coded| coded.code);
@@ -821,8 +842,12 @@ impl AppState {
                     Some("not_found") if push_history && creation_target => {
                         match create_note(&self.active_vault.path, target, None, None, &[]) {
                             Ok((rel_path, _)) => {
-                                let _ = self.storage.sync_vault(&self.active_vault);
-                                self.reload_from_storage(ui);
+                                let _ = self.storage.sync_paths(
+                                    &self.active_vault,
+                                    std::slice::from_ref(&rel_path),
+                                    &[],
+                                );
+                                self.refresh_vault_lists();
                                 if let Ok(detail) =
                                     self.storage.load_note_detail(&self.active_vault, &rel_path)
                                 {
@@ -834,8 +859,8 @@ impl AppState {
                                     ui.canvas_scroll = 0;
                                     ui.canvas_follow_selected = true;
                                     ui.inspector_selected = 0;
+                                    self.clamp_selections(ui);
                                     ui.toasts.success(format!("Created note: {rel_path}"));
-                                    self.refresh_graph(ui);
                                 }
                             }
                             Err(create_err) => ui.toasts.warning(format!(
@@ -1056,7 +1081,11 @@ impl AppState {
                     if let Some(ref mut ed) = ui.inline_editor {
                         ed.reload_from_disk(&text, hash);
                     }
-                    let _ = self.storage.sync_vault(&self.active_vault);
+                    let _ = self.storage.sync_paths(
+                        &self.active_vault,
+                        std::slice::from_ref(&note_path),
+                        &[],
+                    );
                     if let Ok(detail) = self
                         .storage
                         .load_note_detail(&self.active_vault, &note_path)
@@ -1155,7 +1184,11 @@ impl AppState {
         if let Some(images) = self.active_note.as_ref().map(|d| d.images.clone()) {
             self.cache_inline_images_list(&images, ui);
         }
-        self.refresh_graph(ui);
+        if ui.canvas_mode == CanvasMode::Graph {
+            self.refresh_graph(ui);
+        } else {
+            self.clamp_selections(ui);
+        }
         true
     }
 
@@ -1198,8 +1231,12 @@ impl AppState {
             ui.canvas_follow_selected = false;
             ui.focus = Focus::Canvas;
             if disk_changed {
-                let _ = self.storage.sync_vault(&self.active_vault);
-                self.reload_from_storage(ui);
+                let _ = self.storage.sync_paths(
+                    &self.active_vault,
+                    std::slice::from_ref(&ed.note_path),
+                    &[],
+                );
+                self.reload_from_storage_without_html_scan(ui);
             }
         }
         true
@@ -1385,13 +1422,15 @@ impl AppState {
                 ui.should_quit = true;
             }
             Action::RefreshAll => {
-                if let Ok(stats) = self.storage.reindex_vault(&self.active_vault) {
+                self.preview_cache.clear();
+                if self.sync_ctrl.try_reindex_now() {
+                    ui.toasts.info("Reindexing vault...");
+                } else if let Ok(stats) = self.storage.reindex_vault(&self.active_vault) {
                     let msg = format!(
                         "Indexed {} notes ({} updated, {}ms)",
                         stats.total_notes, stats.updated, stats.elapsed_ms
                     );
                     self.last_index_stats = Some(stats);
-                    self.preview_cache.clear();
                     self.reload_from_storage(ui);
                     ui.toasts.success(msg);
                 }
@@ -1680,10 +1719,17 @@ impl AppState {
             }
 
             Action::ToggleBookmark => {
-                if let Some(d) = &self.active_note {
-                    let rp = d.summary.rel_path.clone();
+                if let Some(rp) = self.active_note.as_ref().map(|d| d.summary.rel_path.clone()) {
                     if let Ok(bm) = self.storage.toggle_bookmark(&self.active_vault.id, &rp) {
-                        self.reload_from_storage(ui);
+                        if let Some(detail) = self.active_note.as_mut() {
+                            if detail.summary.rel_path == rp {
+                                detail.summary.is_bookmarked = bm;
+                            }
+                        }
+                        if let Some(slot) = self.notes.iter_mut().find(|n| n.rel_path == rp) {
+                            slot.is_bookmarked = bm;
+                        }
+                        self.clamp_selections(ui);
                         ui.toasts.success(if bm {
                             "Bookmarked note"
                         } else {
@@ -1695,8 +1741,19 @@ impl AppState {
 
             Action::OpenDailyNote => match ensure_daily_note(&self.active_vault, None) {
                 Ok((rel_path, _, created)) => {
-                    let _ = self.storage.sync_vault(&self.active_vault);
-                    self.reload_from_storage(ui);
+                    if created
+                        || !self
+                            .notes
+                            .iter()
+                            .any(|n| n.rel_path.eq_ignore_ascii_case(&rel_path))
+                    {
+                        let _ = self.storage.sync_paths(
+                            &self.active_vault,
+                            std::slice::from_ref(&rel_path),
+                            &[],
+                        );
+                        self.refresh_vault_lists();
+                    }
                     self.open_note(ui, &rel_path, true);
                     if created {
                         ui.toasts.success(format!("Created daily note: {rel_path}"));
@@ -1763,8 +1820,12 @@ impl AppState {
                         expected_checked,
                     ) {
                         Ok(checked) => {
-                            let _ = self.storage.sync_vault(&self.active_vault);
-                            self.reload_from_storage(ui);
+                            let _ = self.storage.sync_paths(
+                                &self.active_vault,
+                                std::slice::from_ref(&note_path),
+                                &[],
+                            );
+                            self.reload_from_storage_without_html_scan(ui);
                             ui.toasts.success(if checked {
                                 "Marked task [x] complete"
                             } else {
@@ -1772,8 +1833,12 @@ impl AppState {
                             });
                         }
                         Err(e) => {
-                            let _ = self.storage.sync_vault(&self.active_vault);
-                            self.reload_from_storage(ui);
+                            let _ = self.storage.sync_paths(
+                                &self.active_vault,
+                                std::slice::from_ref(&note_path),
+                                &[],
+                            );
+                            self.reload_from_storage_without_html_scan(ui);
                             ui.toasts.warning(format!("Task toggle skipped: {e}"));
                         }
                     }
@@ -1861,8 +1926,12 @@ impl AppState {
                 };
                 match create_note(&self.active_vault.path, &title, folder_opt, None, &tag_vec) {
                     Ok((rel_path, _)) => {
-                        let _ = self.storage.sync_vault(&self.active_vault);
-                        self.reload_from_storage(ui);
+                        let _ = self.storage.sync_paths(
+                            &self.active_vault,
+                            std::slice::from_ref(&rel_path),
+                            &[],
+                        );
+                        self.refresh_vault_lists();
                         self.open_note(ui, &rel_path, true);
                         ui.toasts.success(format!("Created {rel_path}"));
                     }
@@ -1878,8 +1947,12 @@ impl AppState {
                     if let Ok(abs) = safe_vault_path(&self.active_vault.path, &rp) {
                         match append_to_note(&abs, &text) {
                             Ok(()) => {
-                                let _ = self.storage.sync_vault(&self.active_vault);
-                                self.reload_from_storage(ui);
+                                let _ = self.storage.sync_paths(
+                                    &self.active_vault,
+                                    std::slice::from_ref(&rp),
+                                    &[],
+                                );
+                                self.reload_from_storage_without_html_scan(ui);
                                 ui.toasts.success("Appended to note");
                             }
                             Err(e) => ui.toasts.error(format!("Append failed: {e}")),
@@ -1917,8 +1990,12 @@ impl AppState {
                             ui.canvas_selected_block = 0;
                             ui.canvas_follow_selected = true;
                             ui.inspector_selected = 0;
-                            let _ = self.storage.sync_vault(&self.active_vault);
-                            self.reload_from_storage(ui);
+                            let _ = self.storage.sync_paths(
+                                &self.active_vault,
+                                std::slice::from_ref(&rp),
+                                &[],
+                            );
+                            self.reload_from_storage_without_html_scan(ui);
                             ui.toasts.success(format!("Moved {rp} to .trash/"));
                         }
                         Err(e) => ui.toasts.error(format!("Delete failed: {e}")),
@@ -1945,13 +2022,17 @@ impl AppState {
                         .unwrap_or("attachment.bin");
                     match save_vault_attachment(&self.active_vault, fname, &bytes) {
                         Ok((saved_name, _)) => {
-                            if let Some(d) = &self.active_note {
-                                if let Ok(abs) =
-                                    safe_vault_path(&self.active_vault.path, &d.summary.rel_path)
-                                {
+                            if let Some(rp) =
+                                self.active_note.as_ref().map(|d| d.summary.rel_path.clone())
+                            {
+                                if let Ok(abs) = safe_vault_path(&self.active_vault.path, &rp) {
                                     let _ = append_to_note(&abs, &format!("\n![[{saved_name}]]"));
-                                    let _ = self.storage.sync_vault(&self.active_vault);
-                                    self.reload_from_storage(ui);
+                                    let _ = self.storage.sync_paths(
+                                        &self.active_vault,
+                                        std::slice::from_ref(&rp),
+                                        &[],
+                                    );
+                                    self.reload_from_storage_without_html_scan(ui);
                                     ui.toasts.success(format!("Embedded ![[{saved_name}]]"));
                                 }
                             }
@@ -1973,15 +2054,18 @@ impl AppState {
                         };
                         match save_vault_attachment(&self.active_vault, &name, &bytes) {
                             Ok((saved_name, _)) => {
-                                if let Some(d) = &self.active_note {
-                                    if let Ok(abs) = safe_vault_path(
-                                        &self.active_vault.path,
-                                        &d.summary.rel_path,
-                                    ) {
+                                if let Some(rp) =
+                                    self.active_note.as_ref().map(|d| d.summary.rel_path.clone())
+                                {
+                                    if let Ok(abs) = safe_vault_path(&self.active_vault.path, &rp) {
                                         let _ =
                                             append_to_note(&abs, &format!("\n![[{saved_name}]]"));
-                                        let _ = self.storage.sync_vault(&self.active_vault);
-                                        self.reload_from_storage(ui);
+                                        let _ = self.storage.sync_paths(
+                                            &self.active_vault,
+                                            std::slice::from_ref(&rp),
+                                            &[],
+                                        );
+                                        self.reload_from_storage_without_html_scan(ui);
                                         ui.toasts.success(format!("Pasted ![[{saved_name}]]"));
                                     }
                                 }
@@ -2200,6 +2284,7 @@ impl AppState {
                     self.cfg.active_vault = next.name.clone();
                     let _ = self.cfg.save();
                     self.active_note = None;
+                    self.graph = GraphData::default();
                     self.history.clear();
                     self.preview_cache.clear();
                     ui.active_tag_filter = None;
@@ -2210,8 +2295,9 @@ impl AppState {
                     ui.canvas_follow_selected = true;
                     ui.inspector_selected = 0;
                     ui.graph_selected = 0;
-                    self.sync_ctrl.switch_vault(next.clone());
-                    let _ = self.storage.sync_vault(&next);
+                    if !self.sync_ctrl.try_switch_vault(next.clone()) {
+                        let _ = self.storage.sync_vault(&next);
+                    }
                     self.reload_from_storage(ui);
                     ui.toasts
                         .success(format!("Switched vault → {}", next.display_name()));
@@ -3226,5 +3312,171 @@ mod tests {
             ui.overlay,
             Some(Overlay::Settings(ref s)) if s.selected == 0
         ));
+    }
+
+    #[test]
+    fn test_note_mode_mutations_skip_graph_rebuild_html_walk_and_full_vault_rescan() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("Alpha.md"),
+            "# Alpha\n\nLinks to [[Beta]].\n\n- [ ] Ship fix\n",
+        )
+        .unwrap();
+        fs::write(tmp.path().join("Beta.md"), "# Beta\n\nTarget.\n").unwrap();
+        fs::write(tmp.path().join("Untouched.md"), "# Untouched\n\nSteady.\n").unwrap();
+
+        let (mut app, mut ui) = make_harness(tmp.path(), "LatencyVault");
+        assert_eq!(ui.canvas_mode, CanvasMode::Note);
+        assert!(
+            app.graph.nodes.is_empty(),
+            "graph must remain lazy (unbuilt) while in CanvasMode::Note"
+        );
+
+        // Open Alpha.md in Note mode: graph stays unbuilt until Graph View is toggled on.
+        app.open_note(&mut ui, "Alpha.md", false);
+        assert!(app.graph.nodes.is_empty());
+
+        // Mark Untouched.md stale in SQLite and drop a new HTML file on disk.
+        app.storage
+            .invalidate_note_mtime(&app.active_vault.id, "Untouched.md")
+            .unwrap();
+        fs::write(tmp.path().join("late.html"), "<h1>late</h1>").unwrap();
+
+        // 1. ToggleBookmark updates active_note + notes in-place (no HTML walk, no full vault scan).
+        app.dispatch(Action::ToggleBookmark, &mut ui);
+        assert!(app.active_note.as_ref().unwrap().summary.is_bookmarked);
+        assert!(
+            app.notes
+                .iter()
+                .find(|n| n.rel_path == "Alpha.md")
+                .unwrap()
+                .is_bookmarked
+        );
+        assert!(
+            app.html_files.is_empty(),
+            "ToggleBookmark must not trigger scan_vault_html_files"
+        );
+
+        // 2. QuickAppendSubmit, ToggleTaskAtLine, CreateNoteSubmit, DeleteActiveNoteConfirmed
+        //    must use path-scoped sync_paths and skip HTML scanning & graph rebuilds.
+        app.dispatch(
+            Action::QuickAppendSubmit {
+                text: "Appended line".into(),
+            },
+            &mut ui,
+        );
+        let task_line = app.active_note.as_ref().unwrap().parsed.tasks[0].line_no;
+        app.dispatch(
+            Action::ToggleTaskAtLine {
+                note_path: "Alpha.md".into(),
+                line_no: task_line,
+            },
+            &mut ui,
+        );
+        assert!(app.active_note.as_ref().unwrap().parsed.tasks[0].checked);
+
+        app.dispatch(
+            Action::CreateNoteSubmit {
+                title: "Gamma".into(),
+                folder: String::new(),
+                tags: "perf".into(),
+            },
+            &mut ui,
+        );
+        assert_eq!(
+            app.active_note.as_ref().unwrap().summary.rel_path,
+            "Gamma.md"
+        );
+        app.dispatch(Action::DeleteActiveNoteConfirmed, &mut ui);
+        assert!(!tmp.path().join("Gamma.md").exists());
+
+        assert!(
+            app.html_files.is_empty(),
+            "Markdown-only mutations must not trigger full-vault scan_vault_html_files"
+        );
+        assert!(
+            app.graph.nodes.is_empty(),
+            "graph must not rebuild while CanvasMode::Note is active"
+        );
+        assert_eq!(
+            app.storage
+                .get_note_summary(&app.active_vault.id, "Untouched.md")
+                .unwrap()
+                .unwrap()
+                .mtime_ms,
+            -1,
+            "single-note TUI mutations must not run full-vault sync_vault"
+        );
+
+        // 3. Entering Graph View builds the graph on demand.
+        app.dispatch(Action::ToggleGraphView, &mut ui);
+        assert_eq!(ui.canvas_mode, CanvasMode::Graph);
+        assert!(app.graph.nodes.len() >= 2);
+    }
+
+    #[tokio::test]
+    async fn test_refresh_all_and_switch_vault_delegate_to_live_watcher_without_blocking() {
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let v1_dir = tmp.path().join("V1");
+        let v2_dir = tmp.path().join("V2");
+        fs::create_dir_all(&v1_dir).unwrap();
+        fs::create_dir_all(&v2_dir).unwrap();
+        fs::write(v1_dir.join("One.md"), "# One\n").unwrap();
+        fs::write(v2_dir.join("Two.md"), "# Two\n").unwrap();
+
+        let v1 = vault_from_dir(&v1_dir, Some("V1"));
+        let v2 = vault_from_dir(&v2_dir, Some("V2"));
+        let mut cfg = AppConfig::default();
+        cfg.load_failed = true;
+        let storage = Storage::open_in_memory().unwrap();
+        let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
+        let (sync_ctrl, diag) = crate::sync::spawn_vault_watcher_with_options(
+            v1.clone(),
+            storage.clone(),
+            2_500,
+            ev_tx,
+            crate::sync::WatcherOptions::default(),
+        );
+
+        let mut app = AppState::new(cfg.clone(), v1.clone(), storage, sync_ctrl);
+        app.vaults.push(v2.clone());
+        let mut ui = UiState::from_config(&cfg);
+
+        // Wait for the single initial background sync of V1.
+        let init_ev = tokio::time::timeout(Duration::from_secs(3), ev_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        app.handle_core_event(init_ev, &mut ui);
+        assert_eq!(app.notes.len(), 1);
+        assert_eq!(diag.initial_scans.load(Ordering::Acquire), 1);
+
+        // 1. Action::RefreshAll delegates to background watcher instead of blocking UI thread.
+        let full_before = diag.post_init_full_scans.load(Ordering::Acquire);
+        app.dispatch(Action::RefreshAll, &mut ui);
+        let reindex_ev = tokio::time::timeout(Duration::from_secs(3), ev_rx.recv())
+            .await
+            .expect("watcher must complete background RefreshAll")
+            .unwrap();
+        app.handle_core_event(reindex_ev, &mut ui);
+        assert_eq!(
+            diag.post_init_full_scans.load(Ordering::Acquire),
+            full_before + 1
+        );
+
+        // 2. Action::SwitchVault delegates to background watcher (single scan, no duplicate sync_vault).
+        app.dispatch(Action::SwitchVault(v2.id.clone()), &mut ui);
+        let switch_ev = tokio::time::timeout(Duration::from_secs(3), ev_rx.recv())
+            .await
+            .expect("watcher must complete background SwitchVault sync")
+            .unwrap();
+        app.handle_core_event(switch_ev, &mut ui);
+        assert_eq!(app.active_vault.id, v2.id);
+        assert_eq!(app.notes.len(), 1);
+        assert_eq!(app.notes[0].rel_path, "Two.md");
+        assert_eq!(diag.initial_scans.load(Ordering::Acquire), 2);
     }
 }

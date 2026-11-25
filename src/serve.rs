@@ -596,7 +596,9 @@ async fn handle_create_note(
         &req.tags,
     ) {
         Ok((rel_path, _)) => {
-            let _ = state.storage.sync_vault(&vault);
+            let _ = state
+                .storage
+                .sync_paths(&vault, std::slice::from_ref(&rel_path), &[]);
             let detail = state.storage.load_note_detail(&vault, &rel_path).ok();
             (
                 StatusCode::CREATED,
@@ -638,7 +640,9 @@ async fn handle_append_note(
     if let Err(e) = append_to_note(&abs, &req.text) {
         return err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
     }
-    let _ = state.storage.sync_vault(&vault);
+    let _ = state
+        .storage
+        .sync_paths(&vault, std::slice::from_ref(&rel_path), &[]);
     Json(json!({ "ok": true, "rel_path": rel_path })).into_response()
 }
 
@@ -673,7 +677,9 @@ async fn handle_daily_note(
                     return err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
                 }
             }
-            let _ = state.storage.sync_vault(&vault);
+            let _ = state
+                .storage
+                .sync_paths(&vault, std::slice::from_ref(&rel_path), &[]);
             let detail = state.storage.load_note_detail(&vault, &rel_path).ok();
             Json(json!({
                 "ok": true,
@@ -898,7 +904,9 @@ async fn handle_toggle_task(
         req.expected_checked,
     ) {
         Ok(checked) => {
-            let _ = state.storage.sync_vault(&vault);
+            let _ = state
+                .storage
+                .sync_paths(&vault, std::slice::from_ref(&rel_path), &[]);
             Json(json!({
                 "ok": true,
                 "rel_path": rel_path,

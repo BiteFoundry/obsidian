@@ -144,6 +144,7 @@ pub struct SyncController {
     cmd_tx: mpsc::UnboundedSender<SyncCommand>,
     rescan_flag: Arc<AtomicBool>,
     rescan_notify: Arc<Notify>,
+    has_live_worker: bool,
 }
 
 impl SyncController {
@@ -156,6 +157,7 @@ impl SyncController {
             cmd_tx,
             rescan_flag: Arc::new(AtomicBool::new(false)),
             rescan_notify: Arc::new(Notify::new()),
+            has_live_worker: false,
         }
     }
 
@@ -167,8 +169,20 @@ impl SyncController {
         let _ = self.cmd_tx.send(SyncCommand::ReindexNow);
     }
 
+    /// Queues an asynchronous full reindex when backed by a live background watcher task.
+    /// Returns `false` for disconnected/mock controllers created via `from_channels`.
+    pub fn try_reindex_now(&self) -> bool {
+        self.has_live_worker && self.cmd_tx.send(SyncCommand::ReindexNow).is_ok()
+    }
+
     pub fn switch_vault(&self, vault: VaultProfile) {
         let _ = self.cmd_tx.send(SyncCommand::SwitchVault { vault });
+    }
+
+    /// Queues an asynchronous vault switch when backed by a live background watcher task.
+    /// Returns `false` for disconnected/mock controllers created via `from_channels`.
+    pub fn try_switch_vault(&self, vault: VaultProfile) -> bool {
+        self.has_live_worker && self.cmd_tx.send(SyncCommand::SwitchVault { vault }).is_ok()
     }
 
     /// Signals that filesystem events may have been dropped, triggering a single full reconciliation.
@@ -607,6 +621,7 @@ pub fn spawn_vault_watcher_with_options(
             cmd_tx,
             rescan_flag,
             rescan_notify,
+            has_live_worker: true,
         },
         diag,
     )
@@ -928,6 +943,7 @@ async fn process_batch(
         }
     }
 
+    let prev_dv = *last_data_version;
     let res = tokio::task::spawn_blocking(move || {
         let mut escalated_full_rescan = false;
         let mut extra_html_paths: Vec<String> = Vec::new();
@@ -981,11 +997,13 @@ async fn process_batch(
             ));
         }
 
-        let had_md_events = !md_paths.is_empty();
         let outcome = storage_clone.sync_paths(&vault_clone, &md_paths, &dir_removed)?;
         let dv = storage_clone.data_version().ok();
-        let should_emit =
-            outcome.stats.updated > 0 || outcome.stats.removed > 0 || html_changed || had_md_events;
+        let db_changed_externally = dv.is_some() && prev_dv.is_some() && dv != prev_dv;
+        let should_emit = outcome.stats.updated > 0
+            || outcome.stats.removed > 0
+            || html_changed
+            || db_changed_externally;
 
         Ok((
             outcome.stats,
@@ -1686,5 +1704,66 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn test_native_watcher_suppresses_same_connection_self_write_echo_but_emits_cross_process_write()
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("EchoVault");
+        fs::create_dir_all(&root).unwrap();
+        let note_abs = root.join("Note.md");
+        fs::write(&note_abs, "# Note\n\nInitial.\n").unwrap();
+
+        let db_file = tmp.path().join("echo.db");
+        let vault = vault_from_dir(&root, Some("EchoVault"));
+        let storage_tui = Storage::open(&db_file).unwrap();
+        let storage_cli = Storage::open(&db_file).unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let (_ctrl, diag) = spawn_vault_watcher_with_options(
+            vault.clone(),
+            storage_tui.clone(),
+            2_500,
+            tx,
+            WatcherOptions::default(),
+        );
+        assert_eq!(diag.mode(), WatcherMode::Native);
+
+        // Consume initial startup VaultIndexed
+        let init_ev = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(init_ev, CoreEvent::VaultIndexed { .. }));
+
+        // 1. Same-connection write + upsert_single_note (like TUI inline autosave):
+        //    watcher sees OS modify event, runs sync_paths (updated == 0, same data_version),
+        //    and MUST suppress the redundant echo VaultIndexed event!
+        let self_body = "# Note\n\nSELF_INLINE_SAVE_42\n";
+        write_atomic(&note_abs, self_body.as_bytes()).unwrap();
+        let (mt_ms, sz) = crate::vault::fs::file_mtime_and_size(&note_abs);
+        storage_tui
+            .upsert_single_note(&vault, "Note.md", self_body, mt_ms, sz)
+            .unwrap();
+
+        let echo = tokio::time::timeout(Duration::from_millis(450), rx.recv()).await;
+        assert!(
+            echo.is_err(),
+            "same-connection self-write must not emit a redundant echo VaultIndexed reload"
+        );
+
+        // 2. Cross-connection write + sync (like CLI/HTTP/MCP stealing the delta):
+        //    PRAGMA data_version increments on storage_tui, so watcher MUST still emit VaultIndexed!
+        write_atomic(&note_abs, b"# Note\n\nCROSS_PROCESS_WRITE_99\n").unwrap();
+        storage_cli
+            .sync_paths(&vault, &["Note.md".to_string()], &[])
+            .unwrap();
+
+        let ext_ev = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("cross-process write + index must emit VaultIndexed")
+            .unwrap();
+        assert!(matches!(ext_ev, CoreEvent::VaultIndexed { .. }));
     }
 }

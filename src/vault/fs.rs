@@ -675,6 +675,208 @@ pub fn resolve_wikilink_from_source(
     (found.len() == 1).then(|| found.remove(0))
 }
 
+/// Precomputed O(1) lookup tables for resolving wikilinks and local Markdown links across a vault
+/// without scanning all note paths on every link.
+pub(crate) struct VaultLinkIndex {
+    by_exact_lower: HashMap<String, Vec<String>>,
+    by_filename_lower: HashMap<String, Vec<String>>,
+    by_alias_lower: HashMap<String, Vec<String>>,
+}
+
+impl VaultLinkIndex {
+    pub(crate) fn build(paths: &[String], aliases: &HashMap<String, Vec<String>>) -> Self {
+        let mut by_exact_lower: HashMap<String, Vec<String>> = HashMap::with_capacity(paths.len());
+        let mut by_filename_lower: HashMap<String, Vec<String>> =
+            HashMap::with_capacity(paths.len());
+        for p in paths {
+            let low = p.to_ascii_lowercase();
+            by_exact_lower.entry(low).or_default().push(p.clone());
+            let fname_low = p.rsplit('/').next().unwrap_or(p).to_ascii_lowercase();
+            by_filename_lower
+                .entry(fname_low)
+                .or_default()
+                .push(p.clone());
+        }
+        for list in by_exact_lower.values_mut() {
+            if list.len() > 1 {
+                list.sort();
+                list.dedup();
+            }
+        }
+        for list in by_filename_lower.values_mut() {
+            if list.len() > 1 {
+                list.sort();
+                list.dedup();
+            }
+        }
+
+        let mut by_alias_lower: HashMap<String, Vec<String>> = HashMap::new();
+        for (path, names) in aliases {
+            for name in names {
+                let key = name.trim().to_ascii_lowercase();
+                if !key.is_empty() {
+                    by_alias_lower.entry(key).or_default().push(path.clone());
+                }
+            }
+        }
+        for list in by_alias_lower.values_mut() {
+            if list.len() > 1 {
+                list.sort();
+                list.dedup();
+            }
+        }
+
+        Self {
+            by_exact_lower,
+            by_filename_lower,
+            by_alias_lower,
+        }
+    }
+
+    fn exact_all(&self, path_lower: &str) -> Vec<String> {
+        self.by_exact_lower
+            .get(path_lower)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn exact_unique(&self, path_candidate: &str) -> Option<String> {
+        let low = path_candidate.to_ascii_lowercase();
+        let matches = self.by_exact_lower.get(&low)?;
+        (matches.len() == 1).then(|| matches[0].clone())
+    }
+
+    /// Indexed equivalent of [`wikilink_candidates_from_source`]: O(1) for exact, relative,
+    /// same-folder, bare filename, and alias lookups, and O(same-filename count) for suffix paths.
+    pub(crate) fn wikilink_candidates(&self, target_raw: &str, source_rel: &str) -> Vec<String> {
+        let raw = wikilink_note_target(target_raw);
+        if raw.is_empty() || is_image_target(&raw) {
+            return Vec::new();
+        }
+        let target = raw.to_ascii_lowercase();
+        let target = if target.ends_with(".md") {
+            target
+        } else {
+            format!("{target}.md")
+        };
+        let source_folder = source_rel
+            .rsplit_once('/')
+            .map_or("", |(folder, _)| folder)
+            .to_ascii_lowercase();
+
+        if let Some(rooted) = target.strip_prefix('/') {
+            let Some(normalized) = normalize_vault_rel_path("", rooted) else {
+                return Vec::new();
+            };
+            return self.exact_all(&normalized);
+        }
+        if target.starts_with("./") || target.starts_with("../") {
+            let mut components: Vec<&str> =
+                source_folder.split('/').filter(|s| !s.is_empty()).collect();
+            for component in target.split('/') {
+                match component {
+                    "." | "" => {}
+                    ".." => {
+                        if components.pop().is_none() {
+                            return Vec::new();
+                        }
+                    }
+                    _ => components.push(component),
+                }
+            }
+            return self.exact_all(&components.join("/"));
+        }
+        if target.contains('/') {
+            let exact = self.exact_all(&target);
+            if exact.len() == 1 {
+                return exact;
+            }
+            let suffix = format!("/{target}");
+            let fname = target.rsplit('/').next().unwrap_or(&target);
+            if let Some(same_name) = self.by_filename_lower.get(fname) {
+                let suffix_matches: Vec<String> = same_name
+                    .iter()
+                    .filter(|p| p.to_ascii_lowercase().ends_with(&suffix))
+                    .cloned()
+                    .collect();
+                if !suffix_matches.is_empty() {
+                    return suffix_matches;
+                }
+            }
+            return exact;
+        }
+
+        let local = if source_folder.is_empty() {
+            target.clone()
+        } else {
+            format!("{source_folder}/{target}")
+        };
+        let local_exact = self.exact_all(&local);
+        if local_exact.len() == 1 {
+            return local_exact;
+        }
+
+        if let Some(by_filename) = self.by_filename_lower.get(&target) {
+            if !by_filename.is_empty() {
+                return by_filename.clone();
+            }
+        }
+
+        let stem = target.strip_suffix(".md").unwrap_or(&target);
+        self.by_alias_lower.get(stem).cloned().unwrap_or_default()
+    }
+
+    pub(crate) fn resolve_wikilink(&self, target_raw: &str, source_rel: &str) -> Option<String> {
+        let mut found = self.wikilink_candidates(target_raw, source_rel);
+        (found.len() == 1).then(|| found.remove(0))
+    }
+
+    pub(crate) fn resolve_markdown_link(&self, path_raw: &str, source_rel: &str) -> Option<String> {
+        if path_raw.is_empty() || path_raw.starts_with("//") || has_uri_scheme(path_raw) {
+            return None;
+        }
+        let decoded = decode_markdown_link_path(path_raw)?;
+        if decoded.is_empty()
+            || decoded.starts_with("//")
+            || has_uri_scheme(&decoded)
+            || is_image_target(&decoded)
+        {
+            return None;
+        }
+        let match_path = |candidate: &str| -> Option<String> {
+            let with_md = if candidate.to_ascii_lowercase().ends_with(".md") {
+                candidate.to_owned()
+            } else {
+                format!("{candidate}.md")
+            };
+            self.exact_unique(&with_md)
+        };
+
+        let source_folder = folder_from_rel_path(source_rel);
+
+        if let Some(rooted) = decoded.strip_prefix('/') {
+            let normalized = normalize_vault_rel_path("", rooted)?;
+            return match_path(&normalized);
+        }
+        if decoded.starts_with("./") || decoded.starts_with("../") {
+            let normalized = normalize_vault_rel_path(&source_folder, &decoded)?;
+            return match_path(&normalized);
+        }
+
+        if let Some(normalized) = normalize_vault_rel_path(&source_folder, &decoded) {
+            if let Some(found) = match_path(&normalized) {
+                return Some(found);
+            }
+        }
+        if !source_folder.is_empty() {
+            if let Some(normalized) = normalize_vault_rel_path("", &decoded) {
+                return match_path(&normalized);
+            }
+        }
+        None
+    }
+}
+
 fn resolve_move_wikilink_target(
     target_raw: &str,
     source_rel: &str,
@@ -1080,13 +1282,22 @@ pub fn hydrate_parsed_note_links(
     all_rel_paths: &[String],
     aliases_by_path: &HashMap<String, Vec<String>>,
 ) -> Vec<NoteImageRef> {
+    let index = VaultLinkIndex::build(all_rel_paths, aliases_by_path);
+    hydrate_parsed_note_links_indexed(vault_root, note_rel_path, parsed, &index)
+}
+
+pub(crate) fn hydrate_parsed_note_links_indexed(
+    vault_root: &Path,
+    note_rel_path: &str,
+    parsed: &mut ParsedNote,
+    index: &VaultLinkIndex,
+) -> Vec<NoteImageRef> {
     let mut images = Vec::new();
     hydrate_blocks(
         vault_root,
         note_rel_path,
         &mut parsed.blocks,
-        all_rel_paths,
-        aliases_by_path,
+        index,
         &mut images,
     );
     images
@@ -1096,8 +1307,7 @@ fn hydrate_blocks(
     vault_root: &Path,
     note_rel_path: &str,
     blocks: &mut [NoteBlock],
-    all_rel_paths: &[String],
-    aliases_by_path: &HashMap<String, Vec<String>>,
+    index: &VaultLinkIndex,
     images: &mut Vec<NoteImageRef>,
 ) {
     for block in blocks {
@@ -1108,35 +1318,21 @@ fn hydrate_blocks(
             | NoteBlock::BulletItem { spans, .. }
             | NoteBlock::NumberedItem { spans, .. }
             | NoteBlock::FootnoteDef { spans, .. } => {
-                resolve_spans(spans, note_rel_path, all_rel_paths, aliases_by_path);
+                resolve_spans(spans, note_rel_path, index);
             }
             NoteBlock::Callout { body_blocks, .. } => {
-                hydrate_blocks(
-                    vault_root,
-                    note_rel_path,
-                    body_blocks,
-                    all_rel_paths,
-                    aliases_by_path,
-                    images,
-                );
+                hydrate_blocks(vault_root, note_rel_path, body_blocks, index, images);
             }
             NoteBlock::Blockquote { blocks, .. } => {
-                hydrate_blocks(
-                    vault_root,
-                    note_rel_path,
-                    blocks,
-                    all_rel_paths,
-                    aliases_by_path,
-                    images,
-                );
+                hydrate_blocks(vault_root, note_rel_path, blocks, index, images);
             }
             NoteBlock::Table { headers, rows, .. } => {
                 for cell in headers {
-                    resolve_spans(cell, note_rel_path, all_rel_paths, aliases_by_path);
+                    resolve_spans(cell, note_rel_path, index);
                 }
                 for row in rows {
                     for cell in row {
-                        resolve_spans(cell, note_rel_path, all_rel_paths, aliases_by_path);
+                        resolve_spans(cell, note_rel_path, index);
                     }
                 }
             }
@@ -1145,12 +1341,7 @@ fn hydrate_blocks(
                 resolved_path,
                 ..
             } => {
-                *resolved_path = resolve_wikilink_from_source(
-                    target,
-                    note_rel_path,
-                    all_rel_paths,
-                    aliases_by_path,
-                );
+                *resolved_path = index.resolve_wikilink(target, note_rel_path);
             }
             NoteBlock::ImageEmbed {
                 raw_target,
@@ -1175,12 +1366,7 @@ fn hydrate_blocks(
     }
 }
 
-fn resolve_spans(
-    spans: &mut [InlineSpan],
-    source_rel: &str,
-    all_rel_paths: &[String],
-    aliases_by_path: &HashMap<String, Vec<String>>,
-) {
+fn resolve_spans(spans: &mut [InlineSpan], source_rel: &str, index: &VaultLinkIndex) {
     for span in spans {
         if let InlineSpan::Wikilink {
             target,
@@ -1188,8 +1374,7 @@ fn resolve_spans(
             ..
         } = span
         {
-            *resolved_path =
-                resolve_wikilink_from_source(target, source_rel, all_rel_paths, aliases_by_path);
+            *resolved_path = index.resolve_wikilink(target, source_rel);
         }
     }
 }
@@ -1669,6 +1854,25 @@ pub fn rewrite_wikilinks_for_move(
     all_paths_before_move: &[String],
     aliases_by_path: &HashMap<String, Vec<String>>,
 ) -> Result<usize> {
+    Ok(rewrite_wikilinks_for_move_paths(
+        vault_root,
+        old_rel,
+        new_rel,
+        all_paths_before_move,
+        aliases_by_path,
+    )?
+    .len())
+}
+
+/// Same as [`rewrite_wikilinks_for_move`], returning the relative paths of all notes rewritten on disk
+/// so callers can update SQLite incrementally via `Storage::sync_paths` without a second vault scan.
+pub(crate) fn rewrite_wikilinks_for_move_paths(
+    vault_root: &Path,
+    old_rel: &str,
+    new_rel: &str,
+    all_paths_before_move: &[String],
+    aliases_by_path: &HashMap<String, Vec<String>>,
+) -> Result<Vec<String>> {
     let mut all_paths_after: Vec<String> = all_paths_before_move
         .iter()
         .map(|p| {
@@ -1693,7 +1897,7 @@ pub fn rewrite_wikilinks_for_move(
     }
 
     let entries = scan_vault_markdown_files(vault_root)?;
-    let mut updated_notes = 0usize;
+    let mut updated_paths = Vec::new();
     for entry in entries {
         let Ok(raw) = fs::read_to_string(&entry.abs_path) else {
             continue;
@@ -1862,9 +2066,9 @@ pub fn rewrite_wikilinks_for_move(
             continue;
         };
         write_atomic(&entry.abs_path, rewritten.as_bytes())?;
-        updated_notes += 1;
+        updated_paths.push(entry.rel_path);
     }
-    Ok(updated_notes)
+    Ok(updated_paths)
 }
 
 fn rewrite_markdown_links(
@@ -2763,6 +2967,80 @@ mod tests {
             assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 1); // only .obsidian
         } else {
             assert_eq!(result.unwrap().0, "2026-11-23 at HH:mm.md");
+        }
+    }
+
+    #[test]
+    fn test_vault_link_index_matches_linear_resolvers() {
+        let paths: Vec<String> = [
+            "Root.md",
+            "Projects/RFC.md",
+            "Archive/Projects/RFC.md",
+            "Projects/Local.md",
+            "Other/Local.md",
+            "Team/Guide.md",
+            "Deep/Sub/Target.md",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let mut aliases = HashMap::new();
+        aliases.insert(
+            "Team/Guide.md".to_string(),
+            vec!["Team Guide".to_string(), "SharedAlias".to_string()],
+        );
+        aliases.insert(
+            "Root.md".to_string(),
+            vec!["Home".to_string(), "SharedAlias".to_string()],
+        );
+
+        let index = VaultLinkIndex::build(&paths, &aliases);
+        let sources = ["Root.md", "Projects/RFC.md", "Deep/Sub/Target.md"];
+        let wikilinks = [
+            "Root",
+            "/Root",
+            "/Projects/RFC",
+            "./Local",
+            "../Root",
+            "Local",
+            "Projects/RFC",
+            "Archive/Projects/RFC",
+            "Sub/Target",
+            "Team Guide",
+            "SharedAlias",
+            "Home",
+            "Missing",
+            "diagram.png",
+            "Root#Heading",
+        ];
+        for src in sources {
+            for target in wikilinks {
+                assert_eq!(
+                    index.wikilink_candidates(target, src),
+                    wikilink_candidates_from_source(target, src, &paths, &aliases),
+                    "candidates mismatch for src={src:?} target={target:?}"
+                );
+                assert_eq!(
+                    index.resolve_wikilink(target, src),
+                    resolve_wikilink_from_source(target, src, &paths, &aliases),
+                    "wikilink mismatch for src={src:?} target={target:?}"
+                );
+            }
+            for md_target in [
+                "Root.md",
+                "/Projects/RFC.md",
+                "./Local.md",
+                "../Root.md",
+                "Team/Guide",
+                "Missing.md",
+                "https://example.com",
+            ] {
+                assert_eq!(
+                    index.resolve_markdown_link(md_target, src),
+                    resolve_markdown_link_from_source(md_target, src, &paths),
+                    "markdown link mismatch for src={src:?} target={md_target:?}"
+                );
+            }
         }
     }
 }

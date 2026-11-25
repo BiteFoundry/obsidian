@@ -29,11 +29,11 @@ use crate::{
         fs::{
             canonical_rel_path_in_vault, content_sha256_hex, extract_local_markdown_note_link,
             file_mtime_and_size, file_mtime_ns_and_size, folder_from_rel_path,
-            has_symlink_component_in_vault, hydrate_parsed_note_links, is_local_attachment_dest,
-            move_note, normalize_rel_path, replace_note_text, resolve_attachment_staged,
-            resolve_markdown_link_from_source, resolve_note_identifier,
-            resolve_wikilink_from_source, rewrite_wikilinks_for_move, safe_vault_path,
-            scan_vault_markdown_files_report, title_from_rel_path, wikilink_candidates_from_source,
+            has_symlink_component_in_vault, hydrate_parsed_note_links_indexed,
+            is_local_attachment_dest, move_note, normalize_rel_path, replace_note_text,
+            resolve_attachment_staged, resolve_note_identifier, rewrite_wikilinks_for_move_paths,
+            safe_vault_path, scan_vault_markdown_files_report, title_from_rel_path,
+            VaultLinkIndex,
         },
         parser::parse_markdown,
     },
@@ -738,15 +738,15 @@ impl Storage {
         let disk_entries = scan.entries;
         let vault_id = vault.id.as_str();
 
-        let mut conn = self
-            .conn
-            .lock()
-            .map_err(|_| anyhow!("Storage lock poisoned"))?;
-
-        // Load existing (rel_path -> (mtime_ms, mtime_ns, size_bytes, content_hash, is_bookmarked, aliases_json))
+        // Snapshot existing metadata briefly, then release the SQLite lock before doing
+        // filesystem reads, SHA-256 hashing, and Markdown parsing so concurrent readers stay fast.
         let mut existing: HashMap<String, (i64, i64, i64, String, bool, String)> = HashMap::new();
         {
-            let mut stmt = conn.prepare(
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|_| anyhow!("Storage lock poisoned"))?;
+            let mut stmt = conn.prepare_cached(
                 "SELECT rel_path, mtime_ms, mtime_ns, size_bytes, content_hash, is_bookmarked, aliases_json
                  FROM notes WHERE vault_id = ?1",
             )?;
@@ -773,14 +773,15 @@ impl Storage {
         let removed_paths =
             compute_removed_paths(existing.keys(), &disk_set, &scan.unreadable_dirs);
 
-        // (entry, raw markdown, content hash, is_bookmarked, previous aliases_json or None when new)
-        let mut to_upsert: Vec<(
-            &crate::vault::fs::DiskNoteEntry,
-            String,
-            String,
-            bool,
-            Option<&str>,
-        )> = Vec::new();
+        // Read, hash, and parse changed files completely outside the SQLite lock/transaction.
+        struct PreparedNote<'a> {
+            entry: &'a crate::vault::fs::DiskNoteEntry,
+            parsed: ParsedNote,
+            disk_hash: String,
+            is_bookmarked: bool,
+            prev_aliases: Option<&'a str>,
+        }
+        let mut to_upsert: Vec<PreparedNote<'_>> = Vec::new();
         for entry in &disk_entries {
             match existing.get(&entry.rel_path) {
                 Some((mt_ms, mt_ns, sz, stored_hash, is_bm, aliases))
@@ -796,7 +797,14 @@ impl Storage {
                         let disk_hash = content_sha256_hex(&bytes);
                         if stored_hash.is_empty() || *stored_hash != disk_hash {
                             let raw = decode_utf8_lossy(bytes);
-                            to_upsert.push((entry, raw, disk_hash, *is_bm, Some(aliases.as_str())));
+                            let parsed = parse_markdown(&entry.rel_path, &entry.title, &raw);
+                            to_upsert.push(PreparedNote {
+                                entry,
+                                parsed,
+                                disk_hash,
+                                is_bookmarked: *is_bm,
+                                prev_aliases: Some(aliases.as_str()),
+                            });
                         }
                     }
                 }
@@ -809,7 +817,14 @@ impl Storage {
                     let is_bm = existing_row.map(|t| t.4).unwrap_or(false);
                     let prev_aliases = existing_row.map(|t| t.5.as_str());
                     let raw = decode_utf8_lossy(bytes);
-                    to_upsert.push((entry, raw, disk_hash, is_bm, prev_aliases));
+                    let parsed = parse_markdown(&entry.rel_path, &entry.title, &raw);
+                    to_upsert.push(PreparedNote {
+                        entry,
+                        parsed,
+                        disk_hash,
+                        is_bookmarked: is_bm,
+                        prev_aliases,
+                    });
                 }
             }
         }
@@ -817,6 +832,25 @@ impl Storage {
         let updated_count = to_upsert.len();
         let removed_count = removed_paths.len();
         let needs_link_resolution = updated_count > 0 || removed_count > 0;
+
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("Storage lock poisoned"))?;
+
+        // Fast no-op path: nothing changed and not a first index or forced repair.
+        if !needs_link_resolution && !force_hash_check && !existing.is_empty() {
+            let mut stats = index_stats_on_conn(
+                &conn,
+                vault,
+                disk_entries.len(),
+                0,
+                0,
+                start.elapsed().as_millis() as u64,
+            )?;
+            stats.unreadable_dirs = scan.unreadable_dirs.len();
+            return Ok(stats);
+        }
 
         let tx = conn.transaction_with_behavior(if existing.is_empty() {
             TransactionBehavior::Immediate
@@ -853,39 +887,39 @@ impl Storage {
         }
 
         // Upsert added/modified notes (only files that were successfully read from disk)
-        for (entry, raw, disk_hash, is_bookmarked, prev_aliases) in &to_upsert {
-            let parsed = parse_markdown(&entry.rel_path, &entry.title, raw);
+        for item in &to_upsert {
+            let entry = item.entry;
             upsert_note_in_tx(
                 &tx,
                 vault_id,
                 &entry.rel_path,
                 &entry.title,
                 &entry.folder,
-                &parsed,
+                &item.parsed,
                 entry.mtime_ms,
                 entry.mtime_ns,
                 entry.size_bytes,
-                disk_hash,
-                *is_bookmarked,
+                &item.disk_hash,
+                item.is_bookmarked,
                 !first_index,
             )?;
 
             affected_sources.insert(entry.rel_path.clone());
-            match prev_aliases {
+            match item.prev_aliases {
                 None => {
                     resolve_unresolved = true;
                     name_candidates.insert(entry.title.to_ascii_lowercase());
-                    insert_alias_names(&mut name_candidates, &parsed.aliases);
+                    insert_alias_names(&mut name_candidates, &item.parsed.aliases);
                 }
                 Some(prev_json) => {
                     let new_json =
-                        serde_json::to_string(&parsed.aliases).unwrap_or_else(|_| "[]".into());
-                    if *prev_json != new_json {
+                        serde_json::to_string(&item.parsed.aliases).unwrap_or_else(|_| "[]".into());
+                    if prev_json != new_json {
                         resolve_unresolved = true;
                         affected_targets.insert(entry.rel_path.clone());
                         let prev: Vec<String> = serde_json::from_str(prev_json).unwrap_or_default();
                         insert_alias_names(&mut name_candidates, &prev);
-                        insert_alias_names(&mut name_candidates, &parsed.aliases);
+                        insert_alias_names(&mut name_candidates, &item.parsed.aliases);
                     }
                 }
             }
@@ -1079,7 +1113,7 @@ impl Storage {
         let matches = replace_note_text(&abs_path, find, replace)?;
         let replaced = matches == 1;
         if replaced {
-            self.sync_vault(vault)?;
+            self.sync_paths(vault, std::slice::from_ref(&rel_path), &[])?;
         }
         Ok(NoteTextReplacement {
             replaced,
@@ -1101,9 +1135,14 @@ impl Storage {
             .get_note_summary(&vault.id, &from)?
             .is_some_and(|summary| summary.is_bookmarked);
         let to = move_note(&vault.path, &from, dst)?;
-        let updated_links_in_notes =
-            rewrite_wikilinks_for_move(&vault.path, &from, &to, &paths, &aliases)?;
-        self.sync_vault(vault)?;
+        let rewritten_paths =
+            rewrite_wikilinks_for_move_paths(&vault.path, &from, &to, &paths, &aliases)?;
+        let updated_links_in_notes = rewritten_paths.len();
+        let mut changed_paths = Vec::with_capacity(rewritten_paths.len() + 2);
+        changed_paths.push(from.clone());
+        changed_paths.push(to.clone());
+        changed_paths.extend(rewritten_paths);
+        self.sync_paths(vault, &changed_paths, &[])?;
         if was_bookmarked {
             self.set_bookmark(&vault.id, &to, true)?;
         }
@@ -1204,28 +1243,24 @@ impl Storage {
 
     /// Loads complete `NoteDetail` from disk + SQLite index (with resolved wikilinks, images, backlinks, outgoing links).
     pub fn load_note_detail(&self, vault: &VaultProfile, note_ref: &str) -> Result<NoteDetail> {
-        let NoteContent {
-            rel_path,
-            title,
-            raw_markdown,
-            ..
-        } = self.load_note_content(vault, note_ref)?;
+        let (all_paths, aliases_map) = self.all_paths_and_aliases(&vault.id)?;
+        let rel_path = resolve_note_identifier(note_ref, &all_paths, &aliases_map)?;
+        let abs_path = safe_vault_path(&vault.path, &rel_path)?;
+        let raw_bytes = fs::read(&abs_path)
+            .with_context(|| format!("Failed to read note: {}", abs_path.display()))?;
+        let raw_markdown = decode_utf8_lossy(raw_bytes);
+        let title = title_from_rel_path(&rel_path);
         let mut parsed = parse_markdown(&rel_path, &title, &raw_markdown);
 
-        let (all_paths, aliases_map) = self.all_paths_and_aliases(&vault.id)?;
-        let images = hydrate_parsed_note_links(
-            &vault.path,
-            &rel_path,
-            &mut parsed,
-            &all_paths,
-            &aliases_map,
-        );
+        let link_index = VaultLinkIndex::build(&all_paths, &aliases_map);
+        let images =
+            hydrate_parsed_note_links_indexed(&vault.path, &rel_path, &mut parsed, &link_index);
 
         let summary = self
             .get_note_summary(&vault.id, &rel_path)?
             .ok_or_else(|| anyhow!("Note missing from index: {rel_path}"))?;
         let backlinks = self.get_backlinks(&vault.id, &rel_path)?;
-        let outgoing_links = self.get_outgoing_links(vault, &rel_path)?;
+        let outgoing_links = self.get_outgoing_links_inner(vault, &rel_path, Some(&link_index))?;
 
         Ok(NoteDetail {
             summary,
@@ -1478,6 +1513,15 @@ impl Storage {
         vault: &VaultProfile,
         source_rel_path: &str,
     ) -> Result<Vec<OutgoingLinkEntry>> {
+        self.get_outgoing_links_inner(vault, source_rel_path, None)
+    }
+
+    fn get_outgoing_links_inner(
+        &self,
+        vault: &VaultProfile,
+        source_rel_path: &str,
+        precomputed_index: Option<&VaultLinkIndex>,
+    ) -> Result<Vec<OutgoingLinkEntry>> {
         struct OutgoingLinkRow {
             target_raw: String,
             resolved_path: Option<String>,
@@ -1493,7 +1537,7 @@ impl Storage {
                 .conn
                 .lock()
                 .map_err(|_| anyhow!("Storage lock poisoned"))?;
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT l.target_raw, l.target_resolved_path, n.title, l.alias, l.heading, l.is_embed, l.link_kind
                  FROM links l
                  LEFT JOIN notes n ON n.vault_id = l.vault_id AND n.rel_path = l.target_resolved_path
@@ -1518,12 +1562,16 @@ impl Storage {
             collected
         };
 
-        let has_unresolved = rows.iter().any(|row| row.resolved_path.is_none());
-        let all_notes = if has_unresolved {
-            Some(self.all_paths_and_aliases(&vault.id)?)
+        let has_unresolved_wikilink = rows
+            .iter()
+            .any(|row| row.resolved_path.is_none() && row.link_kind == "wikilink");
+        let owned_index = if has_unresolved_wikilink && precomputed_index.is_none() {
+            let (all_paths, aliases_map) = self.all_paths_and_aliases(&vault.id)?;
+            Some(VaultLinkIndex::build(&all_paths, &aliases_map))
         } else {
             None
         };
+        let link_index = precomputed_index.or(owned_index.as_ref());
 
         let mut out = Vec::with_capacity(rows.len());
         for OutgoingLinkRow {
@@ -1574,13 +1622,8 @@ impl Storage {
             }
 
             if link_kind == "wikilink" {
-                if let Some((ref all_paths, ref aliases_map)) = all_notes {
-                    let mut cands = wikilink_candidates_from_source(
-                        &target_raw,
-                        source_rel_path,
-                        all_paths,
-                        aliases_map,
-                    );
+                if let Some(idx) = link_index {
+                    let mut cands = idx.wikilink_candidates(&target_raw, source_rel_path);
                     if cands.len() >= 2 {
                         cands.truncate(10);
                         out.push(OutgoingLinkEntry {
@@ -1622,87 +1665,111 @@ impl Storage {
         depth: usize,
     ) -> Result<GraphData> {
         let depth = depth.clamp(1, 5);
-        let (all_paths, aliases_map) = self.all_paths_and_aliases(&vault.id)?;
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| anyhow!("Storage lock poisoned"))?;
         let vault_id = vault.id.as_str();
-        let tags_map = load_tags_map(&conn, vault_id)?;
 
-        // Load all notes metadata
+        // Load notes metadata, aliases, tags, and links in a single SQLite lock acquisition,
+        // then release the lock before any filesystem attachment checks or BFS computation.
+        let mut all_paths: Vec<String> = Vec::new();
+        let mut aliases_map: HashMap<String, Vec<String>> = HashMap::new();
         let mut note_meta: HashMap<String, (String, String)> = HashMap::new();
+        let tags_map: HashMap<String, Vec<String>>;
+        let raw_links: Vec<(String, String, Option<String>, bool, String)>;
         {
-            let mut stmt =
-                conn.prepare("SELECT rel_path, title, folder FROM notes WHERE vault_id = ?1")?;
-            let rows = stmt.query_map(params![vault_id], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                ))
-            })?;
-            for r in rows {
-                let (rp, title, folder) = r?;
-                note_meta.insert(rp, (title, folder));
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|_| anyhow!("Storage lock poisoned"))?;
+            tags_map = load_tags_map(&conn, vault_id)?;
+            {
+                let mut stmt = conn.prepare_cached(
+                    "SELECT rel_path, title, folder, aliases_json FROM notes WHERE vault_id = ?1",
+                )?;
+                let rows = stmt.query_map(params![vault_id], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                    ))
+                })?;
+                for r in rows {
+                    let (rp, title, folder, aj) = r?;
+                    if aj != "[]" {
+                        let aliases: Vec<String> = serde_json::from_str(&aj).unwrap_or_default();
+                        if !aliases.is_empty() {
+                            aliases_map.insert(rp.clone(), aliases);
+                        }
+                    }
+                    all_paths.push(rp.clone());
+                    note_meta.insert(rp, (title, folder));
+                }
+            }
+            {
+                let mut stmt = conn.prepare_cached(
+                    "SELECT source_path, target_raw, target_resolved_path, is_embed, link_kind
+                     FROM links WHERE vault_id = ?1
+                     ORDER BY id ASC",
+                )?;
+                let rows = stmt.query_map(params![vault_id], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, i64>(3)? != 0,
+                        r.get::<_, String>(4)?,
+                    ))
+                })?;
+                let mut collected = Vec::new();
+                for r in rows {
+                    collected.push(r?);
+                }
+                raw_links = collected;
             }
         }
 
-        // Load all edges (excluding image and existing local attachment embeds so graph shows note-to-note connections)
-        let mut all_edges: Vec<(String, String, bool, bool)> = Vec::new();
+        let mut link_index: Option<VaultLinkIndex> = None;
+        let mut attachment_cache: HashMap<(String, String), bool> = HashMap::new();
+
+        // Filter out image and existing local attachment embeds so graph shows note-to-note connections
+        let mut all_edges: Vec<(String, String, bool, bool)> = Vec::with_capacity(raw_links.len());
         let mut unresolved_status: HashMap<String, LinkStatus> = HashMap::new();
-        {
-            let mut stmt = conn.prepare(
-                "SELECT source_path, target_raw, target_resolved_path, is_embed, link_kind
-                 FROM links WHERE vault_id = ?1
-                 ORDER BY id ASC",
-            )?;
-            let rows = stmt.query_map(params![vault_id], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, Option<String>>(2)?,
-                    r.get::<_, i64>(3)? != 0,
-                    r.get::<_, String>(4)?,
-                ))
-            })?;
-            for r in rows {
-                let (src, raw, resolved_opt, is_embed, link_kind) = r?;
-                if crate::vault::parser::is_image_target(&raw) {
-                    continue;
-                }
-                let (target_id, is_resolved) = match resolved_opt {
-                    Some(rp) => (rp, true),
-                    None => {
-                        if is_local_attachment_dest(&raw)
-                            && resolve_attachment_staged(&vault.path, &src, &raw).is_some()
-                        {
+        for (src, raw, resolved_opt, is_embed, link_kind) in raw_links {
+            if crate::vault::parser::is_image_target(&raw) {
+                continue;
+            }
+            let (target_id, is_resolved) = match resolved_opt {
+                Some(rp) => (rp, true),
+                None => {
+                    if is_local_attachment_dest(&raw) {
+                        let cache_key = (folder_from_rel_path(&src), raw.clone());
+                        let exists = *attachment_cache.entry(cache_key).or_insert_with(|| {
+                            resolve_attachment_staged(&vault.path, &src, &raw).is_some()
+                        });
+                        if exists {
                             continue;
                         }
-                        let target_id = format!("unresolved:{raw}");
-                        let is_ambiguous = link_kind == "wikilink"
-                            && wikilink_candidates_from_source(
-                                &raw,
-                                &src,
-                                &all_paths,
-                                &aliases_map,
-                            )
-                            .len()
-                                >= 2;
-                        let entry = unresolved_status
-                            .entry(target_id.clone())
-                            .or_insert(LinkStatus::Missing);
-                        if is_ambiguous {
-                            *entry = LinkStatus::Ambiguous;
-                        }
-                        (target_id, false)
                     }
-                };
-                if src == target_id {
-                    continue;
+                    let target_id = format!("unresolved:{raw}");
+                    let is_ambiguous = if link_kind == "wikilink" {
+                        let idx = link_index
+                            .get_or_insert_with(|| VaultLinkIndex::build(&all_paths, &aliases_map));
+                        idx.wikilink_candidates(&raw, &src).len() >= 2
+                    } else {
+                        false
+                    };
+                    let entry = unresolved_status
+                        .entry(target_id.clone())
+                        .or_insert(LinkStatus::Missing);
+                    if is_ambiguous {
+                        *entry = LinkStatus::Ambiguous;
+                    }
+                    (target_id, false)
                 }
-                all_edges.push((src, target_id, is_embed, is_resolved));
+            };
+            if src == target_id {
+                continue;
             }
+            all_edges.push((src, target_id, is_embed, is_resolved));
         }
 
         let mut in_deg: HashMap<String, usize> = HashMap::new();
@@ -2322,30 +2389,18 @@ fn decode_utf8_lossy(bytes: Vec<u8>) -> String {
 }
 
 fn delete_note_in_tx(tx: &rusqlite::Transaction<'_>, vault_id: &str, rel_path: &str) -> Result<()> {
-    tx.execute(
-        "DELETE FROM notes WHERE vault_id = ?1 AND rel_path = ?2",
-        params![vault_id, rel_path],
-    )?;
-    tx.execute(
-        "DELETE FROM links WHERE vault_id = ?1 AND source_path = ?2",
-        params![vault_id, rel_path],
-    )?;
-    tx.execute(
-        "DELETE FROM tags WHERE vault_id = ?1 AND note_path = ?2",
-        params![vault_id, rel_path],
-    )?;
-    tx.execute(
-        "DELETE FROM headings WHERE vault_id = ?1 AND note_path = ?2",
-        params![vault_id, rel_path],
-    )?;
-    tx.execute(
-        "DELETE FROM tasks WHERE vault_id = ?1 AND note_path = ?2",
-        params![vault_id, rel_path],
-    )?;
-    tx.execute(
-        "DELETE FROM notes_fts WHERE vault_id = ?1 AND rel_path = ?2",
-        params![vault_id, rel_path],
-    )?;
+    tx.prepare_cached("DELETE FROM notes WHERE vault_id = ?1 AND rel_path = ?2")?
+        .execute(params![vault_id, rel_path])?;
+    tx.prepare_cached("DELETE FROM links WHERE vault_id = ?1 AND source_path = ?2")?
+        .execute(params![vault_id, rel_path])?;
+    tx.prepare_cached("DELETE FROM tags WHERE vault_id = ?1 AND note_path = ?2")?
+        .execute(params![vault_id, rel_path])?;
+    tx.prepare_cached("DELETE FROM headings WHERE vault_id = ?1 AND note_path = ?2")?
+        .execute(params![vault_id, rel_path])?;
+    tx.prepare_cached("DELETE FROM tasks WHERE vault_id = ?1 AND note_path = ?2")?
+        .execute(params![vault_id, rel_path])?;
+    tx.prepare_cached("DELETE FROM notes_fts WHERE vault_id = ?1 AND rel_path = ?2")?
+        .execute(params![vault_id, rel_path])?;
     Ok(())
 }
 
@@ -2452,22 +2507,24 @@ fn compute_removed_paths<'a>(
     removed
 }
 
-/// Re-resolves every link of the vault against every note path: O(links x notes).
+/// Re-resolves every link of the vault using a precomputed O(1) lookup index: O(notes + links).
 /// Used for the first index, explicit reindex and bulk changes.
 fn resolve_all_links_in_tx(tx: &rusqlite::Transaction<'_>, vault_id: &str) -> Result<()> {
     let mut all_paths: Vec<String> = Vec::new();
     let mut aliases_by_path: HashMap<String, Vec<String>> = HashMap::new();
     {
         let mut stmt =
-            tx.prepare("SELECT rel_path, aliases_json FROM notes WHERE vault_id = ?1")?;
+            tx.prepare_cached("SELECT rel_path, aliases_json FROM notes WHERE vault_id = ?1")?;
         let rows = stmt.query_map(params![vault_id], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })?;
         for r in rows {
             let (rp, aj) = r?;
-            let aliases: Vec<String> = serde_json::from_str(&aj).unwrap_or_default();
-            if !aliases.is_empty() {
-                aliases_by_path.insert(rp.clone(), aliases);
+            if aj != "[]" {
+                let aliases: Vec<String> = serde_json::from_str(&aj).unwrap_or_default();
+                if !aliases.is_empty() {
+                    aliases_by_path.insert(rp.clone(), aliases);
+                }
             }
             all_paths.push(rp);
         }
@@ -2475,7 +2532,7 @@ fn resolve_all_links_in_tx(tx: &rusqlite::Transaction<'_>, vault_id: &str) -> Re
 
     let mut link_rows: Vec<(i64, String, String, String)> = Vec::new();
     {
-        let mut stmt = tx.prepare(
+        let mut stmt = tx.prepare_cached(
             "SELECT id, source_path, target_raw, link_kind FROM links WHERE vault_id = ?1",
         )?;
         let rows = stmt.query_map(params![vault_id], |r| {
@@ -2491,12 +2548,18 @@ fn resolve_all_links_in_tx(tx: &rusqlite::Transaction<'_>, vault_id: &str) -> Re
         }
     }
 
-    let mut upd = tx.prepare("UPDATE links SET target_resolved_path = ?1 WHERE id = ?2")?;
+    if link_rows.is_empty() {
+        return Ok(());
+    }
+
+    let index = VaultLinkIndex::build(&all_paths, &aliases_by_path);
+    let mut upd =
+        tx.prepare_cached("UPDATE links SET target_resolved_path = ?1 WHERE id = ?2")?;
     for (id, source_path, target_raw, link_kind) in link_rows {
         let resolved = if link_kind == "markdown" {
-            resolve_markdown_link_from_source(&target_raw, &source_path, &all_paths)
+            index.resolve_markdown_link(&target_raw, &source_path)
         } else {
-            resolve_wikilink_from_source(&target_raw, &source_path, &all_paths, &aliases_by_path)
+            index.resolve_wikilink(&target_raw, &source_path)
         };
         upd.execute(params![resolved, id])?;
     }
@@ -2523,15 +2586,17 @@ fn resolve_affected_links_in_tx(
     let mut aliases_by_path: HashMap<String, Vec<String>> = HashMap::new();
     {
         let mut stmt =
-            tx.prepare("SELECT rel_path, aliases_json FROM notes WHERE vault_id = ?1")?;
+            tx.prepare_cached("SELECT rel_path, aliases_json FROM notes WHERE vault_id = ?1")?;
         let rows = stmt.query_map(params![vault_id], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })?;
         for r in rows {
             let (rp, aj) = r?;
-            let aliases: Vec<String> = serde_json::from_str(&aj).unwrap_or_default();
-            if !aliases.is_empty() {
-                aliases_by_path.insert(rp.clone(), aliases);
+            if aj != "[]" {
+                let aliases: Vec<String> = serde_json::from_str(&aj).unwrap_or_default();
+                if !aliases.is_empty() {
+                    aliases_by_path.insert(rp.clone(), aliases);
+                }
             }
             all_paths.push(rp);
         }
@@ -2559,11 +2624,12 @@ fn resolve_affected_links_in_tx(
     }
 
     let mut seen_link_ids: HashSet<i64> = HashSet::new();
-    let mut link_rows: Vec<(i64, String, String, String)> = Vec::new();
+    let mut link_rows: Vec<(i64, String, String, String, Option<String>)> = Vec::new();
 
     if !affected_sources.is_empty() {
-        let mut stmt = tx.prepare(
-            "SELECT id, source_path, target_raw, link_kind FROM links WHERE vault_id = ?1 AND source_path = ?2",
+        let mut stmt = tx.prepare_cached(
+            "SELECT id, source_path, target_raw, link_kind, target_resolved_path
+             FROM links WHERE vault_id = ?1 AND source_path = ?2",
         )?;
         for src in affected_sources {
             let rows = stmt.query_map(params![vault_id, src], |r| {
@@ -2572,20 +2638,22 @@ fn resolve_affected_links_in_tx(
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
                     r.get::<_, String>(3)?,
+                    r.get::<_, Option<String>>(4)?,
                 ))
             })?;
             for r in rows {
-                let (id, source_path, target_raw, link_kind) = r?;
+                let (id, source_path, target_raw, link_kind, prev_resolved) = r?;
                 if seen_link_ids.insert(id) {
-                    link_rows.push((id, source_path, target_raw, link_kind));
+                    link_rows.push((id, source_path, target_raw, link_kind, prev_resolved));
                 }
             }
         }
     }
 
     if !target_set.is_empty() {
-        let mut stmt = tx.prepare(
-            "SELECT id, source_path, target_raw, link_kind FROM links WHERE vault_id = ?1 AND target_resolved_path = ?2",
+        let mut stmt = tx.prepare_cached(
+            "SELECT id, source_path, target_raw, link_kind, target_resolved_path
+             FROM links WHERE vault_id = ?1 AND target_resolved_path = ?2",
         )?;
         for tgt in &target_set {
             let rows = stmt.query_map(params![vault_id, tgt], |r| {
@@ -2594,20 +2662,22 @@ fn resolve_affected_links_in_tx(
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
                     r.get::<_, String>(3)?,
+                    r.get::<_, Option<String>>(4)?,
                 ))
             })?;
             for r in rows {
-                let (id, source_path, target_raw, link_kind) = r?;
+                let (id, source_path, target_raw, link_kind, prev_resolved) = r?;
                 if seen_link_ids.insert(id) {
-                    link_rows.push((id, source_path, target_raw, link_kind));
+                    link_rows.push((id, source_path, target_raw, link_kind, prev_resolved));
                 }
             }
         }
     }
 
     if resolve_unresolved {
-        let mut stmt = tx.prepare(
-            "SELECT id, source_path, target_raw, link_kind FROM links WHERE vault_id = ?1 AND target_resolved_path IS NULL",
+        let mut stmt = tx.prepare_cached(
+            "SELECT id, source_path, target_raw, link_kind, target_resolved_path
+             FROM links WHERE vault_id = ?1 AND target_resolved_path IS NULL",
         )?;
         let rows = stmt.query_map(params![vault_id], |r| {
             Ok((
@@ -2615,30 +2685,30 @@ fn resolve_affected_links_in_tx(
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
                 r.get::<_, String>(3)?,
+                r.get::<_, Option<String>>(4)?,
             ))
         })?;
         for r in rows {
-            let (id, source_path, target_raw, link_kind) = r?;
+            let (id, source_path, target_raw, link_kind, prev_resolved) = r?;
             if seen_link_ids.insert(id) {
-                link_rows.push((id, source_path, target_raw, link_kind));
+                link_rows.push((id, source_path, target_raw, link_kind, prev_resolved));
             }
         }
     }
 
     if !link_rows.is_empty() {
-        let mut upd = tx.prepare("UPDATE links SET target_resolved_path = ?1 WHERE id = ?2")?;
-        for (id, source_path, target_raw, link_kind) in link_rows {
+        let index = VaultLinkIndex::build(&all_paths, &aliases_by_path);
+        let mut upd =
+            tx.prepare_cached("UPDATE links SET target_resolved_path = ?1 WHERE id = ?2")?;
+        for (id, source_path, target_raw, link_kind, prev_resolved) in link_rows {
             let resolved = if link_kind == "markdown" {
-                resolve_markdown_link_from_source(&target_raw, &source_path, &all_paths)
+                index.resolve_markdown_link(&target_raw, &source_path)
             } else {
-                resolve_wikilink_from_source(
-                    &target_raw,
-                    &source_path,
-                    &all_paths,
-                    &aliases_by_path,
-                )
+                index.resolve_wikilink(&target_raw, &source_path)
             };
-            upd.execute(params![resolved, id])?;
+            if resolved != prev_resolved {
+                upd.execute(params![resolved, id])?;
+            }
         }
     }
     Ok(())
@@ -2664,7 +2734,7 @@ fn upsert_note_in_tx(
     let aliases_text = parsed.aliases.join(" ");
     let tags_text = parsed.tags.join(" ");
 
-    tx.execute(
+    tx.prepare_cached(
         "INSERT INTO notes (
             vault_id, rel_path, title, folder, frontmatter_json, aliases_json,
             body_plain, word_count, mtime_ms, mtime_ns, size_bytes, content_hash, is_bookmarked
@@ -2680,117 +2750,123 @@ fn upsert_note_in_tx(
             mtime_ns = excluded.mtime_ns,
             size_bytes = excluded.size_bytes,
             content_hash = excluded.content_hash",
-        params![
-            vault_id,
-            rel_path,
-            title,
-            folder,
-            fm_json,
-            aliases_json,
-            parsed.body_plain,
-            parsed.word_count as i64,
-            mtime_ms,
-            mtime_ns,
-            size_bytes,
-            content_hash,
-            i64::from(is_bookmarked),
-        ],
-    )?;
+    )?
+    .execute(params![
+        vault_id,
+        rel_path,
+        title,
+        folder,
+        fm_json,
+        aliases_json,
+        parsed.body_plain,
+        parsed.word_count as i64,
+        mtime_ms,
+        mtime_ns,
+        size_bytes,
+        content_hash,
+        i64::from(is_bookmarked),
+    ])?;
 
-    tx.execute(
-        "DELETE FROM links WHERE vault_id = ?1 AND source_path = ?2",
-        params![vault_id, rel_path],
-    )?;
-    for wl in &parsed.wikilinks {
-        tx.execute(
+    tx.prepare_cached("DELETE FROM links WHERE vault_id = ?1 AND source_path = ?2")?
+        .execute(params![vault_id, rel_path])?;
+    if !parsed.wikilinks.is_empty() {
+        let mut ins_wl = tx.prepare_cached(
             "INSERT INTO links (
                 vault_id, source_path, target_raw, target_resolved_path, alias, heading, is_embed, link_kind
              ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, 'wikilink')",
-            params![
+        )?;
+        for wl in &parsed.wikilinks {
+            ins_wl.execute(params![
                 vault_id,
                 rel_path,
                 wl.target_raw,
                 wl.alias,
                 wl.heading,
                 i64::from(wl.is_embed),
-            ],
-        )?;
-    }
-    for ml in &parsed.md_links {
-        if ml.is_image {
-            continue;
+            ])?;
         }
-        if let Some((target_raw, heading)) = extract_local_markdown_note_link(&ml.url) {
-            let alias = (!ml.label.trim().is_empty()).then(|| ml.label.trim().to_string());
-            tx.execute(
-                "INSERT INTO links (
-                    vault_id, source_path, target_raw, target_resolved_path, alias, heading, is_embed, link_kind
-                 ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, 0, 'markdown')",
-                params![vault_id, rel_path, target_raw, alias, heading],
-            )?;
+    }
+    if !parsed.md_links.is_empty() {
+        let mut ins_ml = tx.prepare_cached(
+            "INSERT INTO links (
+                vault_id, source_path, target_raw, target_resolved_path, alias, heading, is_embed, link_kind
+             ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, 0, 'markdown')",
+        )?;
+        for ml in &parsed.md_links {
+            if ml.is_image {
+                continue;
+            }
+            if let Some((target_raw, heading)) = extract_local_markdown_note_link(&ml.url) {
+                let alias = (!ml.label.trim().is_empty()).then(|| ml.label.trim().to_string());
+                ins_ml.execute(params![vault_id, rel_path, target_raw, alias, heading])?;
+            }
         }
     }
 
-    tx.execute(
-        "DELETE FROM tags WHERE vault_id = ?1 AND note_path = ?2",
-        params![vault_id, rel_path],
-    )?;
-    for tag in &parsed.tags {
-        tx.execute(
+    tx.prepare_cached("DELETE FROM tags WHERE vault_id = ?1 AND note_path = ?2")?
+        .execute(params![vault_id, rel_path])?;
+    if !parsed.tags.is_empty() {
+        let mut ins_tag = tx.prepare_cached(
             "INSERT OR IGNORE INTO tags (vault_id, note_path, tag) VALUES (?1, ?2, ?3)",
-            params![vault_id, rel_path, tag],
         )?;
+        for tag in &parsed.tags {
+            ins_tag.execute(params![vault_id, rel_path, tag])?;
+        }
     }
 
-    tx.execute(
-        "DELETE FROM headings WHERE vault_id = ?1 AND note_path = ?2",
-        params![vault_id, rel_path],
-    )?;
-    for h in &parsed.headings {
-        tx.execute(
+    tx.prepare_cached("DELETE FROM headings WHERE vault_id = ?1 AND note_path = ?2")?
+        .execute(params![vault_id, rel_path])?;
+    if !parsed.headings.is_empty() {
+        let mut ins_h = tx.prepare_cached(
             "INSERT INTO headings (vault_id, note_path, level, text, line_no)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![vault_id, rel_path, h.level as i64, h.text, h.line_no as i64],
         )?;
+        for h in &parsed.headings {
+            ins_h.execute(params![
+                vault_id,
+                rel_path,
+                h.level as i64,
+                h.text,
+                h.line_no as i64,
+            ])?;
+        }
     }
 
-    tx.execute(
-        "DELETE FROM tasks WHERE vault_id = ?1 AND note_path = ?2",
-        params![vault_id, rel_path],
-    )?;
-    for t in &parsed.tasks {
-        tx.execute(
+    tx.prepare_cached("DELETE FROM tasks WHERE vault_id = ?1 AND note_path = ?2")?
+        .execute(params![vault_id, rel_path])?;
+    if !parsed.tasks.is_empty() {
+        let mut ins_t = tx.prepare_cached(
             "INSERT INTO tasks (vault_id, note_path, line_no, text, checked)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
+        )?;
+        for t in &parsed.tasks {
+            ins_t.execute(params![
                 vault_id,
                 rel_path,
                 t.line_no as i64,
                 t.text,
                 i64::from(t.checked),
-            ],
-        )?;
+            ])?;
+        }
     }
 
     if replace_fts {
-        tx.execute(
-            "DELETE FROM notes_fts WHERE vault_id = ?1 AND rel_path = ?2",
-            params![vault_id, rel_path],
-        )?;
+        tx.prepare_cached("DELETE FROM notes_fts WHERE vault_id = ?1 AND rel_path = ?2")?
+            .execute(params![vault_id, rel_path])?;
     }
-    tx.execute(
+    tx.prepare_cached(
         "INSERT INTO notes_fts (vault_id, rel_path, title, rel_path_text, aliases, tags, body_plain)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![
-            vault_id,
-            rel_path,
-            title,
-            rel_path,
-            aliases_text,
-            tags_text,
-            parsed.body_plain,
-        ],
-    )?;
+    )?
+    .execute(params![
+        vault_id,
+        rel_path,
+        title,
+        rel_path,
+        aliases_text,
+        tags_text,
+        parsed.body_plain,
+    ])?;
     Ok(())
 }
 
@@ -3696,5 +3772,112 @@ mod tests {
             links2[1].target_resolved_path.as_deref(),
             Some("TargetB.md")
         );
+    }
+
+    #[test]
+    fn test_replace_and_move_update_only_affected_paths_without_full_vault_rescan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("Alpha.md"), "# Alpha\n\nOLD_TOKEN\n").unwrap();
+        fs::write(root.join("Referrer.md"), "# Referrer\n\nSee [[Alpha]].\n").unwrap();
+        fs::write(root.join("Untouched.md"), "# Untouched\n\nSteady.\n").unwrap();
+
+        let vault = vault_from_dir(root, Some("PathScopedWriteVault"));
+        let storage = Storage::open_in_memory().unwrap();
+        storage.sync_vault(&vault).unwrap();
+
+        // Mark Untouched.md stale in SQLite: a full sync_vault would overwrite mtime_ms != -1,
+        // while path-scoped sync_paths leaves Untouched.md's row untouched.
+        storage
+            .invalidate_note_mtime(&vault.id, "Untouched.md")
+            .unwrap();
+        assert!(storage.toggle_bookmark(&vault.id, "Alpha.md").unwrap());
+
+        let rep = storage
+            .replace_note_text(&vault, "Alpha.md", "OLD_TOKEN", "NEW_TOKEN")
+            .unwrap();
+        assert!(rep.replaced);
+        assert_eq!(
+            storage
+                .search_notes(&vault.id, "NEW_TOKEN", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            storage
+                .get_note_summary(&vault.id, "Untouched.md")
+                .unwrap()
+                .unwrap()
+                .mtime_ms,
+            -1,
+            "replace_note_text must use path-scoped sync_paths, not a full sync_vault"
+        );
+
+        let moved = storage
+            .move_note_with_links(&vault, "Alpha.md", "Renamed/Beta.md")
+            .unwrap();
+        assert!(moved.moved);
+        assert!(moved.bookmark_preserved);
+        assert_eq!(moved.updated_links_in_notes, 1);
+        assert!(
+            storage
+                .get_note_summary(&vault.id, "Renamed/Beta.md")
+                .unwrap()
+                .unwrap()
+                .is_bookmarked
+        );
+        let bl = storage.get_backlinks(&vault.id, "Renamed/Beta.md").unwrap();
+        assert_eq!(bl.len(), 1);
+        assert_eq!(bl[0].source_path, "Referrer.md");
+        assert_eq!(
+            storage
+                .get_note_summary(&vault.id, "Untouched.md")
+                .unwrap()
+                .unwrap()
+                .mtime_ms,
+            -1,
+            "move_note_with_links must sync only moved and rewritten paths without a second full vault scan"
+        );
+    }
+
+    #[test]
+    fn test_indexed_link_resolution_and_noop_sync_fast_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("Notes")).unwrap();
+        for i in 0..150 {
+            let next = (i + 1) % 150;
+            fs::write(
+                root.join(format!("Notes/N{i:03}.md")),
+                format!(
+                    "---\naliases: [Alias{i:03}]\n---\n# N{i:03}\n\nNext [[Alias{next:03}]] and [md](./N{next:03}.md).\n"
+                ),
+            )
+            .unwrap();
+        }
+        let vault = vault_from_dir(root, Some("BulkIndexVault"));
+        let storage = Storage::open_in_memory().unwrap();
+
+        let s1 = storage.sync_vault(&vault).unwrap();
+        assert_eq!(s1.total_notes, 150);
+        assert_eq!(s1.updated, 150);
+        assert_eq!(s1.total_links, 300);
+
+        // Every wikilink and local markdown link resolved accurately via VaultLinkIndex.
+        let out = storage.get_outgoing_links(&vault, "Notes/N000.md").unwrap();
+        assert_eq!(out.len(), 2);
+        assert!(out
+            .iter()
+            .all(|l| l.target_resolved_path.as_deref() == Some("Notes/N001.md")));
+        let bl = storage.get_backlinks(&vault.id, "Notes/N001.md").unwrap();
+        assert_eq!(bl.len(), 1);
+        assert_eq!(bl[0].source_path, "Notes/N000.md");
+
+        // Second sync with zero disk changes takes the no-op fast path.
+        let s2 = storage.sync_vault(&vault).unwrap();
+        assert_eq!(s2.updated, 0);
+        assert_eq!(s2.removed, 0);
+        assert_eq!(s2.total_notes, 150);
     }
 }

@@ -641,8 +641,12 @@ fn draw_frame(
 }
 
 pub async fn run_tui(cfg: AppConfig, vault: VaultProfile, storage: Storage) -> Result<()> {
-    // Initial synchronous scan so first frame is immediately populated
-    let initial_stats = storage.sync_vault(&vault)?;
+    if !vault.path.is_dir() {
+        anyhow::bail!("Vault directory does not exist: {}", vault.path.display());
+    }
+    // Load existing cached stats from SQLite immediately so frame 0 renders without blocking
+    // on a full filesystem scan; the background watcher runs the single initial reconciliation.
+    let initial_stats = storage.index_stats(&vault, 0, 0, 0, 0).ok();
     let (events_tx, mut events_rx) = mpsc::unbounded_channel::<CoreEvent>();
     let sync_ctrl =
         sync::spawn_vault_watcher(vault.clone(), storage.clone(), cfg.watch_poll_ms, events_tx);
@@ -656,7 +660,7 @@ pub async fn run_tui(cfg: AppConfig, vault: VaultProfile, storage: Storage) -> R
 
     let mut app = AppState::new(cfg.clone(), vault, storage, sync_ctrl);
     app.graphics_caps = graphics_caps;
-    app.last_index_stats = Some(initial_stats);
+    app.last_index_stats = initial_stats;
     let mut ui = UiState::from_config(&cfg);
     if let Ok(sz) = terminal.size() {
         ui.term_width = sz.width;
@@ -690,16 +694,30 @@ pub async fn run_tui(cfg: AppConfig, vault: VaultProfile, storage: Storage) -> R
             continue;
         }
 
-        // Handle external `$EDITOR` launch cleanly (restore terminal -> edit -> reindex -> re-enter)
+        // Handle external `$EDITOR` launch cleanly (restore terminal -> edit -> path-scoped reindex -> re-enter)
         if let Some(edit_path) = app.pending_external_editor.take() {
             drop(reader);
             guard.restore();
             let edit_res = launch_external_editor(&edit_path);
             terminal = guard.resume_after_editor()?;
             reader = EventStream::new();
-            match edit_res.and_then(|()| app.storage.sync_vault(&app.active_vault)) {
+            let sync_res = edit_res.and_then(|()| {
+                let canon_root = std::fs::canonicalize(&app.active_vault.path).ok();
+                if let Some(rel) = crate::vault::fs::rel_path_in_vault(
+                    &app.active_vault.path,
+                    canon_root.as_deref(),
+                    &edit_path,
+                ) {
+                    app.storage
+                        .sync_paths(&app.active_vault, &[rel], &[])
+                        .map(|o| o.stats)
+                } else {
+                    app.storage.sync_vault(&app.active_vault)
+                }
+            });
+            match sync_res {
                 Ok(_) => {
-                    app.reload_from_storage(&mut ui);
+                    app.reload_from_storage_without_html_scan(&mut ui);
                     ui.toasts.success("Reloaded note after external edit");
                 }
                 Err(e) => ui.toasts.error(format!("Editor failed: {e}")),

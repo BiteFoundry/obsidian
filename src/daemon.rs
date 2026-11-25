@@ -244,8 +244,11 @@ pub async fn run_daemon_foreground(cfg: AppConfig, vault_override: Option<String
     let _lock = acquire_lock(&paths.lock_file)?;
 
     let vault = resolve_active_vault(&cfg, vault_override.as_deref())?;
+    if !vault.path.is_dir() {
+        bail!("Vault directory does not exist: {}", vault.path.display());
+    }
     let storage = Storage::open_default()?;
-    let initial_stats = storage.sync_vault(&vault)?;
+    let cached_notes = storage.note_count(&vault.id).unwrap_or(0);
 
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -278,10 +281,7 @@ pub async fn run_daemon_foreground(cfg: AppConfig, vault_override: Option<String
     let sync_ctrl =
         sync::spawn_vault_watcher(vault.clone(), storage.clone(), cfg.watch_poll_ms, events_tx);
 
-    let last_sync = Arc::new(Mutex::new((
-        Some(chrono::Utc::now().to_rfc3339()),
-        initial_stats.total_notes,
-    )));
+    let last_sync = Arc::new(Mutex::new((None, cached_notes)));
     let last_sync_bg = last_sync.clone();
     tokio::spawn(async move {
         while let Some(ev) = events_rx.recv().await {
