@@ -321,6 +321,17 @@ impl ComposerState {
         self.apply_replace(range, "", cursor_after);
     }
 
+    /// Deletes an exact UTF-8 byte range as a single undoable edit, placing cursor at `range.start`.
+    pub fn delete_byte_range(&mut self, range: Range<usize>) {
+        if range.start < range.end
+            && range.end <= self.text.len()
+            && self.text.is_char_boundary(range.start)
+            && self.text.is_char_boundary(range.end)
+        {
+            self.delete_range(range);
+        }
+    }
+
     fn apply_replace(&mut self, range: Range<usize>, inserted: &str, cursor_after: usize) {
         debug_assert!(self.text.get(range.start..range.end).is_some());
         let removed = self.text[range.start..range.end].to_string();

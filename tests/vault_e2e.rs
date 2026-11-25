@@ -2623,7 +2623,7 @@ fn test_inline_editor_external_conflict_protection_clean_reload_and_deleted_file
         .unwrap()
         .composer
         .text()
-        .starts_with("L# EDIT_READY"));
+        .starts_with("# LEDIT_READY"));
 
     fs::write(&note_abs, "# EDIT_READY\n\nExternal v3 must survive!\n").unwrap();
 
@@ -2646,7 +2646,7 @@ fn test_inline_editor_external_conflict_protection_clean_reload_and_deleted_file
             .unwrap()
             .composer
             .text()
-            .starts_with("L# EDIT_READY"),
+            .starts_with("# LEDIT_READY"),
         "local input must remain in open editor on conflict"
     );
     assert!(
@@ -2667,7 +2667,7 @@ fn test_inline_editor_external_conflict_protection_clean_reload_and_deleted_file
         .unwrap()
         .composer
         .text()
-        .starts_with("L# EDIT_READY"));
+        .starts_with("# LEDIT_READY"));
 
     // 2c. FinishInlineEdit (Esc / Done) must also block overwrite and keep local edits open
     app.dispatch(Action::FinishInlineEdit, &mut ui);
@@ -2703,7 +2703,7 @@ fn test_inline_editor_external_conflict_protection_clean_reload_and_deleted_file
         .unwrap()
         .composer
         .text()
-        .starts_with("L# EDIT_READY"));
+        .starts_with("# LEDIT_READY"));
 
     // 4. Attempting QuitConfirm / Quit during a conflict draft must keep app open with draft preserved
     //    and prompt for explicit discard confirmation instead of dropping the draft or recreating the file!
@@ -2729,7 +2729,7 @@ fn test_inline_editor_external_conflict_protection_clean_reload_and_deleted_file
         .unwrap()
         .composer
         .text()
-        .starts_with("L# EDIT_READY"));
+        .starts_with("# LEDIT_READY"));
 
     // Cancelling the discard overlay returns cleanly to the preserved conflict draft
     app.dispatch(Action::CloseOverlay, &mut ui);
@@ -2741,7 +2741,7 @@ fn test_inline_editor_external_conflict_protection_clean_reload_and_deleted_file
         .unwrap()
         .composer
         .text()
-        .starts_with("L# EDIT_READY"));
+        .starts_with("# LEDIT_READY"));
 
     // Explicitly confirming ForceQuitDiscard exits cleanly WITHOUT recreating the deleted file
     app.dispatch(Action::ForceQuitDiscard, &mut ui);

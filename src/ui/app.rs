@@ -3572,7 +3572,7 @@ mod tests {
         let (mut app, mut ui) = make_harness(tmp.path(), "ModeVault");
         app.open_note(&mut ui, "ModeNote.md", false);
 
-        // Pressing `i` enters LivePreview immediately
+        // Pressing `i` enters Rendered WYSIWYG mode immediately (new default)
         let act_i = key_to_action(
             KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
             ui.focus,
@@ -3584,10 +3584,10 @@ mod tests {
         app.dispatch(act_i.unwrap(), &mut ui);
         assert_eq!(
             ui.inline_editor.as_ref().unwrap().mode,
-            EditorMode::LivePreview
+            EditorMode::Rendered
         );
 
-        // Ctrl+M maps to Action::ToggleEditorMode and toggles LivePreview -> Source -> LivePreview
+        // Ctrl+M maps to Action::ToggleEditorMode and cycles Rendered -> LivePreview -> Source -> Rendered
         let act_m = key_to_action(
             KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL),
             ui.focus,
@@ -3597,9 +3597,15 @@ mod tests {
         );
         assert_eq!(act_m, Some(Action::ToggleEditorMode));
         app.dispatch(act_m.unwrap(), &mut ui);
+        assert_eq!(
+            ui.inline_editor.as_ref().unwrap().mode,
+            EditorMode::LivePreview
+        );
+
+        app.dispatch(Action::ToggleEditorMode, &mut ui);
         assert_eq!(ui.inline_editor.as_ref().unwrap().mode, EditorMode::Source);
 
-        // Clicking the `[Src]` pill in the inline header bar toggles back to LivePreview
+        // Clicking the `[Src]` pill in the inline header bar cycles back to Rendered
         let hitmap = draw_frame(&app, &mut ui, 120, 30);
         let pill = hitmap
             .region_of(HitTarget::Button(ButtonId::ToggleEditorMode))
@@ -3613,7 +3619,7 @@ mod tests {
         );
         assert_eq!(
             ui.inline_editor.as_ref().unwrap().mode,
-            EditorMode::LivePreview
+            EditorMode::Rendered
         );
     }
 
@@ -3660,8 +3666,8 @@ mod tests {
         let ed = ui
             .inline_editor
             .as_ref()
-            .expect("clicking rendered paragraph must enter LivePreview immediately");
-        assert_eq!(ed.mode, EditorMode::LivePreview);
+            .expect("clicking rendered paragraph must enter inline editor immediately");
+        assert_eq!(ed.mode, EditorMode::Rendered);
         let (ln, col) = ed.cursor_line_col();
         assert_eq!(ln, 3, "cursor must land on paragraph source line 3");
         assert!(col >= 5, "cursor col should land near clicked column, got {col}");
@@ -3670,14 +3676,14 @@ mod tests {
         app.dispatch(Action::FinishInlineEdit, &mut ui);
         assert!(ui.inline_editor.is_none());
 
-        // 2. Pressing Enter on an ordinary text block enters LivePreview immediately
+        // 2. Pressing Enter on an ordinary text block enters Rendered mode immediately
         ui.focus = Focus::Canvas;
         ui.canvas_selected_block = para_idx;
         app.dispatch(Action::Activate, &mut ui);
         assert!(ui.inline_editor.is_some());
         assert_eq!(
             ui.inline_editor.as_ref().unwrap().mode,
-            EditorMode::LivePreview
+            EditorMode::Rendered
         );
         app.dispatch(Action::FinishInlineEdit, &mut ui);
         assert!(ui.inline_editor.is_none());

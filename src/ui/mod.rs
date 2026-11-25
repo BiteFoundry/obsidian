@@ -296,7 +296,7 @@ fn draw_status_bar(
             area.x + area.width
         };
         let hint =
-            " Esc Done · Ctrl+M Live/Src · Ctrl+S Save · Ctrl+Z/Y Undo/Redo · Ctrl+V Paste · Ctrl+E External $EDITOR";
+            " Esc Done · Ctrl+M Render/Live/Src · Ctrl+S Save · Ctrl+Z/Y Undo/Redo · Ctrl+V Paste · Ctrl+E External $EDITOR";
         frame.render_widget(
             Paragraph::new(Span::styled(
                 truncate_width(hint, left_limit.saturating_sub(area.x) as usize),
