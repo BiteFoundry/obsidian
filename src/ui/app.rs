@@ -42,7 +42,7 @@ use crate::{
             vault_switcher::VaultSwitcherOverlay,
             Overlay, OverlayKind, OverlayOutcome,
         },
-        sidebar::{build_sidebar_entries, SidebarEntry},
+        sidebar::{build_sidebar_entries, tree_parent_index, SidebarEntry},
         theme::Theme,
         toast::ToastQueue,
     },
@@ -159,6 +159,9 @@ pub struct UiState {
     pub graph_selected: usize,
     pub graph_sim: GraphSim,
     pub inspector_selected: usize,
+    /// Whether the last drawn inspector had room for its Outline section. Short terminals hide
+    /// it, and its headings then drop out of inspector keyboard navigation.
+    pub inspector_outline_visible: bool,
     pub inline_editor: Option<InlineNoteEditor>,
     pub overlay: Option<Overlay>,
     pub toasts: ToastQueue,
@@ -195,6 +198,7 @@ impl UiState {
             graph_selected: 0,
             graph_sim: GraphSim::default(),
             inspector_selected: 0,
+            inspector_outline_visible: true,
             inline_editor: None,
             overlay: None,
             toasts: ToastQueue::new(),
@@ -493,8 +497,23 @@ impl AppState {
         }
     }
 
-    fn inspector_item_count(detail: &NoteDetail) -> usize {
-        detail.backlinks.len() + detail.outgoing_links.len() + detail.parsed.headings.len()
+    /// Selectable inspector rows: backlinks, outgoing links, then Outline headings while the
+    /// Outline section is on screen.
+    fn inspector_item_count(detail: &NoteDetail, ui: &UiState) -> usize {
+        let headings = if ui.inspector_outline_visible {
+            detail.parsed.headings.len()
+        } else {
+            0
+        };
+        detail.backlinks.len() + detail.outgoing_links.len() + headings
+    }
+
+    pub fn clamp_inspector_selection(&self, ui: &mut UiState) {
+        let len = self
+            .active_note
+            .as_ref()
+            .map_or(0, |detail| Self::inspector_item_count(detail, ui));
+        ui.inspector_selected = ui.inspector_selected.min(len.saturating_sub(1));
     }
 
     pub fn clamp_selections(&self, ui: &mut UiState) {
@@ -508,8 +527,7 @@ impl AppState {
             let blocks_len = detail.parsed.blocks.len();
             ui.canvas_selected_block = ui.canvas_selected_block.min(blocks_len.saturating_sub(1));
 
-            let inspector_len = Self::inspector_item_count(detail);
-            ui.inspector_selected = ui.inspector_selected.min(inspector_len.saturating_sub(1));
+            self.clamp_inspector_selection(ui);
         } else {
             ui.canvas_selected_block = 0;
             ui.canvas_scroll = 0;
@@ -1577,7 +1595,7 @@ impl AppState {
                 }
                 Focus::Inspector => {
                     if let Some(d) = &self.active_note {
-                        let total = Self::inspector_item_count(d);
+                        let total = Self::inspector_item_count(d, ui);
                         if total > 0 {
                             ui.inspector_selected = (ui.inspector_selected + 1).min(total - 1);
                         }
@@ -1608,7 +1626,7 @@ impl AppState {
                 }
                 Focus::Inspector => {
                     if let Some(d) = &self.active_note {
-                        let total = Self::inspector_item_count(d);
+                        let total = Self::inspector_item_count(d, ui);
                         if total > 0 {
                             ui.inspector_selected = (ui.inspector_selected + 10).min(total - 1);
                         }
@@ -1643,7 +1661,7 @@ impl AppState {
                 }
                 Focus::Inspector => {
                     if let Some(d) = &self.active_note {
-                        ui.inspector_selected = Self::inspector_item_count(d).saturating_sub(1);
+                        ui.inspector_selected = Self::inspector_item_count(d, ui).saturating_sub(1);
                     }
                 }
                 Focus::Canvas | Focus::Overlay => {
@@ -1683,6 +1701,17 @@ impl AppState {
                 Focus::Inspector => self.activate_inspector_selected(ui),
                 Focus::Overlay => {}
             },
+
+            Action::MoveRight
+                if ui.focus == Focus::Sidebar && ui.sidebar_tab == SidebarTab::Files =>
+            {
+                self.files_tree_right(ui);
+            }
+            Action::MoveLeft
+                if ui.focus == Focus::Sidebar && ui.sidebar_tab == SidebarTab::Files =>
+            {
+                self.files_tree_left(ui);
+            }
 
             Action::NavigateBack => {
                 if let Some(prev) = self.history.pop() {
@@ -1818,31 +1847,45 @@ impl AppState {
                 Err(e) => ui.toasts.error(format!("Daily note failed: {e}")),
             },
 
-            Action::ToggleSelectedTask => {
-                if ui.focus == Focus::Sidebar && ui.sidebar_tab == SidebarTab::Tasks {
+            // `Space` / `x` only writes a checkbox the focused pane shows: a sidebar row never
+            // falls through to the open note's (unseen) canvas selection.
+            Action::ToggleSelectedTask => match ui.focus {
+                Focus::Sidebar => {
                     let entries = build_sidebar_entries(self, ui);
-                    if let Some(SidebarEntry::Task {
-                        note_path, line_no, ..
-                    }) = entries.get(ui.sidebar_selected).cloned()
-                    {
-                        self.dispatch_core(Action::ToggleTaskAtLine { note_path, line_no }, ui);
-                    }
-                } else if let Some(d) = &self.active_note {
-                    if let Some(NoteBlock::Task { line_no, .. }) =
-                        d.parsed.blocks.get(ui.canvas_selected_block)
-                    {
-                        let note_path = d.summary.rel_path.clone();
-                        let ln = *line_no;
-                        self.dispatch_core(
-                            Action::ToggleTaskAtLine {
-                                note_path,
-                                line_no: ln,
-                            },
-                            ui,
-                        );
+                    match (ui.sidebar_tab, entries.get(ui.sidebar_selected).cloned()) {
+                        (
+                            SidebarTab::Tasks,
+                            Some(SidebarEntry::Task {
+                                note_path, line_no, ..
+                            }),
+                        ) => {
+                            self.dispatch_core(Action::ToggleTaskAtLine { note_path, line_no }, ui);
+                        }
+                        (SidebarTab::Files, Some(SidebarEntry::Folder { path, .. })) => {
+                            self.toggle_folder(ui, path);
+                        }
+                        _ => {}
                     }
                 }
-            }
+                Focus::Canvas if ui.canvas_mode == CanvasMode::Note => {
+                    if let Some(d) = &self.active_note {
+                        if let Some(NoteBlock::Task { line_no, .. }) =
+                            d.parsed.blocks.get(ui.canvas_selected_block)
+                        {
+                            let note_path = d.summary.rel_path.clone();
+                            let ln = *line_no;
+                            self.dispatch_core(
+                                Action::ToggleTaskAtLine {
+                                    note_path,
+                                    line_no: ln,
+                                },
+                                ui,
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            },
 
             Action::ToggleTaskAtLine { note_path, line_no } => {
                 if let Ok(abs) = safe_vault_path(&self.active_vault.path, &note_path) {
@@ -2483,7 +2526,7 @@ impl AppState {
                         }
                         Focus::Inspector => {
                             if let Some(d) = &self.active_note {
-                                let total = Self::inspector_item_count(d);
+                                let total = Self::inspector_item_count(d, ui);
                                 if total > 0 {
                                     ui.inspector_selected =
                                         (ui.inspector_selected + 1).min(total - 1);
@@ -2508,13 +2551,7 @@ impl AppState {
             return;
         };
         match entry {
-            SidebarEntry::Folder { path, .. } => {
-                if !ui.collapsed_folders.remove(&path) {
-                    ui.collapsed_folders.insert(path);
-                }
-                // Collapsing hides the whole subtree, so keep the selection inside the list.
-                self.clamp_selections(ui);
-            }
+            SidebarEntry::Folder { path, .. } => self.toggle_folder(ui, path),
             SidebarEntry::Note { rel_path, .. } => {
                 self.open_note(ui, &rel_path, true);
                 ui.focus = Focus::Canvas;
@@ -2545,6 +2582,68 @@ impl AppState {
                 self.open_note(ui, &note_path, true);
                 self.dispatch_core(Action::JumpToHeadingLine(line_no), ui);
             }
+        }
+    }
+
+    fn set_folder_expanded(&self, ui: &mut UiState, path: String, expanded: bool) {
+        if expanded {
+            ui.collapsed_folders.remove(&path);
+        } else {
+            ui.collapsed_folders.insert(path);
+        }
+        // Collapsing hides the whole subtree, so keep the selection inside the list.
+        self.clamp_selections(ui);
+    }
+
+    fn toggle_folder(&self, ui: &mut UiState, path: String) {
+        let collapsed = ui.collapsed_folders.contains(&path);
+        self.set_folder_expanded(ui, path, collapsed);
+    }
+
+    /// `Right` in the Files tree: expand a collapsed folder, step into an expanded folder's first
+    /// child, or open the selected file.
+    fn files_tree_right(&mut self, ui: &mut UiState) {
+        let entries = build_sidebar_entries(self, ui);
+        let sel = ui.sidebar_selected;
+        match entries.get(sel) {
+            Some(SidebarEntry::Folder {
+                path,
+                expanded: false,
+                ..
+            }) => self.set_folder_expanded(ui, path.clone(), true),
+            Some(SidebarEntry::Folder {
+                depth,
+                expanded: true,
+                ..
+            }) => {
+                let first_child = entries.get(sel + 1).and_then(SidebarEntry::tree_depth);
+                if first_child.is_some_and(|child_depth| child_depth > *depth) {
+                    ui.sidebar_selected = sel + 1;
+                }
+            }
+            Some(SidebarEntry::Note { .. } | SidebarEntry::HtmlFile { .. }) => {
+                self.activate_sidebar_selected(ui);
+            }
+            _ => {}
+        }
+    }
+
+    /// `Left` in the Files tree: collapse an expanded folder, otherwise select the parent folder.
+    fn files_tree_left(&mut self, ui: &mut UiState) {
+        let entries = build_sidebar_entries(self, ui);
+        let sel = ui.sidebar_selected;
+        match entries.get(sel) {
+            Some(SidebarEntry::Folder {
+                path,
+                expanded: true,
+                ..
+            }) => self.set_folder_expanded(ui, path.clone(), false),
+            Some(_) => {
+                if let Some(parent) = tree_parent_index(&entries, sel) {
+                    ui.sidebar_selected = parent;
+                }
+            }
+            None => {}
         }
     }
 
@@ -3793,5 +3892,330 @@ mod tests {
             rendered.contains("TypedAtBottomVisibleOnEsc"),
             "newly typed text at bottom of note must remain visible immediately after Esc, got:\n{rendered}"
         );
+    }
+
+    fn sidebar_row_label(app: &AppState, ui: &UiState) -> String {
+        match build_sidebar_entries(app, ui).get(ui.sidebar_selected) {
+            Some(SidebarEntry::Folder { path, expanded, .. }) => {
+                format!("F {path} {}", if *expanded { "open" } else { "closed" })
+            }
+            Some(SidebarEntry::Note { rel_path, .. }) => format!("N {rel_path}"),
+            other => format!("{other:?}"),
+        }
+    }
+
+    fn sidebar_row_of(app: &AppState, ui: &UiState, path: &str) -> usize {
+        build_sidebar_entries(app, ui)
+            .iter()
+            .position(|e| match e {
+                SidebarEntry::Folder { path: p, .. } => p == path,
+                SidebarEntry::Note { rel_path, .. } => rel_path == path,
+                _ => false,
+            })
+            .unwrap_or_else(|| panic!("no sidebar row for {path}"))
+    }
+
+    #[test]
+    fn p0_space_in_files_sidebar_toggles_folder_and_never_writes_open_notes_task() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("Projects")).unwrap();
+        fs::write(tmp.path().join("Projects/Plan.md"), "# Plan\n\nBody\n").unwrap();
+        let todo_src = "# Todo\n\n- [ ] Ship it\n";
+        let todo_path = tmp.path().join("Todo.md");
+        fs::write(&todo_path, todo_src).unwrap();
+        let (mut app, mut ui) = make_harness(tmp.path(), "SpaceVault");
+        app.open_note(&mut ui, "Todo.md", false);
+
+        // The canvas selection rests on the task block: exactly the state that used to let a
+        // sidebar Space fall through and flip this checkbox on disk.
+        let task_block = app
+            .active_note
+            .as_ref()
+            .unwrap()
+            .parsed
+            .blocks
+            .iter()
+            .position(|b| matches!(b, NoteBlock::Task { .. }))
+            .expect("task block");
+        ui.canvas_selected_block = task_block;
+        ui.canvas_mode = CanvasMode::Note;
+        ui.focus = Focus::Sidebar;
+        ui.sidebar_tab = SidebarTab::Files;
+        ui.sidebar_selected = sidebar_row_of(&app, &ui, "Projects");
+        assert_eq!(sidebar_row_label(&app, &ui), "F Projects open");
+
+        let space = key_to_action(
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+            ui.focus,
+            ui.canvas_mode,
+            &ui.keymap,
+            false,
+        )
+        .expect("Space maps to an action");
+        assert_eq!(space, Action::ToggleSelectedTask);
+        let task_checked =
+            |app: &AppState| app.active_note.as_ref().unwrap().parsed.tasks[0].checked;
+
+        // Space on a folder row collapses, then re-expands, that folder only.
+        app.dispatch(space.clone(), &mut ui);
+        assert!(ui.collapsed_folders.contains("Projects"));
+        assert_eq!(sidebar_row_label(&app, &ui), "F Projects closed");
+        assert_eq!(fs::read_to_string(&todo_path).unwrap(), todo_src);
+        assert!(!task_checked(&app));
+        app.dispatch(space.clone(), &mut ui);
+        assert!(ui.collapsed_folders.is_empty());
+        assert_eq!(fs::read_to_string(&todo_path).unwrap(), todo_src);
+
+        // Space on a file row is a no-op.
+        ui.sidebar_selected = sidebar_row_of(&app, &ui, "Todo.md");
+        app.dispatch(space.clone(), &mut ui);
+        assert!(ui.collapsed_folders.is_empty());
+        assert_eq!(fs::read_to_string(&todo_path).unwrap(), todo_src);
+
+        // Other sidebar tabs, the inspector and the graph canvas never reach the note either.
+        for tab in [SidebarTab::Tags, SidebarTab::Bookmarks, SidebarTab::Outline] {
+            ui.sidebar_tab = tab;
+            ui.sidebar_selected = 0;
+            app.dispatch(Action::ToggleSelectedTask, &mut ui);
+            assert_eq!(fs::read_to_string(&todo_path).unwrap(), todo_src, "{tab:?}");
+        }
+        ui.focus = Focus::Inspector;
+        app.dispatch(Action::ToggleSelectedTask, &mut ui);
+        ui.focus = Focus::Canvas;
+        ui.canvas_mode = CanvasMode::Graph;
+        app.dispatch(Action::ToggleSelectedTask, &mut ui);
+        assert_eq!(fs::read_to_string(&todo_path).unwrap(), todo_src);
+        assert!(!task_checked(&app));
+
+        // With the note canvas focused, Space still toggles the selected task.
+        ui.canvas_mode = CanvasMode::Note;
+        ui.canvas_selected_block = task_block;
+        app.dispatch(space, &mut ui);
+        assert!(fs::read_to_string(&todo_path)
+            .unwrap()
+            .contains("- [x] Ship it"));
+        assert!(task_checked(&app));
+    }
+
+    #[test]
+    fn p1_left_right_arrows_walk_the_files_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("Projects/Sub")).unwrap();
+        fs::write(tmp.path().join("Projects/p.md"), "# p\n").unwrap();
+        fs::write(tmp.path().join("Projects/Sub/s.md"), "# s\n").unwrap();
+        fs::write(tmp.path().join("root.md"), "# root\n").unwrap();
+        let (mut app, mut ui) = make_harness(tmp.path(), "ArrowVault");
+        ui.focus = Focus::Sidebar;
+        ui.sidebar_tab = SidebarTab::Files;
+
+        let key = |code| {
+            key_to_action(
+                KeyEvent::new(code, KeyModifiers::NONE),
+                Focus::Sidebar,
+                CanvasMode::Note,
+                &KeyMap,
+                false,
+            )
+            .unwrap()
+        };
+        let (left, right) = (key(KeyCode::Left), key(KeyCode::Right));
+        assert_eq!((&left, &right), (&Action::MoveLeft, &Action::MoveRight));
+
+        // Left: file -> its folder, expanded folder -> collapsed, collapsed folder -> parent.
+        ui.sidebar_selected = sidebar_row_of(&app, &ui, "Projects/Sub/s.md");
+        let mut walk = Vec::new();
+        for _ in 0..5 {
+            app.dispatch(left.clone(), &mut ui);
+            walk.push(sidebar_row_label(&app, &ui));
+        }
+        assert_eq!(
+            walk,
+            [
+                "F Projects/Sub open",
+                "F Projects/Sub closed",
+                "F Projects open",
+                "F Projects closed",
+                // A top-level row has no parent: Left stays put.
+                "F Projects closed",
+            ]
+        );
+
+        // Right: collapsed folder -> expanded, expanded folder -> first child, file -> opened.
+        app.dispatch(right.clone(), &mut ui);
+        assert_eq!(sidebar_row_label(&app, &ui), "F Projects open");
+        app.dispatch(right.clone(), &mut ui);
+        assert_eq!(sidebar_row_label(&app, &ui), "N Projects/p.md");
+        app.dispatch(left.clone(), &mut ui);
+        assert_eq!(sidebar_row_label(&app, &ui), "F Projects open");
+
+        app.dispatch(Action::MoveDown, &mut ui);
+        app.dispatch(Action::MoveDown, &mut ui);
+        assert_eq!(sidebar_row_label(&app, &ui), "F Projects/Sub closed");
+        app.dispatch(right.clone(), &mut ui);
+        assert_eq!(sidebar_row_label(&app, &ui), "F Projects/Sub open");
+        app.dispatch(right.clone(), &mut ui);
+        assert_eq!(sidebar_row_label(&app, &ui), "N Projects/Sub/s.md");
+
+        // Root-level file: Left has no parent to go to.
+        app.dispatch(Action::JumpBottom, &mut ui);
+        assert_eq!(sidebar_row_label(&app, &ui), "N root.md");
+        app.dispatch(left.clone(), &mut ui);
+        assert_eq!(sidebar_row_label(&app, &ui), "N root.md");
+
+        // Arrows outside the Files tab leave the tree alone.
+        ui.sidebar_selected = sidebar_row_of(&app, &ui, "Projects");
+        for (focus, tab) in [
+            (Focus::Canvas, SidebarTab::Files),
+            (Focus::Sidebar, SidebarTab::Tags),
+        ] {
+            ui.focus = focus;
+            ui.sidebar_tab = tab;
+            app.dispatch(left.clone(), &mut ui);
+            assert!(ui.collapsed_folders.is_empty(), "{focus:?} {tab:?}");
+        }
+        ui.focus = Focus::Sidebar;
+        ui.sidebar_tab = SidebarTab::Files;
+
+        // Right on a file opens it and moves focus to the canvas.
+        ui.sidebar_selected = sidebar_row_of(&app, &ui, "Projects/Sub/s.md");
+        app.dispatch(right, &mut ui);
+        assert_eq!(
+            app.active_note.as_ref().unwrap().summary.rel_path,
+            "Projects/Sub/s.md"
+        );
+        assert_eq!(ui.focus, Focus::Canvas);
+    }
+
+    #[test]
+    fn p1_deeply_nested_tree_rows_keep_chevron_and_name_on_screen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let deep_dir = tmp.path().join("A/B/C/D/E/F/G/H");
+        fs::create_dir_all(&deep_dir).unwrap();
+        fs::write(deep_dir.join("DeepNote.md"), "# DeepNote\n").unwrap();
+        let (app, mut ui) = make_harness(tmp.path(), "DeepVault");
+        ui.show_sidebar = true;
+        ui.sidebar_tab = SidebarTab::Files;
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 34)).unwrap();
+        terminal
+            .draw(|f| {
+                let _ = ui::draw(f, &app, &mut ui);
+            })
+            .unwrap();
+        // 120 cols -> 24-col sidebar whose right border sits at x = 23.
+        let buf = terminal.backend().buffer();
+        let rows: Vec<String> = (0..34u16)
+            .map(|y| (0..23u16).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        let sidebar = rows.join("\n");
+        assert!(
+            rows.iter().any(|r| r.contains("▾ H (1)")),
+            "deepest folder chevron, name and count must stay visible:\n{sidebar}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("▾ A (1)")),
+            "parent-only top folder counts its descendant note:\n{sidebar}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("DeepNote")),
+            "depth-8 note title must not be clipped:\n{sidebar}"
+        );
+    }
+
+    #[test]
+    fn p1_nested_tag_rows_synthesize_parents_and_match_filter_counts() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("One.md"), "# One\n\n#a/b/c\n").unwrap();
+        fs::write(tmp.path().join("Two.md"), "# Two\n\n#a/b #a/b/d\n").unwrap();
+        fs::write(tmp.path().join("Three.md"), "# Three\n\n#a/x #other\n").unwrap();
+        fs::write(tmp.path().join("Four.md"), "# Four\n\n#other\n").unwrap();
+        let (mut app, mut ui) = make_harness(tmp.path(), "NestedTagVault");
+        app.dispatch(Action::SetSidebarTab(SidebarTab::Tags), &mut ui);
+
+        let tag_rows = |app: &AppState, ui: &UiState| -> Vec<(String, usize)> {
+            build_sidebar_entries(app, ui)
+                .into_iter()
+                .filter_map(|e| match e {
+                    SidebarEntry::Tag { tag, count, .. } => Some((tag, count)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let rows = tag_rows(&app, &ui);
+        assert_eq!(
+            rows,
+            [
+                ("a".to_string(), 3),
+                ("a/b".to_string(), 2),
+                ("other".to_string(), 2),
+                ("a/b/c".to_string(), 1),
+                ("a/b/d".to_string(), 1),
+                ("a/x".to_string(), 1),
+            ]
+        );
+
+        // Selecting any row lists exactly as many notes as that row displayed.
+        for (idx, (tag, count)) in rows.iter().enumerate() {
+            ui.sidebar_selected = idx;
+            app.dispatch(Action::Activate, &mut ui);
+            let entries = build_sidebar_entries(&app, &ui);
+            assert_eq!(
+                entries.first(),
+                Some(&SidebarEntry::TagHeader {
+                    tag: tag.clone(),
+                    count: *count,
+                }),
+                "#{tag}"
+            );
+            let listed = entries
+                .iter()
+                .filter(|e| matches!(e, SidebarEntry::Note { .. }))
+                .count();
+            assert_eq!(listed, *count, "#{tag}");
+            app.dispatch(Action::ClearTagFilter, &mut ui);
+        }
+    }
+
+    #[test]
+    fn p1_short_inspector_hides_outline_from_keyboard_selection() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("Doc.md"),
+            "# Doc\n\n## One\n\nSee [[Other]].\n\n## Two\n\nText.\n",
+        )
+        .unwrap();
+        fs::write(tmp.path().join("Other.md"), "# Other\n\nBack to [[Doc]].\n").unwrap();
+        let (mut app, mut ui) = make_harness(tmp.path(), "ShortInspectorVault");
+        app.open_note(&mut ui, "Doc.md", false);
+        let detail = app.active_note.as_ref().unwrap();
+        let links = detail.backlinks.len() + detail.outgoing_links.len();
+        let headings = detail.parsed.headings.len();
+        assert!(links > 0 && headings > 0);
+        ui.show_inspector = true;
+        ui.focus = Focus::Inspector;
+
+        // Tall terminal: the Outline is shown and its headings are selectable.
+        let tall = draw_frame(&app, &mut ui, 120, 34);
+        assert!(ui.inspector_outline_visible);
+        assert!(tall.region_of(HitTarget::InspectorOutline(0)).is_some());
+        app.dispatch(Action::JumpBottom, &mut ui);
+        assert_eq!(ui.inspector_selected, links + headings - 1);
+
+        // Short terminal (inspector < 18 rows): the Outline is hidden, so a selection inside it
+        // is pulled back onto the last link and navigation can no longer reach the headings.
+        let short = draw_frame(&app, &mut ui, 120, 18);
+        assert!(!ui.inspector_outline_visible);
+        assert!(short.region_of(HitTarget::InspectorOutline(0)).is_none());
+        assert_eq!(ui.inspector_selected, links - 1);
+        for action in [Action::JumpBottom, Action::MoveDown, Action::PageDown] {
+            app.dispatch(action.clone(), &mut ui);
+            assert_eq!(ui.inspector_selected, links - 1, "{action:?}");
+        }
+
+        // Growing the terminal again brings the headings back.
+        draw_frame(&app, &mut ui, 120, 34);
+        assert!(ui.inspector_outline_visible);
+        app.dispatch(Action::JumpBottom, &mut ui);
+        assert_eq!(ui.inspector_selected, links + headings - 1);
     }
 }

@@ -141,6 +141,10 @@ pub const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
                 "Cycle focus across Sidebar, Canvas, and Inspector",
             ),
             ("Backspace / Alt+Left", "Navigate back in note history"),
+            (
+                "← / → / Space",
+                "Files tree: collapse or go to parent / expand, enter or open / fold",
+            ),
         ],
     ),
     (

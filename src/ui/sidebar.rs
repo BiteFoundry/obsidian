@@ -1,7 +1,7 @@
 //! Left Navigation Sidebar (`[` / `Ctrl+B`):
 //! 5 switchable tabs: `1 Files` · `2 Tags` · `3 Bookmarks` · `4 Outline` · `5 Tasks`.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -13,7 +13,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    models::{NoteSummary, SidebarTab},
+    models::{NoteSummary, SidebarTab, TagCount},
     ui::{
         app::{AppState, Focus, UiState},
         hitmap::{HitMap, HitTarget},
@@ -65,6 +65,75 @@ pub enum SidebarEntry {
     },
 }
 
+impl SidebarEntry {
+    /// Nesting level of a Files-tree row (folders, notes and HTML files); `None` for other rows.
+    pub fn tree_depth(&self) -> Option<usize> {
+        match self {
+            SidebarEntry::Folder { depth, .. }
+            | SidebarEntry::Note { depth, .. }
+            | SidebarEntry::HtmlFile { depth, .. } => Some(*depth),
+            _ => None,
+        }
+    }
+}
+
+/// Row of the folder that holds the Files-tree row at `idx`, or `None` for a top-level row.
+///
+/// The tree is emitted parent-first, so every row between a folder and one of its descendants
+/// is nested deeper than that folder: the nearest earlier folder row that is shallower than
+/// `idx` is its parent.
+pub fn tree_parent_index(entries: &[SidebarEntry], idx: usize) -> Option<usize> {
+    let depth = entries.get(idx)?.tree_depth()?;
+    if depth == 0 {
+        return None;
+    }
+    entries[..idx]
+        .iter()
+        .rposition(|e| matches!(e, SidebarEntry::Folder { depth: d, .. } if *d < depth))
+}
+
+/// Deepest indent level the Files tree draws; deeper rows line up at this level.
+const MAX_TREE_INDENT: usize = 5;
+/// Columns a tree row keeps clear of indentation for its marker, chevron or icon and its name.
+const MIN_TREE_LABEL_COLS: usize = 12;
+
+/// Indent levels (two columns each) drawn for a tree row at `depth` in a list `width` columns
+/// wide, capped so a deeply nested row never pushes its chevron and name off-screen.
+fn tree_indent_levels(depth: usize, width: usize) -> usize {
+    depth
+        .min(MAX_TREE_INDENT)
+        .min(width.saturating_sub(MIN_TREE_LABEL_COLS) / 2)
+}
+
+/// Tag rows for the Tags tab: every tag in use plus each missing parent prefix (`a` and `a/b`
+/// for `a/b/c`). A row counts the distinct notes the tag filter lists for it (a tag equal to the
+/// row or nested under `row/`), so a row's count always matches what selecting it shows.
+/// Ordered like the index's tag list: most notes first, then by name, which keeps a parent
+/// above its children.
+pub fn nested_tag_counts(notes: &[NoteSummary]) -> Vec<TagCount> {
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for note in notes {
+        seen.clear();
+        for tag in &note.tags {
+            for prefix in folder_ancestors(tag).chain(std::iter::once(tag.as_str())) {
+                if seen.insert(prefix) {
+                    *counts.entry(prefix).or_default() += 1;
+                }
+            }
+        }
+    }
+    let mut out: Vec<TagCount> = counts
+        .into_iter()
+        .map(|(tag, count)| TagCount {
+            tag: tag.to_string(),
+            count,
+        })
+        .collect();
+    out.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.tag.cmp(&b.tag)));
+    out
+}
+
 pub fn selection_offset(selected: usize, visible: usize, total: usize) -> usize {
     if visible == 0 || total <= visible {
         return 0;
@@ -103,14 +172,10 @@ pub fn build_sidebar_entries(app: &AppState, ui: &UiState) -> Vec<SidebarEntry> 
                     });
                 }
             }
-            for tc in &app.tags {
-                let is_active = ui
-                    .active_tag_filter
-                    .as_deref()
-                    .map(|f| f == tc.tag)
-                    .unwrap_or(false);
+            for tc in nested_tag_counts(&app.notes) {
+                let is_active = ui.active_tag_filter.as_deref() == Some(tc.tag.as_str());
                 out.push(SidebarEntry::Tag {
-                    tag: tc.tag.clone(),
+                    tag: tc.tag,
                     count: tc.count,
                     active_filter: is_active,
                 });
@@ -159,6 +224,7 @@ pub fn build_sidebar_entries(app: &AppState, ui: &UiState) -> Vec<SidebarEntry> 
 }
 
 /// Proper ancestor folders of `folder`, outermost first: `A/B/C` yields `A` then `A/B`.
+/// Nested tags (`a/b/c`) share the same `/` hierarchy.
 fn folder_ancestors(folder: &str) -> impl Iterator<Item = &str> {
     folder
         .match_indices('/')
@@ -190,6 +256,19 @@ fn build_file_tree(
         by_folder.entry(ancestor).or_default();
     }
 
+    // A folder counts every note and HTML file in its whole subtree, so a parent-only folder
+    // (`A` holding just `A/B/n.md`) shows (1) rather than (0).
+    let mut subtree_counts: HashMap<&str, usize> = HashMap::new();
+    for (folder, items) in &by_folder {
+        let own = items.len() + html_by_folder.get(folder).map_or(0, Vec::len);
+        if own == 0 {
+            continue;
+        }
+        for scope in folder_ancestors(folder).chain(std::iter::once(folder.as_str())) {
+            *subtree_counts.entry(scope).or_default() += own;
+        }
+    }
+
     // Order by path components, not by the raw string: `-` sorts before `/`, so a plain string
     // order would put `Projects-old` between `Projects` and `Projects/Sub`.
     let mut folders: Vec<&String> = by_folder.keys().filter(|f| !f.is_empty()).collect();
@@ -212,7 +291,7 @@ fn build_file_tree(
             name: display,
             depth,
             expanded,
-            count: items.len() + html_items.len(),
+            count: subtree_counts.get(folder.as_str()).copied().unwrap_or(0),
         });
         if expanded {
             for n in items {
@@ -310,12 +389,14 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
         Rect::new(tab_area.x, tab_area.y, tab_area.width, 1),
     );
 
+    let entries = build_sidebar_entries(app, ui);
+
     // Subheader line naming active tab
     let sub_title = match ui.sidebar_tab {
         SidebarTab::Files => format!(" Files ({}) ", app.notes.len()),
         SidebarTab::Tags => match &ui.active_tag_filter {
             Some(t) => format!(" Tag #{t} (Esc clear) "),
-            None => format!(" Tags ({}) ", app.tags.len()),
+            None => format!(" Tags ({}) ", entries.len()),
         },
         SidebarTab::Bookmarks => {
             let cnt = app.notes.iter().filter(|n| n.is_bookmarked).count();
@@ -351,7 +432,6 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
 
     // 2. Entries list
     let list_area = chunks[1];
-    let entries = build_sidebar_entries(app, ui);
     if entries.is_empty() {
         let empty_msg = match ui.sidebar_tab {
             SidebarTab::Files => "  No notes in vault.",
@@ -403,7 +483,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
                 count,
                 ..
             } => {
-                let indent = "  ".repeat(*depth);
+                let indent = "  ".repeat(tree_indent_levels(*depth, w));
                 let arrow = if *expanded { "▾" } else { "▸" };
                 let count_suffix = format!(" ({count})");
                 let count_w = UnicodeWidthStr::width(count_suffix.as_str());
@@ -426,7 +506,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
                 is_bookmarked,
                 ..
             } => {
-                let indent = "  ".repeat(*depth);
+                let indent = "  ".repeat(tree_indent_levels(*depth, w));
                 let marker = if is_active_note {
                     "▎"
                 } else if is_sel && focused {
@@ -471,7 +551,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
                 ])
             }
             SidebarEntry::HtmlFile { title, depth, .. } => {
-                let indent = "  ".repeat(*depth);
+                let indent = "  ".repeat(tree_indent_levels(*depth, w));
                 let marker = if is_sel && focused { "▸" } else { " " };
                 let avail = w.saturating_sub(indent.len() + 9);
                 Line::from(vec![
@@ -674,7 +754,7 @@ mod tests {
             [
                 "F Other d0 open (1)",
                 "N Other/o.md d1",
-                "F Projects d0 closed (1)",
+                "F Projects d0 closed (3)",
                 "N root.md d0",
             ]
         );
@@ -684,9 +764,9 @@ mod tests {
             [
                 "F Other d0 open (1)",
                 "N Other/o.md d1",
-                "F Projects d0 open (1)",
+                "F Projects d0 open (3)",
                 "N Projects/p.md d1",
-                "F Projects/Sub d1 open (1)",
+                "F Projects/Sub d1 open (2)",
                 "N Projects/Sub/s.md d2",
                 "F Projects/Sub/Deep d2 open (1)",
                 "N Projects/Sub/Deep/d.md d3",
@@ -702,9 +782,9 @@ mod tests {
             [
                 "F Other d0 open (1)",
                 "N Other/o.md d1",
-                "F Projects d0 open (1)",
+                "F Projects d0 open (3)",
                 "N Projects/p.md d1",
-                "F Projects/Sub d1 closed (1)",
+                "F Projects/Sub d1 closed (2)",
                 "N root.md d0",
             ]
         );
@@ -717,11 +797,155 @@ mod tests {
 
     #[test]
     fn obs11_synthesizes_missing_ancestors() {
+        // A parent-only folder counts its descendants: `A` holds no file itself but shows (1).
         assert_eq!(
             tree(&["A/B/n.md"], &[], &[]),
-            ["F A d0 open (0)", "F A/B d1 open (1)", "N A/B/n.md d2"]
+            ["F A d0 open (1)", "F A/B d1 open (1)", "N A/B/n.md d2"]
         );
-        assert_eq!(tree(&["A/B/n.md"], &[], &["A"]), ["F A d0 closed (0)"]);
+        assert_eq!(tree(&["A/B/n.md"], &[], &["A"]), ["F A d0 closed (1)"]);
+    }
+
+    #[test]
+    fn obs11_folder_count_is_recursive_over_notes_and_html() {
+        let notes = ["A/a.md", "A/B/b1.md", "A/B/b2.md", "A/B/C/c.md", "Z/z.md"];
+        let html_files = ["A/B/C/page.html", "A/site.html"];
+        assert_eq!(
+            tree(&notes, &html_files, &[]),
+            [
+                "F A d0 open (6)",
+                "N A/a.md d1",
+                "H A/site.html d1",
+                "F A/B d1 open (4)",
+                "N A/B/b1.md d2",
+                "N A/B/b2.md d2",
+                "F A/B/C d2 open (2)",
+                "N A/B/C/c.md d3",
+                "H A/B/C/page.html d3",
+                "F Z d0 open (1)",
+                "N Z/z.md d1",
+            ]
+        );
+        // Collapsing does not change what a folder counts.
+        assert_eq!(
+            tree(&notes, &html_files, &["A/B"])[..4],
+            [
+                "F A d0 open (6)",
+                "N A/a.md d1",
+                "H A/site.html d1",
+                "F A/B d1 closed (4)",
+            ]
+        );
+    }
+
+    #[test]
+    fn tree_parent_index_finds_enclosing_folder() {
+        let notes: Vec<NoteSummary> = ["A/a.md", "A/B/b.md", "A/B/C/c.md", "r.md"]
+            .iter()
+            .map(|p| note(p))
+            .collect();
+        let entries = build_file_tree(&notes, &[], &HashSet::new());
+        let row = |path: &str| {
+            entries
+                .iter()
+                .position(|e| match e {
+                    SidebarEntry::Folder { path: p, .. } => p == path,
+                    SidebarEntry::Note { rel_path, .. } => rel_path == path,
+                    _ => false,
+                })
+                .unwrap()
+        };
+        assert_eq!(tree_parent_index(&entries, row("A")), None);
+        assert_eq!(tree_parent_index(&entries, row("A/a.md")), Some(row("A")));
+        assert_eq!(tree_parent_index(&entries, row("A/B")), Some(row("A")));
+        assert_eq!(
+            tree_parent_index(&entries, row("A/B/b.md")),
+            Some(row("A/B"))
+        );
+        assert_eq!(tree_parent_index(&entries, row("A/B/C")), Some(row("A/B")));
+        assert_eq!(
+            tree_parent_index(&entries, row("A/B/C/c.md")),
+            Some(row("A/B/C"))
+        );
+        assert_eq!(tree_parent_index(&entries, row("r.md")), None);
+        assert_eq!(tree_parent_index(&entries, entries.len()), None);
+    }
+
+    #[test]
+    fn tree_indent_is_capped_for_deep_rows_and_narrow_lists() {
+        assert_eq!(tree_indent_levels(0, 29), 0);
+        assert_eq!(tree_indent_levels(3, 29), 3);
+        // Never deeper than MAX_TREE_INDENT ...
+        assert_eq!(tree_indent_levels(12, 120), MAX_TREE_INDENT);
+        // ... and always leaving MIN_TREE_LABEL_COLS for the chevron/icon and name.
+        assert_eq!(tree_indent_levels(12, 21), 4);
+        assert_eq!(tree_indent_levels(12, 12), 0);
+        for width in 0..40 {
+            for depth in 0..20 {
+                let indent_cols = 2 * tree_indent_levels(depth, width);
+                assert!(indent_cols <= width.saturating_sub(MIN_TREE_LABEL_COLS));
+            }
+        }
+    }
+
+    fn tagged(rel_path: &str, tags: &[&str]) -> NoteSummary {
+        NoteSummary {
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+            ..note(rel_path)
+        }
+    }
+
+    #[test]
+    fn nested_tags_synthesize_parents_with_filter_matching_counts() {
+        let notes = [
+            tagged("one.md", &["a/b/c"]),
+            // Two tags under `a/b` on one note still count that note once for `a` and `a/b`.
+            tagged("two.md", &["a/b", "a/b/d"]),
+            tagged("three.md", &["a/x", "other"]),
+            tagged("four.md", &["other"]),
+            tagged("plain.md", &[]),
+        ];
+        let rows: Vec<(String, usize)> = nested_tag_counts(&notes)
+            .into_iter()
+            .map(|tc| (tc.tag, tc.count))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("a".to_string(), 3),
+                ("a/b".to_string(), 2),
+                ("other".to_string(), 2),
+                ("a/b/c".to_string(), 1),
+                ("a/b/d".to_string(), 1),
+                ("a/x".to_string(), 1),
+            ]
+        );
+        // Every row's count equals the notes the tag filter (`t == tag || t under tag/`) lists.
+        for (tag, count) in &rows {
+            let listed = notes
+                .iter()
+                .filter(|n| {
+                    n.tags
+                        .iter()
+                        .any(|t| t == tag || t.starts_with(&format!("{tag}/")))
+                })
+                .count();
+            assert_eq!(listed, *count, "count mismatch for #{tag}");
+        }
+        // A sibling that merely shares a prefix string is not nested: `ab` is not under `a`.
+        let rows = nested_tag_counts(&[tagged("n.md", &["ab"]), tagged("m.md", &["a"])]);
+        assert_eq!(
+            rows,
+            [
+                TagCount {
+                    tag: "a".into(),
+                    count: 1
+                },
+                TagCount {
+                    tag: "ab".into(),
+                    count: 1
+                },
+            ]
+        );
     }
 
     #[test]
@@ -733,7 +957,7 @@ mod tests {
                 &[]
             ),
             [
-                "F Projects d0 open (1)",
+                "F Projects d0 open (2)",
                 "N Projects/p.md d1",
                 "F Projects/Sub d1 open (1)",
                 "N Projects/Sub/s.md d2",
@@ -750,7 +974,7 @@ mod tests {
         assert_eq!(
             tree(&notes, &html_files, &[]),
             [
-                "F Projects d0 open (1)",
+                "F Projects d0 open (2)",
                 "N Projects/p.md d1",
                 "F Projects/Site d1 open (1)",
                 "H Projects/Site/index.html d2",
@@ -759,7 +983,7 @@ mod tests {
         );
         assert_eq!(
             tree(&notes, &html_files, &["Projects"]),
-            ["F Projects d0 closed (1)", "H home.html d0"]
+            ["F Projects d0 closed (2)", "H home.html d0"]
         );
     }
 

@@ -61,7 +61,18 @@ pub fn backlinks_scroll_offset(
     start
 }
 
-pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap: &mut HitMap) {
+/// Minimum inspector height that leaves room for the Outline section; shorter panes hide it.
+pub const OUTLINE_MIN_HEIGHT: u16 = 18;
+
+/// Draws the inspector and returns whether its Outline section was shown: on a short pane it is
+/// hidden, and its headings must then drop out of keyboard navigation.
+pub fn draw(
+    frame: &mut Frame,
+    area: Rect,
+    app: &AppState,
+    ui: &UiState,
+    hitmap: &mut HitMap,
+) -> bool {
     let theme = &ui.theme;
     let focused = ui.focus == Focus::Inspector;
 
@@ -74,7 +85,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
     hitmap.add(area, HitTarget::Pane(Focus::Inspector));
 
     if inner.width < 10 || inner.height < 6 {
-        return;
+        return false;
     }
 
     let Some(detail) = app.active_note.as_ref() else {
@@ -86,7 +97,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
             .wrap(Wrap { trim: false }),
             inner,
         );
-        return;
+        return false;
     };
 
     let w = inner.width as usize;
@@ -153,7 +164,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
         .min(inner.height.saturating_sub(4))
         .max(4);
 
-    let show_outline = inner.height >= 18;
+    let show_outline = inner.height >= OUTLINE_MIN_HEIGHT;
     let chunks = if show_outline {
         Layout::default()
             .direction(Direction::Vertical)
@@ -176,9 +187,14 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
             .split(inner)
     };
 
+    let outline_visible = show_outline && chunks[2].height >= 3;
     let total_bl = detail.backlinks.len();
     let total_ol = detail.outgoing_links.len();
-    let total_h = detail.parsed.headings.len();
+    let total_h = if outline_visible {
+        detail.parsed.headings.len()
+    } else {
+        0
+    };
     let total_items = total_bl + total_ol + total_h;
     let sel = ui.inspector_selected.min(total_items.saturating_sub(1));
 
@@ -353,7 +369,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
     }
 
     // 3. Live Outline & Tags (updates on every keystroke in inline edit mode!)
-    if show_outline && chunks[2].height >= 3 {
+    if outline_visible {
         let out_area = chunks[2];
         let heading_cnt = detail.parsed.headings.len();
         let outline_base = total_bl + total_ol;
@@ -488,6 +504,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
             .style(Style::default().bg(theme.bg_card)),
         stats_inner,
     );
+    outline_visible
 }
 
 fn format_mtime_short(mtime_ms: i64) -> String {

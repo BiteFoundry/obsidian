@@ -248,7 +248,11 @@ fn draw_workspace(
     }
 
     if show_right {
-        inspector::draw(frame, panes[pane_idx], app, ui, hitmap);
+        let outline_visible = inspector::draw(frame, panes[pane_idx], app, ui, hitmap);
+        ui.inspector_outline_visible = outline_visible;
+        // A pane too short for the Outline drops its headings from the selectable items, so a
+        // selection left there by a taller terminal moves back onto a visible row.
+        app.clamp_inspector_selection(ui);
     }
 }
 
