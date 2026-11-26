@@ -1,6 +1,6 @@
 {
   "name": "@bitefoundry/obsidian-win32-x64",
-  "version": "0.4.7",
+  "version": "0.4.8",
   "description": "Prebuilt bitefoundry-obsidian binary for Windows x64",
   "repository": {
     "type": "git",
