@@ -55,6 +55,7 @@ impl AppState {
                 self.push_history_entry(previous);
                 self.cache_inline_images(&detail, ui);
                 self.active_note = Some(detail);
+                self.bump_data_gen();
                 ui.canvas_mode = CanvasMode::Note;
                 ui.canvas_selected_block = 0;
                 ui.canvas_scroll = 0;

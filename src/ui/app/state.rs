@@ -1,6 +1,7 @@
 //! Core `AppState`, `UiState`, focus/canvas mode enums, and constructors.
 
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet},
     path::PathBuf,
 };
@@ -20,7 +21,9 @@ use crate::{
         hitmap::HitMap,
         inline_editor::InlineNoteEditor,
         keymap::KeyMap,
+        note_view::CanvasLinesCache,
         overlays::Overlay,
+        sidebar::SidebarTreeCache,
         theme::Theme,
         toast::ToastQueue,
     },
@@ -86,6 +89,7 @@ pub struct AppState {
     pub last_served_html_url: Option<String>,
     pub last_index_stats: Option<IndexStats>,
     pub pending_external_editor: Option<PathBuf>,
+    pub(crate) data_gen: u64,
 }
 
 pub struct UiState {
@@ -123,6 +127,8 @@ pub struct UiState {
     pub should_quit: bool,
     pub last_hitmap: HitMap,
     pub last_note_content_area: ratatui::layout::Rect,
+    pub(crate) sidebar_tree_cache: RefCell<Option<SidebarTreeCache>>,
+    pub(crate) canvas_lines_cache: RefCell<Option<CanvasLinesCache>>,
 }
 
 impl UiState {
@@ -160,6 +166,8 @@ impl UiState {
             should_quit: false,
             last_hitmap: HitMap::new(),
             last_note_content_area: ratatui::layout::Rect::default(),
+            sidebar_tree_cache: RefCell::new(None),
+            canvas_lines_cache: RefCell::new(None),
         }
     }
 
@@ -220,7 +228,12 @@ impl AppState {
             last_served_html_url: None,
             last_index_stats: None,
             pending_external_editor: None,
+            data_gen: 0,
         }
     }
 
+    #[inline]
+    pub(crate) fn bump_data_gen(&mut self) {
+        self.data_gen = self.data_gen.wrapping_add(1);
+    }
 }

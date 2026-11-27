@@ -19,7 +19,8 @@ use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::{
     event::{
         DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent,
-        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     execute, queue,
     terminal::{
@@ -602,8 +603,22 @@ fn draw_frame(
             let _ = ui::draw(f, app, ui);
         })?;
 
+        enum DeferredPixelSource {
+            Direct(String),
+            CacheFull {
+                base_key: String,
+            },
+            CacheCrop {
+                base_key: String,
+                sx: u16,
+                sy: u16,
+                vw: u16,
+                vh: u16,
+            },
+        }
+
         let mut desired: Vec<ActivePixelGraphic> = Vec::new();
-        let mut resolved_payloads: Vec<(ActivePixelGraphic, String)> = Vec::new();
+        let mut deferred_sources: Vec<DeferredPixelSource> = Vec::new();
 
         for pending in std::mem::take(&mut ui.pending_pixel_graphics) {
             if !pixel_graphics_allowed_for_overlays(ui.overlay.as_ref(), &pending.cache_key) {
@@ -634,8 +649,8 @@ fn draw_frame(
                     rows: fit_h,
                     payload_len: direct_payload.len(),
                 };
-                desired.push(graphic.clone());
-                resolved_payloads.push((graphic, direct_payload));
+                desired.push(graphic);
+                deferred_sources.push(DeferredPixelSource::Direct(direct_payload));
                 continue;
             }
 
@@ -645,45 +660,99 @@ fn draw_frame(
 
             let (base_key, crop) = parse_pixel_key(&pending.cache_key);
             if let Some(rendered) = app.preview_cache.get(base_key) {
-                let resolved: Option<(Cow<'_, str>, u16, u16)> =
+                // Plan transition using O(1) cell dimensions BEFORE any expensive PNG/Sixel
+                // viewport crop encoding; payloads are only built when `plan.emit_desired` is true.
+                let planned: Option<(u16, u16, usize, DeferredPixelSource)> =
                     if let Some((sx, sy, vw, vh)) = crop {
                         let eff_vw = vw.min(safe_max_w);
                         let eff_vh = vh.min(safe_max_h);
-                        rendered
-                            .viewport_pixel_payload(sx, sy, eff_vw, eff_vh)
-                            .map(|(p, dw, dh)| (Cow::Owned(p), dw, dh))
-                            .or_else(|| {
-                                if rendered.cols <= eff_vw && rendered.rows <= eff_vh {
-                                    rendered
-                                        .pixel_payload
-                                        .as_deref()
-                                        .map(|p| (Cow::Borrowed(p), rendered.cols, rendered.rows))
-                                } else {
-                                    None
-                                }
+                        if sx == 0 && sy == 0 && rendered.cols <= eff_vw && rendered.rows <= eff_vh
+                        {
+                            rendered.pixel_payload.as_deref().map(|p| {
+                                (
+                                    rendered.cols,
+                                    rendered.rows,
+                                    p.len(),
+                                    DeferredPixelSource::CacheFull {
+                                        base_key: base_key.to_string(),
+                                    },
+                                )
                             })
+                        } else {
+                            rendered
+                                .viewport_pixel_dims(sx, sy, eff_vw, eff_vh)
+                                .map(|(dw, dh)| {
+                                    (
+                                        dw,
+                                        dh,
+                                        0,
+                                        DeferredPixelSource::CacheCrop {
+                                            base_key: base_key.to_string(),
+                                            sx,
+                                            sy,
+                                            vw: eff_vw,
+                                            vh: eff_vh,
+                                        },
+                                    )
+                                })
+                                .or_else(|| {
+                                    if rendered.cols <= eff_vw && rendered.rows <= eff_vh {
+                                        rendered.pixel_payload.as_deref().map(|p| {
+                                            (
+                                                rendered.cols,
+                                                rendered.rows,
+                                                p.len(),
+                                                DeferredPixelSource::CacheFull {
+                                                    base_key: base_key.to_string(),
+                                                },
+                                            )
+                                        })
+                                    } else {
+                                        None
+                                    }
+                                })
+                        }
                     } else if rendered.cols <= fit_w && rendered.rows <= fit_h {
-                        rendered
-                            .pixel_payload
-                            .as_deref()
-                            .map(|p| (Cow::Borrowed(p), rendered.cols, rendered.rows))
+                        rendered.pixel_payload.as_deref().map(|p| {
+                            (
+                                rendered.cols,
+                                rendered.rows,
+                                p.len(),
+                                DeferredPixelSource::CacheFull {
+                                    base_key: base_key.to_string(),
+                                },
+                            )
+                        })
                     } else {
                         rendered
-                            .viewport_pixel_payload(0, 0, fit_w, fit_h)
-                            .map(|(p, dw, dh)| (Cow::Owned(p), dw, dh))
+                            .viewport_pixel_dims(0, 0, fit_w, fit_h)
+                            .map(|(dw, dh)| {
+                                (
+                                    dw,
+                                    dh,
+                                    0,
+                                    DeferredPixelSource::CacheCrop {
+                                        base_key: base_key.to_string(),
+                                        sx: 0,
+                                        sy: 0,
+                                        vw: fit_w,
+                                        vh: fit_h,
+                                    },
+                                )
+                            })
                     };
 
-                if let Some((payload, draw_cols, draw_rows)) = resolved {
+                if let Some((draw_cols, draw_rows, payload_len, source)) = planned {
                     let graphic = ActivePixelGraphic {
                         cache_key: pending.cache_key,
                         rect: Rect::new(pending.rect.x, pending.rect.y, draw_cols, draw_rows),
                         protocol: pending.protocol,
                         cols: draw_cols,
                         rows: draw_rows,
-                        payload_len: payload.len(),
+                        payload_len,
                     };
-                    desired.push(graphic.clone());
-                    resolved_payloads.push((graphic, payload.into_owned()));
+                    desired.push(graphic);
+                    deferred_sources.push(source);
                 }
             }
         }
@@ -724,13 +793,34 @@ fn draw_frame(
         }
 
         if plan.emit_desired {
-            for (graphic, payload) in &resolved_payloads {
-                let move_seq = format!("\x1b[{};{}H", graphic.rect.y + 1, graphic.rect.x + 1);
-                let _ = terminal.backend_mut().write_all(move_seq.as_bytes());
-                let _ = terminal.backend_mut().write_all(payload.as_bytes());
-                if graphic.protocol == TerminalImageProtocol::Kitty {
-                    guard.kitty_used = true;
-                    KITTY_USED_GLOBAL.store(true, Ordering::Relaxed);
+            for (graphic, source) in desired.iter().zip(deferred_sources) {
+                let payload: Option<Cow<'_, str>> = match source {
+                    DeferredPixelSource::Direct(p) => Some(Cow::Owned(p)),
+                    DeferredPixelSource::CacheFull { base_key } => app
+                        .preview_cache
+                        .get(&base_key)
+                        .and_then(|r| r.pixel_payload.as_deref())
+                        .map(Cow::Borrowed),
+                    DeferredPixelSource::CacheCrop {
+                        base_key,
+                        sx,
+                        sy,
+                        vw,
+                        vh,
+                    } => app
+                        .preview_cache
+                        .get(&base_key)
+                        .and_then(|r| r.viewport_pixel_payload(sx, sy, vw, vh))
+                        .map(|(p, _, _)| Cow::Owned(p)),
+                };
+                if let Some(payload) = payload {
+                    let move_seq = format!("\x1b[{};{}H", graphic.rect.y + 1, graphic.rect.x + 1);
+                    let _ = terminal.backend_mut().write_all(move_seq.as_bytes());
+                    let _ = terminal.backend_mut().write_all(payload.as_bytes());
+                    if graphic.protocol == TerminalImageProtocol::Kitty {
+                        guard.kitty_used = true;
+                        KITTY_USED_GLOBAL.store(true, Ordering::Relaxed);
+                    }
                 }
             }
             let _ = terminal.backend_mut().flush();
@@ -752,12 +842,13 @@ fn draw_frame(
     draw_res
 }
 
+/// Handles a single crossterm event, returning `(break_coalesce, state_changed)`.
 fn handle_crossterm_event(
     ev: CrosstermEvent,
     app: &mut AppState,
     ui: &mut UiState,
     resized_to: &mut Option<(u16, u16)>,
-) -> bool {
+) -> (bool, bool) {
     match ev {
         CrosstermEvent::Key(key) => {
             let text_input = ui.is_text_input_active();
@@ -774,28 +865,43 @@ fn handle_crossterm_event(
                 text_input,
             ) {
                 app.dispatch(act, ui);
+                (false, true)
+            } else {
+                (false, false)
             }
-            false
         }
         CrosstermEvent::Mouse(mouse) => {
-            if let Some(act) = event::mouse_to_action(mouse) {
+            if mouse.kind == MouseEventKind::Moved {
+                if ui.overlay.is_some() || ui.canvas_mode != ui::app::CanvasMode::Graph {
+                    return (false, false);
+                }
+                let prev_hover = ui.graph_sim.hovered_node;
+                if let Some(act) = event::mouse_to_action(mouse) {
+                    app.dispatch(act, ui);
+                }
+                (false, ui.graph_sim.hovered_node != prev_hover)
+            } else if let Some(act) = event::mouse_to_action(mouse) {
                 app.dispatch(act, ui);
+                (true, true)
+            } else {
+                (false, false)
             }
-            true
         }
         CrosstermEvent::Paste(pasted) => {
             if ui.is_text_input_active() {
                 app.dispatch(ui::action::Action::Paste(pasted), ui);
+                (false, true)
+            } else {
+                (false, false)
             }
-            false
         }
         CrosstermEvent::Resize(w, h) => {
             ui.term_width = w;
             ui.term_height = h;
             *resized_to = Some((w, h));
-            true
+            (true, true)
         }
-        _ => false,
+        _ => (false, false),
     }
 }
 
@@ -904,10 +1010,22 @@ pub async fn run_tui(cfg: AppConfig, vault: VaultProfile, storage: Storage) -> R
                 true
             }
             maybe_ev = reader.recv() => {
+                let mut any_changed = false;
                 match maybe_ev {
                     Some(ev) => {
-                        let mut break_coalesce =
-                            handle_crossterm_event(ev, &mut app, &mut ui, &mut resized_to);
+                        let mut pending_move: Option<CrosstermEvent> = None;
+                        let mut break_coalesce = false;
+                        if matches!(
+                            ev,
+                            CrosstermEvent::Mouse(m) if m.kind == MouseEventKind::Moved
+                        ) {
+                            pending_move = Some(ev);
+                        } else {
+                            let (brk, changed) =
+                                handle_crossterm_event(ev, &mut app, &mut ui, &mut resized_to);
+                            break_coalesce = brk;
+                            any_changed |= changed;
+                        }
                         let mut drained = 0usize;
                         while !break_coalesce
                             && drained < MAX_COALESCED_EVENTS
@@ -918,12 +1036,30 @@ pub async fn run_tui(cfg: AppConfig, vault: VaultProfile, storage: Storage) -> R
                             match reader.try_recv() {
                                 Ok(next_ev) => {
                                     drained += 1;
-                                    break_coalesce = handle_crossterm_event(
+                                    if matches!(
+                                        next_ev,
+                                        CrosstermEvent::Mouse(m) if m.kind == MouseEventKind::Moved
+                                    ) {
+                                        pending_move = Some(next_ev);
+                                        continue;
+                                    }
+                                    if let Some(mv) = pending_move.take() {
+                                        let (_, mv_changed) = handle_crossterm_event(
+                                            mv,
+                                            &mut app,
+                                            &mut ui,
+                                            &mut resized_to,
+                                        );
+                                        any_changed |= mv_changed;
+                                    }
+                                    let (brk, changed) = handle_crossterm_event(
                                         next_ev,
                                         &mut app,
                                         &mut ui,
                                         &mut resized_to,
                                     );
+                                    break_coalesce = brk;
+                                    any_changed |= changed;
                                 }
                                 Err(mpsc::error::TryRecvError::Empty) => break,
                                 Err(mpsc::error::TryRecvError::Disconnected) => {
@@ -932,10 +1068,15 @@ pub async fn run_tui(cfg: AppConfig, vault: VaultProfile, storage: Storage) -> R
                                 }
                             }
                         }
+                        if let Some(mv) = pending_move.take() {
+                            let (_, mv_changed) =
+                                handle_crossterm_event(mv, &mut app, &mut ui, &mut resized_to);
+                            any_changed |= mv_changed;
+                        }
                     }
                     None => reader_eof = true,
                 }
-                true
+                any_changed
             }
         };
 

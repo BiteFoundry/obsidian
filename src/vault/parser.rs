@@ -12,7 +12,10 @@
 //!   `<mark>`, `<sub>`, `<sup>`, `<a>`) and embedded HTML blocks (`NoteBlock::HtmlEmbed`)
 //! - Exact 1-based `line_no` for headings, tasks, callouts, tables, and embeds.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, BTreeSet},
+};
 
 use bitefoundry_html::pulldown_cmark::{
     Alignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
@@ -305,7 +308,10 @@ fn line_index_at(line_starts: &[usize], byte_offset: usize) -> usize {
 /// 1. Strips non-newline characters inside paired `%%...%%` comments.
 /// 2. Escapes unescaped `|` inside `[[...]]` / `![[...]]` on table-like lines so `pulldown-cmark`
 ///    never splits `| **Bold** [[Note|Alias]] |` across columns.
-fn preprocess_obsidian_body(body: &str) -> String {
+fn preprocess_obsidian_body(body: &str) -> Cow<'_, str> {
+    if !body.contains("%%") && (!body.contains("[[") || !body.contains('|')) {
+        return Cow::Borrowed(body);
+    }
     let mut out = String::with_capacity(body.len());
     let bytes = body.as_bytes();
     let len = bytes.len();
@@ -440,7 +446,7 @@ fn preprocess_obsidian_body(body: &str) -> String {
         i += ch.len_utf8();
     }
 
-    out
+    Cow::Owned(out)
 }
 
 fn find_closing_obsidian_comment(after_open: &str) -> Option<usize> {
@@ -1974,6 +1980,24 @@ fn scan_obsidian_extensions(
     tag_set: &mut BTreeSet<String>,
     mut standalone_embed_out: Option<&mut Option<PendingEmbed>>,
 ) {
+    if input.is_empty() {
+        return;
+    }
+    if !input
+        .as_bytes()
+        .iter()
+        .any(|&b| matches!(b, b'[' | b'!' | b'=' | b'#' | b'h'))
+    {
+        let text = input.to_string();
+        if sub_depth > 0 {
+            out.push(InlineSpan::Subscript { text });
+        } else if sup_depth > 0 {
+            out.push(InlineSpan::Superscript { text });
+        } else {
+            out.push(flags.to_span(text));
+        }
+        return;
+    }
     let len = input.len();
     let mut i = 0usize;
     let mut text_buf = String::new();

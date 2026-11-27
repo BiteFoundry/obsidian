@@ -1,7 +1,10 @@
 //! Left Navigation Sidebar (`[` / `Ctrl+B`):
 //! 5 switchable tabs: `1 Files` · `2 Tags` · `3 Bookmarks` · `4 Outline` · `5 Tasks`.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    rc::Rc,
+};
 
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -143,9 +146,67 @@ pub fn selection_offset(selected: usize, visible: usize, total: usize) -> usize 
     selected.saturating_sub(half).min(max_off)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SidebarTreeCacheKey {
+    data_gen: u64,
+    notes_len: usize,
+    notes_ptr: usize,
+    html_len: usize,
+    html_ptr: usize,
+    collapsed_len: usize,
+    collapsed_fp: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SidebarTreeCache {
+    key: SidebarTreeCacheKey,
+    entries: Rc<Vec<SidebarEntry>>,
+}
+
+fn collapsed_fingerprint(collapsed: &HashSet<String>) -> u64 {
+    // Order-independent XOR/wrapping-add hash over collapsed folder names (typically 0..5 items).
+    let mut acc = 0xcbf2_9ce4_8422_2325_u64;
+    for folder in collapsed {
+        let mut h = 0x811c_9dc5_u64;
+        for b in folder.bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0100_0193);
+        }
+        acc = acc.wrapping_add(h ^ (h >> 27));
+    }
+    acc
+}
+
+fn cached_file_tree(app: &AppState, ui: &UiState) -> Rc<Vec<SidebarEntry>> {
+    let key = SidebarTreeCacheKey {
+        data_gen: app.data_gen,
+        notes_len: app.notes.len(),
+        notes_ptr: app.notes.as_ptr() as usize,
+        html_len: app.html_files.len(),
+        html_ptr: app.html_files.as_ptr() as usize,
+        collapsed_len: ui.collapsed_folders.len(),
+        collapsed_fp: collapsed_fingerprint(&ui.collapsed_folders),
+    };
+    if let Some(cache) = ui.sidebar_tree_cache.borrow().as_ref() {
+        if cache.key == key {
+            return Rc::clone(&cache.entries);
+        }
+    }
+    let entries = Rc::new(build_file_tree(
+        &app.notes,
+        &app.html_files,
+        &ui.collapsed_folders,
+    ));
+    *ui.sidebar_tree_cache.borrow_mut() = Some(SidebarTreeCache {
+        key,
+        entries: Rc::clone(&entries),
+    });
+    entries
+}
+
 pub fn build_sidebar_entries(app: &AppState, ui: &UiState) -> Vec<SidebarEntry> {
     match ui.sidebar_tab {
-        SidebarTab::Files => build_file_tree(&app.notes, &app.html_files, &ui.collapsed_folders),
+        SidebarTab::Files => (*cached_file_tree(app, ui)).clone(),
         SidebarTab::Tags => {
             let mut out = Vec::new();
             if let Some(ref active_tag) = ui.active_tag_filter {
@@ -389,7 +450,15 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &UiState, hitmap:
         Rect::new(tab_area.x, tab_area.y, tab_area.width, 1),
     );
 
-    let entries = build_sidebar_entries(app, ui);
+    let cached_files: Option<Rc<Vec<SidebarEntry>>>;
+    let owned_entries: Vec<SidebarEntry>;
+    let entries: &[SidebarEntry] = if ui.sidebar_tab == SidebarTab::Files {
+        cached_files = Some(cached_file_tree(app, ui));
+        cached_files.as_deref().unwrap()
+    } else {
+        owned_entries = build_sidebar_entries(app, ui);
+        &owned_entries
+    };
 
     // Subheader line naming active tab
     let sub_title = match ui.sidebar_tab {

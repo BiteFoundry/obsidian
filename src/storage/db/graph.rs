@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use rusqlite::params;
 
 use super::{notes::load_tags_map, search::{extract_context_snippet, first_line_preview}, Storage};
@@ -23,12 +23,9 @@ impl Storage {
         vault_id: &str,
         target_rel_path: &str,
     ) -> Result<Vec<BacklinkEntry>> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| anyhow!("Storage lock poisoned"))?;
+        let conn = self.read_conn()?;
         let target_title = title_from_rel_path(target_rel_path);
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT l.source_path, n.title, l.target_raw, l.heading, l.is_embed
              FROM links l
              JOIN notes n ON n.vault_id = l.vault_id AND n.rel_path = l.source_path
@@ -36,8 +33,8 @@ impl Storage {
              ORDER BY LOWER(n.title) ASC, l.id ASC",
         )?;
         // Keep the metadata cursor open while fetching bodies so both reads share its snapshot.
-        let mut body_stmt =
-            conn.prepare("SELECT body_plain FROM notes WHERE vault_id = ?1 AND rel_path = ?2")?;
+        let mut body_stmt = conn
+            .prepare_cached("SELECT body_plain FROM notes WHERE vault_id = ?1 AND rel_path = ?2")?;
         let rows = stmt.query_map(params![vault_id, target_rel_path], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -97,10 +94,7 @@ impl Storage {
         }
 
         let rows: Vec<OutgoingLinkRow> = {
-            let conn = self
-                .conn
-                .lock()
-                .map_err(|_| anyhow!("Storage lock poisoned"))?;
+            let conn = self.read_conn()?;
             let mut stmt = conn.prepare_cached(
                 "SELECT l.target_raw, l.target_resolved_path, n.title, l.alias, l.heading, l.is_embed, l.link_kind
                  FROM links l
@@ -239,10 +233,7 @@ impl Storage {
         let tags_map: HashMap<String, Vec<String>>;
         let raw_links: Vec<(String, String, Option<String>, bool, String)>;
         {
-            let conn = self
-                .conn
-                .lock()
-                .map_err(|_| anyhow!("Storage lock poisoned"))?;
+            let conn = self.read_conn()?;
             tags_map = load_tags_map(&conn, vault_id)?;
             {
                 let mut stmt = conn.prepare_cached(
@@ -424,8 +415,9 @@ impl Storage {
                 .then_with(|| (b.in_degree + b.out_degree).cmp(&(a.in_degree + a.out_degree)))
                 .then_with(|| {
                     a.title
-                        .to_ascii_lowercase()
-                        .cmp(&b.title.to_ascii_lowercase())
+                        .bytes()
+                        .map(|c| c.to_ascii_lowercase())
+                        .cmp(b.title.bytes().map(|c| c.to_ascii_lowercase()))
                 })
                 .then_with(|| a.id.cmp(&b.id))
         });

@@ -8,7 +8,9 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 
-use super::{tx::decode_utf8_lossy, Storage, VaultPathsAndAliases};
+use super::{
+    search::escape_like_pattern, tx::decode_utf8_lossy, Storage, VaultPathsAndAliases,
+};
 use crate::{
     config::VaultProfile,
     models::{
@@ -25,92 +27,81 @@ use crate::{
     },
 };
 
+fn normalize_folder_filter(folder: Option<&str>) -> Option<String> {
+    folder
+        .map(|f| {
+            f.trim()
+                .replace('\\', "/")
+                .trim_matches('/')
+                .to_ascii_lowercase()
+        })
+        .filter(|f| !f.is_empty())
+}
+
 impl Storage {
     pub fn note_count(&self, vault_id: &str) -> Result<usize> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| anyhow!("Storage lock poisoned"))?;
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM notes WHERE vault_id = ?1",
-            params![vault_id],
-            |r| r.get(0),
-        )?;
+        let conn = self.read_conn()?;
+        let count: i64 = conn
+            .prepare_cached("SELECT COUNT(*) FROM notes WHERE vault_id = ?1")?
+            .query_row(params![vault_id], |r| r.get(0))?;
         Ok(count.max(0) as usize)
     }
 
     /// Lists all indexed notes in a vault, optionally filtered by folder prefix.
     pub fn list_notes(&self, vault_id: &str, folder: Option<&str>) -> Result<Vec<NoteSummary>> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| anyhow!("Storage lock poisoned"))?;
+        let conn = self.read_conn()?;
         let tags_map = load_tags_map(&conn, vault_id)?;
         let (in_counts, out_counts) = load_degree_maps(&conn, vault_id)?;
+        let folder_norm = normalize_folder_filter(folder);
 
-        let folder_norm = folder
-            .map(|f| {
-                f.trim()
-                    .replace('\\', "/")
-                    .trim_matches('/')
-                    .to_ascii_lowercase()
-            })
-            .filter(|f| !f.is_empty());
-
-        let mut stmt = conn.prepare(
-            "SELECT rel_path, title, folder, frontmatter_json, aliases_json, word_count,
-                    mtime_ms, size_bytes, is_bookmarked
-             FROM notes
-             WHERE vault_id = ?1
-             ORDER BY LOWER(folder) ASC, LOWER(title) ASC, rel_path ASC",
-        )?;
-        let rows = stmt.query_map(params![vault_id], |r| {
-            let rel_path: String = r.get(0)?;
-            let title: String = r.get(1)?;
-            let folder: String = r.get(2)?;
-            let fm_json: String = r.get(3)?;
-            let aliases_json: String = r.get(4)?;
-            let word_count: i64 = r.get(5)?;
-            let mtime_ms: i64 = r.get(6)?;
-            let size_bytes: i64 = r.get(7)?;
-            let is_bookmarked: bool = r.get::<_, i64>(8)? != 0;
-            Ok((
-                rel_path,
-                title,
-                folder,
-                fm_json,
-                aliases_json,
-                word_count,
-                mtime_ms,
-                size_bytes,
-                is_bookmarked,
-            ))
-        })?;
-
-        let mut out = Vec::new();
-        for row in rows {
-            let (
-                rel_path,
-                title,
-                folder_val,
-                fm_json,
-                aliases_json,
-                word_count,
-                mtime_ms,
-                size_bytes,
-                is_bookmarked,
-            ) = row?;
-
+        let raw_rows: Vec<RawNoteRow> =
             if let Some(ref flt) = folder_norm {
-                let f_low = folder_val.to_ascii_lowercase();
-                if f_low != *flt && !f_low.starts_with(&format!("{flt}/")) {
-                    continue;
-                }
-            }
+                let prefix_like = format!("{}/%", escape_like_pattern(flt));
+                let mut stmt = conn.prepare_cached(
+                    "SELECT rel_path, title, folder, frontmatter_json, aliases_json, word_count,
+                            mtime_ms, size_bytes, is_bookmarked
+                     FROM notes
+                     WHERE vault_id = ?1
+                       AND (LOWER(folder) = ?2 OR LOWER(folder) LIKE ?3 ESCAPE '\\')
+                     ORDER BY LOWER(folder) ASC, LOWER(title) ASC, rel_path ASC",
+                )?;
+                let rows = stmt.query_map(params![vault_id, flt, prefix_like], map_note_row)?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()?
+            } else {
+                let mut stmt = conn.prepare_cached(
+                    "SELECT rel_path, title, folder, frontmatter_json, aliases_json, word_count,
+                            mtime_ms, size_bytes, is_bookmarked
+                     FROM notes
+                     WHERE vault_id = ?1
+                     ORDER BY LOWER(folder) ASC, LOWER(title) ASC, rel_path ASC",
+                )?;
+                let rows = stmt.query_map(params![vault_id], map_note_row)?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()?
+            };
 
-            let frontmatter: BTreeMap<String, serde_json::Value> =
-                serde_json::from_str(&fm_json).unwrap_or_default();
-            let aliases: Vec<String> = serde_json::from_str(&aliases_json).unwrap_or_default();
+        let mut out = Vec::with_capacity(raw_rows.len());
+        for (
+            rel_path,
+            title,
+            folder_val,
+            fm_json,
+            aliases_json,
+            word_count,
+            mtime_ms,
+            size_bytes,
+            is_bookmarked,
+        ) in raw_rows
+        {
+            let frontmatter: BTreeMap<String, serde_json::Value> = if fm_json == "{}" {
+                BTreeMap::new()
+            } else {
+                serde_json::from_str(&fm_json).unwrap_or_default()
+            };
+            let aliases: Vec<String> = if aliases_json == "[]" {
+                Vec::new()
+            } else {
+                serde_json::from_str(&aliases_json).unwrap_or_default()
+            };
             let tags = tags_map.get(&rel_path).cloned().unwrap_or_default();
             let backlink_count = *in_counts.get(&rel_path).unwrap_or(&0);
             let outgoing_count = *out_counts.get(&rel_path).unwrap_or(&0);
@@ -134,7 +125,7 @@ impl Storage {
         Ok(out)
     }
 
-    /// Lists indexed notes using deterministic keyset pagination.
+    /// Lists indexed notes using deterministic SQLite-pushed keyset pagination.
     pub fn list_notes_page(
         &self,
         vault_id: &str,
@@ -143,19 +134,189 @@ impl Storage {
         limit: Option<usize>,
     ) -> Result<ListPage<NoteSummary>> {
         let after = cursor.map(parse_note_cursor).transpose()?;
-        let all = self.list_notes(vault_id, folder)?;
-        let keyed: Vec<((String, String, String), NoteSummary)> = all
-            .into_iter()
-            .map(|n| {
-                let key = (
-                    n.folder.to_ascii_lowercase(),
-                    n.title.to_ascii_lowercase(),
-                    n.rel_path.clone(),
-                );
-                (key, n)
-            })
-            .collect();
-        Ok(page_after(keyed, after, limit, |n| n.rel_path.clone()))
+        let folder_norm = normalize_folder_filter(folder);
+
+        // Unbounded requests without a cursor reuse the bulk loader (single degree/tags pass).
+        if limit.is_none() && after.is_none() {
+            let items = self.list_notes(vault_id, folder)?;
+            let total = items.len();
+            return Ok(ListPage {
+                items,
+                total,
+                has_more: false,
+                next_cursor: None,
+            });
+        }
+
+        let conn = self.read_conn()?;
+        let total: usize = if let Some(ref flt) = folder_norm {
+            let prefix_like = format!("{}/%", escape_like_pattern(flt));
+            conn.prepare_cached(
+                "SELECT COUNT(*) FROM notes
+                 WHERE vault_id = ?1
+                   AND (LOWER(folder) = ?2 OR LOWER(folder) LIKE ?3 ESCAPE '\\')",
+            )?
+            .query_row(params![vault_id, flt, prefix_like], |r| r.get::<_, i64>(0))?
+            .max(0) as usize
+        } else {
+            conn.prepare_cached("SELECT COUNT(*) FROM notes WHERE vault_id = ?1")?
+                .query_row(params![vault_id], |r| r.get::<_, i64>(0))?
+                .max(0) as usize
+        };
+
+        let fetch_limit: i64 = match limit {
+            Some(lim) => lim.saturating_add(1).min(i64::MAX as usize) as i64,
+            None => -1,
+        };
+
+        let raw_rows: Vec<RawNoteRow> =
+            match (folder_norm.as_deref(), after.as_ref()) {
+                (Some(flt), Some((cf, ct, cp))) => {
+                    let prefix_like = format!("{}/%", escape_like_pattern(flt));
+                    let mut stmt = conn.prepare_cached(
+                        "SELECT rel_path, title, folder, frontmatter_json, aliases_json, word_count,
+                                mtime_ms, size_bytes, is_bookmarked
+                         FROM notes
+                         WHERE vault_id = ?1
+                           AND (LOWER(folder) = ?2 OR LOWER(folder) LIKE ?3 ESCAPE '\\')
+                           AND (LOWER(folder), LOWER(title), rel_path) > (?4, ?5, ?6)
+                         ORDER BY LOWER(folder) ASC, LOWER(title) ASC, rel_path ASC
+                         LIMIT ?7",
+                    )?;
+                    let rows = stmt.query_map(
+                        params![vault_id, flt, prefix_like, cf, ct, cp, fetch_limit],
+                        map_note_row,
+                    )?;
+                    rows.collect::<std::result::Result<Vec<_>, _>>()?
+                }
+                (Some(flt), None) => {
+                    let prefix_like = format!("{}/%", escape_like_pattern(flt));
+                    let mut stmt = conn.prepare_cached(
+                        "SELECT rel_path, title, folder, frontmatter_json, aliases_json, word_count,
+                                mtime_ms, size_bytes, is_bookmarked
+                         FROM notes
+                         WHERE vault_id = ?1
+                           AND (LOWER(folder) = ?2 OR LOWER(folder) LIKE ?3 ESCAPE '\\')
+                         ORDER BY LOWER(folder) ASC, LOWER(title) ASC, rel_path ASC
+                         LIMIT ?4",
+                    )?;
+                    let rows = stmt.query_map(
+                        params![vault_id, flt, prefix_like, fetch_limit],
+                        map_note_row,
+                    )?;
+                    rows.collect::<std::result::Result<Vec<_>, _>>()?
+                }
+                (None, Some((cf, ct, cp))) => {
+                    let mut stmt = conn.prepare_cached(
+                        "SELECT rel_path, title, folder, frontmatter_json, aliases_json, word_count,
+                                mtime_ms, size_bytes, is_bookmarked
+                         FROM notes
+                         WHERE vault_id = ?1
+                           AND (LOWER(folder), LOWER(title), rel_path) > (?2, ?3, ?4)
+                         ORDER BY LOWER(folder) ASC, LOWER(title) ASC, rel_path ASC
+                         LIMIT ?5",
+                    )?;
+                    let rows = stmt.query_map(
+                        params![vault_id, cf, ct, cp, fetch_limit],
+                        map_note_row,
+                    )?;
+                    rows.collect::<std::result::Result<Vec<_>, _>>()?
+                }
+                (None, None) => {
+                    let mut stmt = conn.prepare_cached(
+                        "SELECT rel_path, title, folder, frontmatter_json, aliases_json, word_count,
+                                mtime_ms, size_bytes, is_bookmarked
+                         FROM notes
+                         WHERE vault_id = ?1
+                         ORDER BY LOWER(folder) ASC, LOWER(title) ASC, rel_path ASC
+                         LIMIT ?2",
+                    )?;
+                    let rows = stmt.query_map(params![vault_id, fetch_limit], map_note_row)?;
+                    rows.collect::<std::result::Result<Vec<_>, _>>()?
+                }
+            };
+
+        let (mut page_rows, has_more) = match limit {
+            Some(lim) if raw_rows.len() > lim => {
+                let mut rows = raw_rows;
+                rows.truncate(lim);
+                (rows, true)
+            }
+            _ => (raw_rows, false),
+        };
+
+        let mut tag_stmt = conn.prepare_cached(
+            "SELECT tag FROM tags WHERE vault_id = ?1 AND note_path = ?2 ORDER BY tag ASC",
+        )?;
+        let mut in_stmt = conn.prepare_cached(
+            "SELECT COUNT(DISTINCT source_path) FROM links
+             WHERE vault_id = ?1 AND target_resolved_path = ?2 AND source_path != ?2",
+        )?;
+        let mut out_stmt = conn.prepare_cached(
+            "SELECT COUNT(*) FROM links WHERE vault_id = ?1 AND source_path = ?2",
+        )?;
+
+        let mut items = Vec::with_capacity(page_rows.len());
+        for (
+            rel_path,
+            title,
+            folder_val,
+            fm_json,
+            aliases_json,
+            word_count,
+            mtime_ms,
+            size_bytes,
+            is_bookmarked,
+        ) in page_rows.drain(..)
+        {
+            let frontmatter: BTreeMap<String, serde_json::Value> = if fm_json == "{}" {
+                BTreeMap::new()
+            } else {
+                serde_json::from_str(&fm_json).unwrap_or_default()
+            };
+            let aliases: Vec<String> = if aliases_json == "[]" {
+                Vec::new()
+            } else {
+                serde_json::from_str(&aliases_json).unwrap_or_default()
+            };
+            let tags: Vec<String> = tag_stmt
+                .query_map(params![vault_id, &rel_path], |r| r.get(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let backlink_count = in_stmt
+                .query_row(params![vault_id, &rel_path], |r| r.get::<_, i64>(0))?
+                .max(0) as usize;
+            let outgoing_count = out_stmt
+                .query_row(params![vault_id, &rel_path], |r| r.get::<_, i64>(0))?
+                .max(0) as usize;
+
+            items.push(NoteSummary {
+                vault_id: vault_id.to_string(),
+                rel_path,
+                title,
+                folder: folder_val,
+                frontmatter,
+                aliases,
+                tags,
+                word_count: word_count.max(0) as usize,
+                mtime_ms,
+                size_bytes,
+                is_bookmarked,
+                backlink_count,
+                outgoing_count,
+            });
+        }
+
+        let next_cursor = if has_more {
+            items.last().map(|n| n.rel_path.clone())
+        } else {
+            None
+        };
+        Ok(ListPage {
+            items,
+            total,
+            has_more,
+            next_cursor,
+        })
     }
 
     /// Resolves any user-provided note identifier (relative path, title, stem, or alias) in `vault_id`.
@@ -219,12 +380,9 @@ impl Storage {
     }
 
     pub fn all_paths_and_aliases(&self, vault_id: &str) -> Result<VaultPathsAndAliases> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| anyhow!("Storage lock poisoned"))?;
+        let conn = self.read_conn()?;
         let mut stmt =
-            conn.prepare("SELECT rel_path, aliases_json FROM notes WHERE vault_id = ?1")?;
+            conn.prepare_cached("SELECT rel_path, aliases_json FROM notes WHERE vault_id = ?1")?;
         let rows = stmt.query_map(params![vault_id], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })?;
@@ -232,9 +390,11 @@ impl Storage {
         let mut aliases_map = HashMap::new();
         for r in rows {
             let (rp, aj) = r?;
-            let aliases: Vec<String> = serde_json::from_str(&aj).unwrap_or_default();
-            if !aliases.is_empty() {
-                aliases_map.insert(rp.clone(), aliases);
+            if aj != "[]" {
+                let aliases: Vec<String> = serde_json::from_str(&aj).unwrap_or_default();
+                if !aliases.is_empty() {
+                    aliases_map.insert(rp.clone(), aliases);
+                }
             }
             paths.push(rp);
         }
@@ -258,10 +418,7 @@ impl Storage {
 
     /// Counts for the omitted object of a compact read. One query, no file access.
     pub fn note_omitted_counts(&self, vault_id: &str, rel_path: &str) -> Result<NoteOmittedCounts> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| anyhow!("Storage lock poisoned"))?;
+        let conn = self.read_conn()?;
         let (backlinks, outgoing_links, tags, headings, tasks, aliases_json): (
             i64,
             i64,
@@ -269,17 +426,18 @@ impl Storage {
             i64,
             i64,
             Option<String>,
-        ) = conn.query_row(
-            "SELECT
-              (SELECT COUNT(DISTINCT source_path) FROM links
-                WHERE vault_id = ?1 AND target_resolved_path = ?2 AND source_path != ?2),
-              (SELECT COUNT(*) FROM links    WHERE vault_id = ?1 AND source_path = ?2),
-              (SELECT COUNT(*) FROM tags     WHERE vault_id = ?1 AND note_path = ?2),
-              (SELECT COUNT(*) FROM headings WHERE vault_id = ?1 AND note_path = ?2),
-              (SELECT COUNT(*) FROM tasks    WHERE vault_id = ?1 AND note_path = ?2),
-              (SELECT aliases_json FROM notes WHERE vault_id = ?1 AND rel_path = ?2)",
-            params![vault_id, rel_path],
-            |r| {
+        ) = conn
+            .prepare_cached(
+                "SELECT
+                  (SELECT COUNT(DISTINCT source_path) FROM links
+                    WHERE vault_id = ?1 AND target_resolved_path = ?2 AND source_path != ?2),
+                  (SELECT COUNT(*) FROM links    WHERE vault_id = ?1 AND source_path = ?2),
+                  (SELECT COUNT(*) FROM tags     WHERE vault_id = ?1 AND note_path = ?2),
+                  (SELECT COUNT(*) FROM headings WHERE vault_id = ?1 AND note_path = ?2),
+                  (SELECT COUNT(*) FROM tasks    WHERE vault_id = ?1 AND note_path = ?2),
+                  (SELECT aliases_json FROM notes WHERE vault_id = ?1 AND rel_path = ?2)",
+            )?
+            .query_row(params![vault_id, rel_path], |r| {
                 Ok((
                     r.get(0)?,
                     r.get(1)?,
@@ -288,8 +446,7 @@ impl Storage {
                     r.get(4)?,
                     r.get(5)?,
                 ))
-            },
-        )?;
+            })?;
         let aliases = aliases_json
             .as_deref()
             .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
@@ -336,31 +493,15 @@ impl Storage {
     }
 
     pub fn get_note_summary(&self, vault_id: &str, rel_path: &str) -> Result<Option<NoteSummary>> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| anyhow!("Storage lock poisoned"))?;
+        let conn = self.read_conn()?;
         let row = conn
-            .query_row(
+            .prepare_cached(
                 "SELECT rel_path, title, folder, frontmatter_json, aliases_json, word_count,
                         mtime_ms, size_bytes, is_bookmarked
                  FROM notes
                  WHERE vault_id = ?1 AND rel_path = ?2",
-                params![vault_id, rel_path],
-                |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, String>(3)?,
-                        r.get::<_, String>(4)?,
-                        r.get::<_, i64>(5)?,
-                        r.get::<_, i64>(6)?,
-                        r.get::<_, i64>(7)?,
-                        r.get::<_, i64>(8)? != 0,
-                    ))
-                },
-            )
+            )?
+            .query_row(params![vault_id, rel_path], map_note_row)
             .optional()?;
 
         let Some((
@@ -380,7 +521,7 @@ impl Storage {
 
         let mut tags = Vec::new();
         {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare_cached(
                 "SELECT tag FROM tags WHERE vault_id = ?1 AND note_path = ?2 ORDER BY tag ASC",
             )?;
             let rows = stmt.query_map(params![vault_id, rp], |r| r.get::<_, String>(0))?;
@@ -388,17 +529,15 @@ impl Storage {
                 tags.push(t?);
             }
         }
-        let backlink_count: i64 = conn.query_row(
-            "SELECT COUNT(DISTINCT source_path) FROM links
-             WHERE vault_id = ?1 AND target_resolved_path = ?2 AND source_path != ?2",
-            params![vault_id, rp],
-            |r| r.get(0),
-        )?;
-        let outgoing_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM links WHERE vault_id = ?1 AND source_path = ?2",
-            params![vault_id, rp],
-            |r| r.get(0),
-        )?;
+        let backlink_count: i64 = conn
+            .prepare_cached(
+                "SELECT COUNT(DISTINCT source_path) FROM links
+                 WHERE vault_id = ?1 AND target_resolved_path = ?2 AND source_path != ?2",
+            )?
+            .query_row(params![vault_id, rp], |r| r.get(0))?;
+        let outgoing_count: i64 = conn
+            .prepare_cached("SELECT COUNT(*) FROM links WHERE vault_id = ?1 AND source_path = ?2")?
+            .query_row(params![vault_id, rp], |r| r.get(0))?;
 
         Ok(Some(NoteSummary {
             vault_id: vault_id.to_string(),
@@ -424,17 +563,16 @@ impl Storage {
             .lock()
             .map_err(|_| anyhow!("Storage lock poisoned"))?;
         let current: i64 = conn
-            .query_row(
+            .prepare_cached(
                 "SELECT is_bookmarked FROM notes WHERE vault_id = ?1 AND rel_path = ?2",
-                params![vault_id, rel_path],
-                |r| r.get(0),
-            )
+            )?
+            .query_row(params![vault_id, rel_path], |r| r.get(0))
             .unwrap_or(0);
         let next = if current != 0 { 0 } else { 1 };
-        conn.execute(
+        conn.prepare_cached(
             "UPDATE notes SET is_bookmarked = ?1 WHERE vault_id = ?2 AND rel_path = ?3",
-            params![next, vault_id, rel_path],
-        )?;
+        )?
+        .execute(params![next, vault_id, rel_path])?;
         Ok(next != 0)
     }
 
@@ -443,12 +581,28 @@ impl Storage {
             .conn
             .lock()
             .map_err(|_| anyhow!("Storage lock poisoned"))?;
-        conn.execute(
+        conn.prepare_cached(
             "UPDATE notes SET is_bookmarked = ?1 WHERE vault_id = ?2 AND rel_path = ?3",
-            params![i64::from(bookmarked), vault_id, rel_path],
-        )?;
+        )?
+        .execute(params![i64::from(bookmarked), vault_id, rel_path])?;
         Ok(())
     }
+}
+
+type RawNoteRow = (String, String, String, String, String, i64, i64, i64, bool);
+
+fn map_note_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RawNoteRow> {
+    Ok((
+        r.get::<_, String>(0)?,
+        r.get::<_, String>(1)?,
+        r.get::<_, String>(2)?,
+        r.get::<_, String>(3)?,
+        r.get::<_, String>(4)?,
+        r.get::<_, i64>(5)?,
+        r.get::<_, i64>(6)?,
+        r.get::<_, i64>(7)?,
+        r.get::<_, i64>(8)? != 0,
+    ))
 }
 
 pub(super) fn page_after<T, K: Ord>(
@@ -526,8 +680,8 @@ pub(super) fn parse_task_cursor(raw: &str) -> Result<(bool, String, String, usiz
 
 pub(super) fn load_tags_map(conn: &Connection, vault_id: &str) -> Result<HashMap<String, Vec<String>>> {
     let mut map: HashMap<String, Vec<String>> = HashMap::new();
-    let mut stmt =
-        conn.prepare("SELECT note_path, tag FROM tags WHERE vault_id = ?1 ORDER BY tag ASC")?;
+    let mut stmt = conn
+        .prepare_cached("SELECT note_path, tag FROM tags WHERE vault_id = ?1 ORDER BY tag ASC")?;
     let rows = stmt.query_map(params![vault_id], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
     })?;
@@ -538,6 +692,22 @@ pub(super) fn load_tags_map(conn: &Connection, vault_id: &str) -> Result<HashMap
     Ok(map)
 }
 
+pub(super) fn load_tags_for_note(
+    conn: &Connection,
+    vault_id: &str,
+    note_path: &str,
+) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT tag FROM tags WHERE vault_id = ?1 AND note_path = ?2 ORDER BY tag ASC",
+    )?;
+    let rows = stmt.query_map(params![vault_id, note_path], |r| r.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for t in rows {
+        out.push(t?);
+    }
+    Ok(out)
+}
+
 pub(super) fn load_degree_maps(
     conn: &Connection,
     vault_id: &str,
@@ -546,7 +716,7 @@ pub(super) fn load_degree_maps(
     let mut out_deg: HashMap<String, usize> = HashMap::new();
 
     {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT target_resolved_path, COUNT(DISTINCT source_path)
              FROM links
              WHERE vault_id = ?1 AND target_resolved_path IS NOT NULL AND source_path != target_resolved_path
@@ -561,7 +731,7 @@ pub(super) fn load_degree_maps(
         }
     }
     {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT source_path, COUNT(*)
              FROM links
              WHERE vault_id = ?1

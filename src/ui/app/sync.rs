@@ -47,6 +47,7 @@ impl AppState {
             .storage
             .list_tasks(&vid, TaskFilter::All, None)
             .unwrap_or_default();
+        self.bump_data_gen();
     }
 
     /// Refreshes in-memory vault note list, HTML files, tags, tasks, active note detail, and (when visible) graph.

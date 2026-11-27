@@ -67,6 +67,7 @@ pub type MultiLineComposer = ComposerState;
 #[derive(Debug, Clone)]
 pub struct ComposerState {
     text: String,
+    text_gen: u64,
     line_endings: Option<LineEndings>,
     cursor: usize,
     pub pending_images: Vec<InlineImageUpload>,
@@ -91,6 +92,7 @@ impl Default for ComposerState {
     fn default() -> Self {
         Self {
             text: String::new(),
+            text_gen: 0,
             line_endings: None,
             cursor: 0,
             pending_images: Vec::new(),
@@ -110,6 +112,11 @@ impl ComposerState {
 
     pub fn text(&self) -> &str {
         &self.text
+    }
+
+    #[inline]
+    pub fn text_gen(&self) -> u64 {
+        self.text_gen
     }
 
     pub fn cursor(&self) -> usize {
@@ -265,6 +272,7 @@ impl ComposerState {
 
     pub fn load_text_cursor_start(&mut self, value: &str) {
         self.text = normalize(value);
+        self.text_gen = self.text_gen.wrapping_add(1);
         self.line_endings = None;
         self.cursor = 0;
         self.anchor = None;
@@ -358,6 +366,7 @@ impl ComposerState {
             })
         });
         self.text.replace_range(range, inserted);
+        self.text_gen = self.text_gen.wrapping_add(1);
         self.cursor = cursor_after;
         self.anchor = None;
         self.record_delta(EditDelta {
@@ -540,6 +549,7 @@ impl ComposerState {
         );
         let redo_cursor = self.cursor;
         self.text.replace_range(delta.start..end, &delta.removed);
+        self.text_gen = self.text_gen.wrapping_add(1);
         if let (Some(endings), Some(edit)) = (&mut self.line_endings, &delta.endings) {
             endings.values.splice(
                 edit.index..edit.index + edit.inserted_count,
@@ -563,6 +573,7 @@ impl ComposerState {
         );
         let undo_cursor = self.cursor;
         self.text.replace_range(delta.start..end, &delta.inserted);
+        self.text_gen = self.text_gen.wrapping_add(1);
         if let (Some(endings), Some(edit)) = (&mut self.line_endings, &delta.endings) {
             endings.values.splice(
                 edit.index..edit.index + edit.removed.len(),

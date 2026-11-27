@@ -1,6 +1,6 @@
 //! Tag counts, tag filtering, checklist task listing, and headings queries.
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use rusqlite::params;
 
 use super::{
@@ -11,11 +11,8 @@ use crate::models::{HeadingEntry, ListPage, NoteSummary, TagCount, TaskEntry, Ta
 
 impl Storage {
     pub fn list_tags(&self, vault_id: &str) -> Result<Vec<TagCount>> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| anyhow!("Storage lock poisoned"))?;
-        let mut stmt = conn.prepare(
+        let conn = self.read_conn()?;
+        let mut stmt = conn.prepare_cached(
             "SELECT tag, COUNT(DISTINCT note_path) AS cnt
              FROM tags
              WHERE vault_id = ?1
@@ -56,11 +53,8 @@ impl Storage {
         filter: TaskFilter,
         note_rel_path: Option<&str>,
     ) -> Result<Vec<TaskEntry>> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| anyhow!("Storage lock poisoned"))?;
-        let mut stmt = conn.prepare(
+        let conn = self.read_conn()?;
+        let mut stmt = conn.prepare_cached(
             "SELECT t.note_path, n.title, t.line_no, t.text, t.checked
              FROM tasks t
              JOIN notes n ON n.vault_id = t.vault_id AND n.rel_path = t.note_path
@@ -125,11 +119,8 @@ impl Storage {
 
     /// Returns headings outline for a specific note.
     pub fn get_headings(&self, vault_id: &str, rel_path: &str) -> Result<Vec<HeadingEntry>> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| anyhow!("Storage lock poisoned"))?;
-        let mut stmt = conn.prepare(
+        let conn = self.read_conn()?;
+        let mut stmt = conn.prepare_cached(
             "SELECT note_path, level, text, line_no
              FROM headings
              WHERE vault_id = ?1 AND note_path = ?2

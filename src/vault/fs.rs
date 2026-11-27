@@ -183,6 +183,25 @@ pub fn is_html_file_path(path: &str) -> bool {
     matches!(ext.to_ascii_lowercase().as_str(), "html" | "htm" | "xhtml")
 }
 
+#[inline]
+fn cmp_ascii_ignore_case(a: &str, b: &str) -> std::cmp::Ordering {
+    a.bytes()
+        .map(|c| c.to_ascii_lowercase())
+        .cmp(b.bytes().map(|c| c.to_ascii_lowercase()))
+}
+
+#[inline]
+fn mtime_ns_and_size_from_meta(meta: &fs::Metadata) -> (i64, i64) {
+    let size_bytes = meta.len() as i64;
+    let mtime_ns = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos().min(i64::MAX as u128) as i64)
+        .unwrap_or(0);
+    (mtime_ns, size_bytes)
+}
+
 /// Walks a vault directory recursively for `.html`/`.htm`/`.xhtml` files, skipping hidden/system directories.
 pub fn scan_vault_html_files(vault_root: &Path) -> Result<Vec<VaultHtmlFile>> {
     if !vault_root.is_dir() {
@@ -190,11 +209,7 @@ pub fn scan_vault_html_files(vault_root: &Path) -> Result<Vec<VaultHtmlFile>> {
     }
     let mut out = Vec::new();
     walk_html_dir_recursive(vault_root, vault_root, &mut out)?;
-    out.sort_by(|a, b| {
-        a.rel_path
-            .to_ascii_lowercase()
-            .cmp(&b.rel_path.to_ascii_lowercase())
-    });
+    out.sort_by(|a, b| cmp_ascii_ignore_case(&a.rel_path, &b.rel_path));
     Ok(out)
 }
 
@@ -208,11 +223,7 @@ pub fn scan_vault_html_subdir(vault_root: &Path, subdir: &Path) -> Result<Vec<Va
     }
     let mut out = Vec::new();
     walk_html_dir_recursive(vault_root, subdir, &mut out)?;
-    out.sort_by(|a, b| {
-        a.rel_path
-            .to_ascii_lowercase()
-            .cmp(&b.rel_path.to_ascii_lowercase())
-    });
+    out.sort_by(|a, b| cmp_ascii_ignore_case(&a.rel_path, &b.rel_path));
     Ok(out)
 }
 
@@ -243,7 +254,10 @@ fn walk_html_dir_recursive(root: &Path, dir: &Path, out: &mut Vec<VaultHtmlFile>
             let rel_path = normalize_rel_path(rel);
             let title = name.to_string();
             let folder = folder_from_rel_path(&rel_path);
-            let (mtime_ns, size_bytes) = file_mtime_ns_and_size(&path);
+            let (mtime_ns, size_bytes) = entry
+                .metadata()
+                .map(|m| mtime_ns_and_size_from_meta(&m))
+                .unwrap_or_else(|_| file_mtime_ns_and_size(&path));
             out.push(VaultHtmlFile {
                 rel_path,
                 abs_path: path,
@@ -284,11 +298,8 @@ pub fn scan_vault_markdown_files_report(vault_root: &Path) -> Result<VaultScan> 
         &mut scan.entries,
         &mut scan.unreadable_dirs,
     )?;
-    scan.entries.sort_by(|a, b| {
-        a.rel_path
-            .to_ascii_lowercase()
-            .cmp(&b.rel_path.to_ascii_lowercase())
-    });
+    scan.entries
+        .sort_by(|a, b| cmp_ascii_ignore_case(&a.rel_path, &b.rel_path));
     scan.unreadable_dirs.sort();
     scan.unreadable_dirs.dedup();
     Ok(scan)
@@ -304,11 +315,7 @@ pub fn scan_vault_markdown_subdir(vault_root: &Path, subdir: &Path) -> Result<Ve
     }
     let mut out = Vec::new();
     walk_dir_recursive(vault_root, subdir, &mut out, &mut Vec::new())?;
-    out.sort_by(|a, b| {
-        a.rel_path
-            .to_ascii_lowercase()
-            .cmp(&b.rel_path.to_ascii_lowercase())
-    });
+    out.sort_by(|a, b| cmp_ascii_ignore_case(&a.rel_path, &b.rel_path));
     Ok(out)
 }
 
@@ -364,7 +371,10 @@ fn walk_dir_recursive(
             let rel_path = normalize_rel_path(rel);
             let title = title_from_rel_path(&rel_path);
             let folder = folder_from_rel_path(&rel_path);
-            let (mtime_ns, size_bytes) = file_mtime_ns_and_size(&path);
+            let (mtime_ns, size_bytes) = entry
+                .metadata()
+                .map(|m| mtime_ns_and_size_from_meta(&m))
+                .unwrap_or_else(|_| file_mtime_ns_and_size(&path));
             let mtime_ms = mtime_ns / 1_000_000;
             out.push(DiskNoteEntry {
                 rel_path,
@@ -382,15 +392,9 @@ fn walk_dir_recursive(
 
 /// Reads `(mtime_ns, size_bytes)` from a file's filesystem metadata with nanosecond precision.
 pub fn file_mtime_ns_and_size(path: &Path) -> (i64, i64) {
-    let meta = fs::metadata(path).ok();
-    let size_bytes = meta.as_ref().map(|m| m.len() as i64).unwrap_or(0);
-    let mtime_ns = meta
-        .as_ref()
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos().min(i64::MAX as u128) as i64)
-        .unwrap_or(0);
-    (mtime_ns, size_bytes)
+    fs::metadata(path)
+        .map(|m| mtime_ns_and_size_from_meta(&m))
+        .unwrap_or((0, 0))
 }
 
 /// Reads `(mtime_ms, size_bytes)` from a file's filesystem metadata using the exact

@@ -3,13 +3,17 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::io::{Cursor, IsTerminal};
+use std::io::IsTerminal;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64_STANDARD, Engine as _};
-use image::{imageops::FilterType, DynamicImage, ImageFormat, Rgba};
+use image::{
+    codecs::png::{CompressionType, FilterType as PngFilterType, PngEncoder},
+    imageops::FilterType,
+    DynamicImage, ExtendedColorType, ImageEncoder, ImageFormat, Rgba,
+};
 use ratatui::{
     layout::Rect,
     style::{Color, Style},
@@ -286,6 +290,84 @@ impl RenderedTerminalImage {
             }
         }
         total
+    }
+
+    /// Computes the `(draw_cols, draw_rows)` cell dimensions of a viewport-cropped pixel graphic
+    /// in O(1) without performing any image cropping, PNG encoding, or Sixel encoding.
+    pub fn viewport_pixel_dims(
+        &self,
+        scroll_x: u16,
+        scroll_y: u16,
+        view_cols: u16,
+        view_rows: u16,
+    ) -> Option<(u16, u16)> {
+        if !self.protocol.is_pixel() || view_cols == 0 || view_rows == 0 {
+            return None;
+        }
+        if scroll_x == 0 && scroll_y == 0 && self.cols <= view_cols && self.rows <= view_rows {
+            return Some((self.cols, self.rows));
+        }
+
+        let backing = self.scroll_backing.as_ref()?;
+        match backing {
+            PixelScrollBacking::SixelIndexed {
+                width,
+                height,
+                cell_px,
+                ..
+            } => {
+                let cell_w = cell_px.0.max(1) as u32;
+                let cell_h = cell_px.1.max(1) as u32;
+                let x0 = (scroll_x as u32).saturating_mul(cell_w);
+                let y0 = (scroll_y as u32).saturating_mul(cell_h);
+                if x0 >= *width || y0 >= *height {
+                    return None;
+                }
+                let max_w = (view_cols as u32).saturating_mul(cell_w);
+                let max_h = (view_rows as u32).saturating_mul(cell_h);
+                let crop_w = (*width - x0).min(max_w);
+                let mut crop_h = (*height - y0).min(max_h);
+                let safe_h = compute_sixel_safe_pixel_height(view_rows, cell_px.1.max(1));
+                if safe_h >= 6 && crop_h.div_ceil(6) * 6 > max_h {
+                    crop_h = safe_h;
+                }
+                if crop_w == 0 || crop_h == 0 {
+                    return None;
+                }
+                let draw_cols = crop_w.div_ceil(cell_w).clamp(1, view_cols as u32) as u16;
+                let draw_rows = (crop_h.div_ceil(6) * 6)
+                    .div_ceil(cell_h)
+                    .clamp(1, view_rows as u32) as u16;
+                Some((draw_cols, draw_rows))
+            }
+            PixelScrollBacking::Source {
+                image,
+                target_px_w,
+                target_px_h,
+                cell_px,
+            } => {
+                if image.width() == 0 || image.height() == 0 {
+                    return None;
+                }
+                let cell_w = cell_px.0.max(1) as u32;
+                let cell_h = cell_px.1.max(1) as u32;
+                let x0 = (scroll_x as u32).saturating_mul(cell_w);
+                let y0 = (scroll_y as u32).saturating_mul(cell_h);
+                if x0 >= *target_px_w || y0 >= *target_px_h {
+                    return None;
+                }
+                let max_w = (view_cols as u32).saturating_mul(cell_w);
+                let max_h = (view_rows as u32).saturating_mul(cell_h);
+                let crop_w = (*target_px_w - x0).min(max_w);
+                let crop_h = (*target_px_h - y0).min(max_h);
+                if crop_w == 0 || crop_h == 0 {
+                    return None;
+                }
+                let draw_cols = crop_w.div_ceil(cell_w).clamp(1, view_cols as u32) as u16;
+                let draw_rows = crop_h.div_ceil(cell_h).clamp(1, view_rows as u32) as u16;
+                Some((draw_cols, draw_rows))
+            }
+        }
     }
 
     /// Returns a viewport-cropped pixel protocol payload `(payload, draw_cols, draw_rows)` guaranteed
@@ -1479,7 +1561,7 @@ pub fn decode_and_render_halfblocks_with_cell_px(
 
     let (target_w, target_h) = compute_halfblock_dims(width_px, height_px, fit, cell_px);
 
-    let resized = image::imageops::resize(&rgba, target_w, target_h, FilterType::Lanczos3);
+    let resized = image::imageops::resize(&rgba, target_w, target_h, FilterType::Triangle);
     let mut lines = Vec::with_capacity((target_h / 2) as usize);
 
     type RgbPair = ((u8, u8, u8), (u8, u8, u8));
@@ -1637,17 +1719,37 @@ pub fn decode_and_render_for_protocol(
             (payload, Some(backing))
         }
         TerminalImageProtocol::Sixel => {
-            let rgba = dyn_img.to_rgba8();
-            let resized = if width_px == target_px_w && height_px == target_px_h {
-                rgba
-            } else {
-                image::imageops::resize(&rgba, target_px_w, target_px_h, FilterType::Lanczos3)
+            let flat_rgba: Vec<u8> = match dyn_img {
+                DynamicImage::ImageRgb8(rgb) => {
+                    let resized = if width_px == target_px_w && height_px == target_px_h {
+                        rgb
+                    } else {
+                        image::imageops::resize(&rgb, target_px_w, target_px_h, FilterType::Lanczos3)
+                    };
+                    let raw_rgb = resized.into_raw();
+                    let mut out = Vec::with_capacity((target_px_w * target_px_h * 4) as usize);
+                    for px in raw_rgb.as_chunks::<3>().0 {
+                        out.extend_from_slice(&[px[0], px[1], px[2], 255]);
+                    }
+                    out
+                }
+                other => {
+                    let rgba = other.into_rgba8();
+                    let resized = if width_px == target_px_w && height_px == target_px_h {
+                        rgba
+                    } else {
+                        image::imageops::resize(
+                            &rgba,
+                            target_px_w,
+                            target_px_h,
+                            FilterType::Lanczos3,
+                        )
+                    };
+                    let mut raw = resized.into_raw();
+                    blend_over_bg_inplace(&mut raw, bg_rgb);
+                    raw
+                }
             };
-            let mut flat_rgba = Vec::with_capacity((target_px_w * target_px_h * 4) as usize);
-            for px in resized.pixels() {
-                let (r, g, b) = blend_over_bg(*px, bg_rgb);
-                flat_rgba.extend_from_slice(&[r, g, b, 255]);
-            }
             let (palette, indexed) =
                 quantize_rgba_to_256(&flat_rgba, target_px_w as usize, target_px_h as usize);
             let payload = encode_sixel_indexed_slice(
@@ -1913,6 +2015,8 @@ fn encode_sixel_indexed_slice(
     }
 
     let mut color_seen = [false; 256];
+    let mut min_x = [usize::MAX; 256];
+    let mut max_x = [0usize; 256];
     let mut band_colors: Vec<u8> = Vec::with_capacity(palette.len().min(64));
     let mut band_masks = vec![0u8; palette.len().max(1) * crop_w];
 
@@ -1923,13 +2027,23 @@ fn encode_sixel_indexed_slice(
         for dy in 0..band_h {
             let bit = 1u8 << dy;
             let row_offset = (y0 + band_y + dy) * full_w + x0;
-            for x in 0..crop_w {
-                let c = indexed[row_offset + x];
-                if !color_seen[c as usize] {
-                    color_seen[c as usize] = true;
+            let row = &indexed[row_offset..row_offset + crop_w];
+            for (x, &c) in row.iter().enumerate() {
+                let ci = c as usize;
+                if !color_seen[ci] {
+                    color_seen[ci] = true;
+                    min_x[ci] = x;
+                    max_x[ci] = x;
                     band_colors.push(c);
+                } else {
+                    if x < min_x[ci] {
+                        min_x[ci] = x;
+                    }
+                    if x > max_x[ci] {
+                        max_x[ci] = x;
+                    }
                 }
-                band_masks[c as usize * crop_w + x] |= bit;
+                band_masks[ci * crop_w + x] |= bit;
             }
         }
 
@@ -1937,22 +2051,22 @@ fn encode_sixel_indexed_slice(
             if ci > 0 {
                 out.push('$');
             }
-            let _ = write!(out, "#{color_idx}");
+            out.push('#');
+            push_usize_ascii(&mut out, color_idx as usize);
 
-            let mask_start = color_idx as usize * crop_w;
-            let row_slice = &band_masks[mask_start..mask_start + crop_w];
-            let end = row_slice
-                .iter()
-                .rposition(|&bits| bits != 0)
-                .map_or(0, |idx| idx + 1);
-
-            write_sixel_rle(&row_slice[..end], &mut out);
+            let c_idx = color_idx as usize;
+            let mask_start = c_idx * crop_w;
+            let end = max_x[c_idx] + 1;
+            write_sixel_rle(&band_masks[mask_start..mask_start + end], &mut out);
         }
 
         for &c in &band_colors {
-            color_seen[c as usize] = false;
-            let start = c as usize * crop_w;
-            band_masks[start..start + crop_w].fill(0);
+            let ci = c as usize;
+            color_seen[ci] = false;
+            let start = ci * crop_w;
+            band_masks[start + min_x[ci]..=start + max_x[ci]].fill(0);
+            min_x[ci] = usize::MAX;
+            max_x[ci] = 0;
         }
 
         if band_y + 6 < crop_h {
@@ -1964,17 +2078,37 @@ fn encode_sixel_indexed_slice(
     out
 }
 
+#[inline]
+fn push_usize_ascii(out: &mut String, mut n: usize) {
+    if n < 10 {
+        out.push((b'0' + n as u8) as char);
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let mut pos = buf.len();
+    while n > 0 {
+        pos -= 1;
+        buf[pos] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    // SAFETY: digits '0'..'9' are valid ASCII/UTF-8.
+    out.push_str(unsafe { std::str::from_utf8_unchecked(&buf[pos..]) });
+}
+
 fn write_sixel_rle(masks: &[u8], out: &mut String) {
+    let len = masks.len();
     let mut i = 0;
-    while i < masks.len() {
+    while i < len {
         let bits = masks[i];
         let mut run_len = 1usize;
-        while i + run_len < masks.len() && masks[i + run_len] == bits {
+        while i + run_len < len && masks[i + run_len] == bits {
             run_len += 1;
         }
         let ch = (bits + 63) as char;
         if run_len >= 4 {
-            let _ = write!(out, "!{run_len}{ch}");
+            out.push('!');
+            push_usize_ascii(out, run_len);
+            out.push(ch);
         } else {
             for _ in 0..run_len {
                 out.push(ch);
@@ -2044,33 +2178,42 @@ fn quantize_rgba_to_256_with_stats(
         return (exact_palette, indexed, 0);
     }
 
-    // Median-cut over 5-bit-per-channel RGB buckets for > 256 distinct colors.
-    let mut hist: HashMap<u16, (u32, u64, u64, u64)> = HashMap::new();
+    // Flat 32K (5-5-5) RGB histogram for median-cut over > 256 distinct colors (zero SipHash).
+    const HIST_LEN: usize = 32_768;
+    let mut hist_count = vec![0u32; HIST_LEN];
+    let mut hist_r = vec![0u64; HIST_LEN];
+    let mut hist_g = vec![0u64; HIST_LEN];
+    let mut hist_b = vec![0u64; HIST_LEN];
+
     for px in flat_rgba.as_chunks::<4>().0.iter().take(pixel_count) {
         let qkey =
-            (((px[0] as u16) >> 3) << 10) | (((px[1] as u16) >> 3) << 5) | ((px[2] as u16) >> 3);
-        let entry = hist.entry(qkey).or_insert((0, 0, 0, 0));
-        entry.0 += 1;
-        entry.1 += px[0] as u64;
-        entry.2 += px[1] as u64;
-        entry.3 += px[2] as u64;
+            (((px[0] as usize) >> 3) << 10) | (((px[1] as usize) >> 3) << 5) | ((px[2] as usize) >> 3);
+        hist_count[qkey] += 1;
+        hist_r[qkey] += px[0] as u64;
+        hist_g[qkey] += px[1] as u64;
+        hist_b[qkey] += px[2] as u64;
     }
 
-    let mut buckets: Vec<ColorBucket> = hist
-        .into_values()
-        .map(|(count, sum_r, sum_g, sum_b)| {
-            let c = count as u64;
-            ColorBucket {
-                r_avg: (sum_r / c) as u8,
-                g_avg: (sum_g / c) as u8,
-                b_avg: (sum_b / c) as u8,
-                count,
-                sum_r,
-                sum_g,
-                sum_b,
-            }
-        })
-        .collect();
+    let mut buckets: Vec<ColorBucket> = Vec::with_capacity(2048);
+    for qkey in 0..HIST_LEN {
+        let count = hist_count[qkey];
+        if count == 0 {
+            continue;
+        }
+        let c = count as u64;
+        let sum_r = hist_r[qkey];
+        let sum_g = hist_g[qkey];
+        let sum_b = hist_b[qkey];
+        buckets.push(ColorBucket {
+            r_avg: (sum_r / c) as u8,
+            g_avg: (sum_g / c) as u8,
+            b_avg: (sum_b / c) as u8,
+            count,
+            sum_r,
+            sum_g,
+            sum_b,
+        });
+    }
 
     let total_buckets = buckets.len();
     let mut boxes: Vec<(usize, usize)> = vec![(0, total_buckets)];
@@ -2169,18 +2312,28 @@ fn quantize_rgba_to_256_with_stats(
 
     indexed.clear();
     indexed.resize(pixel_count, 0);
-    let mut lookup_cache: HashMap<u32, u8> = HashMap::with_capacity(2048);
+    // Direct lazily-populated 5-5-5 LUT (32,768 slots, `-1` = unpopulated) replaces O(W*H*256)
+    // linear scans and HashMap SipHash overhead with O(1) array indexing.
+    let mut lut = vec![-1i16; HIST_LEN];
+    let mut lut_populated = 0usize;
     let mut used = vec![false; raw_palette.len()];
 
-    let find_nearest = |r: u8, g: u8, b: u8, cache: &mut HashMap<u32, u8>| -> u8 {
-        let key = ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
-        if let Some(&cached) = cache.get(&key) {
-            return cached;
+    let find_nearest = |r: u8, g: u8, b: u8, lut: &mut [i16], populated: &mut usize| -> u8 {
+        let r5 = (r as usize) >> 3;
+        let g5 = (g as usize) >> 3;
+        let b5 = (b as usize) >> 3;
+        let key = (r5 << 10) | (g5 << 5) | b5;
+        let cached = lut[key];
+        if cached >= 0 {
+            return cached as u8;
         }
+        let cr = ((r5 << 3) | (r5 >> 2)) as u8;
+        let cg = ((g5 << 3) | (g5 >> 2)) as u8;
+        let cb = ((b5 << 3) | (b5 >> 2)) as u8;
         let mut best_idx = 0u8;
         let mut best_dist = u32::MAX;
         for (pi, &(pr, pg, pb)) in raw_palette.iter().enumerate() {
-            let dist = redmean_dist_sq(r, g, b, pr, pg, pb);
+            let dist = redmean_dist_sq(cr, cg, cb, pr, pg, pb);
             if dist < best_dist {
                 best_dist = dist;
                 best_idx = pi as u8;
@@ -2189,16 +2342,25 @@ fn quantize_rgba_to_256_with_stats(
                 }
             }
         }
-        if cache.len() < MAX_QUANT_LOOKUP_CACHE {
-            cache.insert(key, best_idx);
-        }
+        lut[key] = best_idx as i16;
+        *populated += 1;
         best_idx
     };
 
-    // Serpentine Floyd-Steinberg error diffusion (7/16, 3/16, 5/16, 1/16) with [-48, 48] error clamp
-    // and flat-region dither suppression so UI panels and crisp text remain clean without banding.
-    let mut err_curr = vec![[0.0f32; 3]; width];
-    let mut err_next = vec![[0.0f32; 3]; width];
+    #[inline(always)]
+    fn apply_q4_err(orig: u8, err_q4: i16) -> u8 {
+        let delta = if err_q4 >= 0 {
+            (err_q4 + 8) >> 4
+        } else {
+            -((-err_q4 + 8) >> 4)
+        };
+        (orig as i16 + delta).clamp(0, 255) as u8
+    }
+
+    // Serpentine Floyd-Steinberg error diffusion in 2-row `i16` Q4 fixed-point (7/16, 3/16, 5/16, 1/16)
+    // with [-48, 48] error clamp and flat-region dither suppression.
+    let mut err_curr = vec![[0i16; 3]; width];
+    let mut err_next = vec![[0i16; 3]; width];
 
     for y in 0..height {
         let row_base = y * width;
@@ -2223,24 +2385,29 @@ fn quantize_rgba_to_256_with_stats(
                     && flat_rgba[uoff + 2] == orig_b
             };
             let is_flat_neighbor = same_left || same_up;
+            let [ec_r, ec_g, ec_b] = err_curr[x];
 
             // Flat-region guard: if pixel belongs to a solid UI panel whose color is already well
             // represented in the palette (Redmean dist <= 64), map directly without dither noise.
             let (idx, diffuse_err) = if is_flat_neighbor {
-                let orig_idx = find_nearest(orig_r, orig_g, orig_b, &mut lookup_cache);
+                let orig_idx = find_nearest(orig_r, orig_g, orig_b, &mut lut, &mut lut_populated);
                 let (pr, pg, pb) = raw_palette[orig_idx as usize];
                 if redmean_dist_sq(orig_r, orig_g, orig_b, pr, pg, pb) <= 64 {
                     (orig_idx, None)
                 } else {
-                    let r = (orig_r as f32 + err_curr[x][0]).round().clamp(0.0, 255.0) as u8;
-                    let g = (orig_g as f32 + err_curr[x][1]).round().clamp(0.0, 255.0) as u8;
-                    let b = (orig_b as f32 + err_curr[x][2]).round().clamp(0.0, 255.0) as u8;
-                    let q_idx = find_nearest(r, g, b, &mut lookup_cache);
+                    let r = apply_q4_err(orig_r, ec_r);
+                    let g = apply_q4_err(orig_g, ec_g);
+                    let b = apply_q4_err(orig_b, ec_b);
+                    let q_idx = if r == orig_r && g == orig_g && b == orig_b {
+                        orig_idx
+                    } else {
+                        find_nearest(r, g, b, &mut lut, &mut lut_populated)
+                    };
                     let (qr, qg, qb) = raw_palette[q_idx as usize];
-                    let er = (r as f32 - qr as f32).clamp(-48.0, 48.0);
-                    let eg = (g as f32 - qg as f32).clamp(-48.0, 48.0);
-                    let eb = (b as f32 - qb as f32).clamp(-48.0, 48.0);
-                    let err = if er.abs() <= 3.0 && eg.abs() <= 3.0 && eb.abs() <= 3.0 {
+                    let er = (r as i16 - qr as i16).clamp(-48, 48);
+                    let eg = (g as i16 - qg as i16).clamp(-48, 48);
+                    let eb = (b as i16 - qb as i16).clamp(-48, 48);
+                    let err = if er.abs() <= 3 && eg.abs() <= 3 && eb.abs() <= 3 {
                         None
                     } else {
                         Some([er, eg, eb])
@@ -2248,15 +2415,15 @@ fn quantize_rgba_to_256_with_stats(
                     (q_idx, err)
                 }
             } else {
-                let r = (orig_r as f32 + err_curr[x][0]).round().clamp(0.0, 255.0) as u8;
-                let g = (orig_g as f32 + err_curr[x][1]).round().clamp(0.0, 255.0) as u8;
-                let b = (orig_b as f32 + err_curr[x][2]).round().clamp(0.0, 255.0) as u8;
-                let q_idx = find_nearest(r, g, b, &mut lookup_cache);
+                let r = apply_q4_err(orig_r, ec_r);
+                let g = apply_q4_err(orig_g, ec_g);
+                let b = apply_q4_err(orig_b, ec_b);
+                let q_idx = find_nearest(r, g, b, &mut lut, &mut lut_populated);
                 let (qr, qg, qb) = raw_palette[q_idx as usize];
-                let er = (r as f32 - qr as f32).clamp(-48.0, 48.0);
-                let eg = (g as f32 - qg as f32).clamp(-48.0, 48.0);
-                let eb = (b as f32 - qb as f32).clamp(-48.0, 48.0);
-                let err = if er.abs() <= 3.0 && eg.abs() <= 3.0 && eb.abs() <= 3.0 {
+                let er = (r as i16 - qr as i16).clamp(-48, 48);
+                let eg = (g as i16 - qg as i16).clamp(-48, 48);
+                let eb = (b as i16 - qb as i16).clamp(-48, 48);
+                let err = if er.abs() <= 3 && eg.abs() <= 3 && eb.abs() <= 3 {
                     None
                 } else {
                     Some([er, eg, eb])
@@ -2270,54 +2437,54 @@ fn quantize_rgba_to_256_with_stats(
             if let Some([er, eg, eb]) = diffuse_err {
                 if !rtl {
                     if x + 1 < width {
-                        err_curr[x + 1][0] += er * (7.0 / 16.0);
-                        err_curr[x + 1][1] += eg * (7.0 / 16.0);
-                        err_curr[x + 1][2] += eb * (7.0 / 16.0);
+                        err_curr[x + 1][0] = err_curr[x + 1][0].saturating_add(er * 7);
+                        err_curr[x + 1][1] = err_curr[x + 1][1].saturating_add(eg * 7);
+                        err_curr[x + 1][2] = err_curr[x + 1][2].saturating_add(eb * 7);
                     }
                     if y + 1 < height {
                         if x > 0 {
-                            err_next[x - 1][0] += er * (3.0 / 16.0);
-                            err_next[x - 1][1] += eg * (3.0 / 16.0);
-                            err_next[x - 1][2] += eb * (3.0 / 16.0);
+                            err_next[x - 1][0] = err_next[x - 1][0].saturating_add(er * 3);
+                            err_next[x - 1][1] = err_next[x - 1][1].saturating_add(eg * 3);
+                            err_next[x - 1][2] = err_next[x - 1][2].saturating_add(eb * 3);
                         }
-                        err_next[x][0] += er * (5.0 / 16.0);
-                        err_next[x][1] += eg * (5.0 / 16.0);
-                        err_next[x][2] += eb * (5.0 / 16.0);
+                        err_next[x][0] = err_next[x][0].saturating_add(er * 5);
+                        err_next[x][1] = err_next[x][1].saturating_add(eg * 5);
+                        err_next[x][2] = err_next[x][2].saturating_add(eb * 5);
                         if x + 1 < width {
-                            err_next[x + 1][0] += er * (1.0 / 16.0);
-                            err_next[x + 1][1] += eg * (1.0 / 16.0);
-                            err_next[x + 1][2] += eb * (1.0 / 16.0);
+                            err_next[x + 1][0] = err_next[x + 1][0].saturating_add(er);
+                            err_next[x + 1][1] = err_next[x + 1][1].saturating_add(eg);
+                            err_next[x + 1][2] = err_next[x + 1][2].saturating_add(eb);
                         }
                     }
                 } else {
                     if x > 0 {
-                        err_curr[x - 1][0] += er * (7.0 / 16.0);
-                        err_curr[x - 1][1] += eg * (7.0 / 16.0);
-                        err_curr[x - 1][2] += eb * (7.0 / 16.0);
+                        err_curr[x - 1][0] = err_curr[x - 1][0].saturating_add(er * 7);
+                        err_curr[x - 1][1] = err_curr[x - 1][1].saturating_add(eg * 7);
+                        err_curr[x - 1][2] = err_curr[x - 1][2].saturating_add(eb * 7);
                     }
                     if y + 1 < height {
                         if x + 1 < width {
-                            err_next[x + 1][0] += er * (3.0 / 16.0);
-                            err_next[x + 1][1] += eg * (3.0 / 16.0);
-                            err_next[x + 1][2] += eb * (3.0 / 16.0);
+                            err_next[x + 1][0] = err_next[x + 1][0].saturating_add(er * 3);
+                            err_next[x + 1][1] = err_next[x + 1][1].saturating_add(eg * 3);
+                            err_next[x + 1][2] = err_next[x + 1][2].saturating_add(eb * 3);
                         }
-                        err_next[x][0] += er * (5.0 / 16.0);
-                        err_next[x][1] += eg * (5.0 / 16.0);
-                        err_next[x][2] += eb * (5.0 / 16.0);
+                        err_next[x][0] = err_next[x][0].saturating_add(er * 5);
+                        err_next[x][1] = err_next[x][1].saturating_add(eg * 5);
+                        err_next[x][2] = err_next[x][2].saturating_add(eb * 5);
                         if x > 0 {
-                            err_next[x - 1][0] += er * (1.0 / 16.0);
-                            err_next[x - 1][1] += eg * (1.0 / 16.0);
-                            err_next[x - 1][2] += eb * (1.0 / 16.0);
+                            err_next[x - 1][0] = err_next[x - 1][0].saturating_add(er);
+                            err_next[x - 1][1] = err_next[x - 1][1].saturating_add(eg);
+                            err_next[x - 1][2] = err_next[x - 1][2].saturating_add(eb);
                         }
                     }
                 }
             }
         }
         std::mem::swap(&mut err_curr, &mut err_next);
-        err_next.fill([0.0, 0.0, 0.0]);
+        err_next.fill([0, 0, 0]);
     }
 
-    let cache_len = lookup_cache.len();
+    let cache_len = lut_populated.min(MAX_QUANT_LOOKUP_CACHE);
 
     // Compact palette so every emitted `#idx;2;...` entry is actually referenced.
     let mut remap = vec![0u8; raw_palette.len()];
@@ -2359,14 +2526,14 @@ fn render_ansi_stdout_with_caps(
 ) -> Result<String> {
     reject_html_bytes(bytes)?;
     let fit = FitBox::fit_to_box(max_cols, max_rows);
-    let svg_rasterized = if looks_like_svg_bytes(bytes) {
-        Some(rasterize_svg_png(bytes, fit, caps.cell_px)?)
-    } else {
-        None
-    };
-    let decode_bytes = svg_rasterized.as_deref().unwrap_or(bytes);
     match caps.protocol {
         TerminalImageProtocol::ITerm2 => {
+            let svg_rasterized = if looks_like_svg_bytes(bytes) {
+                Some(rasterize_svg_png(bytes, fit, caps.cell_px)?)
+            } else {
+                None
+            };
+            let decode_bytes = svg_rasterized.as_deref().unwrap_or(bytes);
             let guessed = image::guess_format(decode_bytes).ok();
             let dyn_img = image::load_from_memory(decode_bytes).context("Failed to decode image")?;
             let (width_px, height_px) = (dyn_img.width(), dyn_img.height());
@@ -2395,6 +2562,12 @@ fn render_ansi_stdout_with_caps(
             ))
         }
         TerminalImageProtocol::Kitty => {
+            let svg_rasterized = if looks_like_svg_bytes(bytes) {
+                Some(rasterize_svg_png(bytes, fit, caps.cell_px)?)
+            } else {
+                None
+            };
+            let decode_bytes = svg_rasterized.as_deref().unwrap_or(bytes);
             let guessed = image::guess_format(decode_bytes).ok();
             let dyn_img = image::load_from_memory(decode_bytes).context("Failed to decode image")?;
             let (width_px, height_px) = (dyn_img.width(), dyn_img.height());
@@ -2413,19 +2586,15 @@ fn render_ansi_stdout_with_caps(
                 &png_owned
             };
             let b64 = B64_STANDARD.encode(png_bytes);
-            let chunks: Vec<&str> = b64
-                .as_bytes()
-                .chunks(4096)
-                .map(|c| std::str::from_utf8(c).expect("base64 is valid ASCII"))
-                .collect();
-            let total = chunks.len();
-            let mut out = String::new();
-            for (idx, chunk) in chunks.into_iter().enumerate() {
+            let total = b64.len().div_ceil(4096).max(1);
+            let mut out = String::with_capacity(b64.len() + total * 24 + 1);
+            for (idx, chunk_bytes) in b64.as_bytes().chunks(4096).enumerate() {
+                let chunk = std::str::from_utf8(chunk_bytes).expect("base64 is valid ASCII");
                 let more = if idx + 1 < total { 1 } else { 0 };
                 if idx == 0 {
-                    out.push_str(&format!("\x1b_Gf=100,a=T,m={more};{chunk}\x1b\\"));
+                    let _ = write!(out, "\x1b_Gf=100,a=T,m={more};{chunk}\x1b\\");
                 } else {
-                    out.push_str(&format!("\x1b_Gm={more};{chunk}\x1b\\"));
+                    let _ = write!(out, "\x1b_Gm={more};{chunk}\x1b\\");
                 }
             }
             out.push('\n');
@@ -2440,21 +2609,30 @@ fn render_ansi_stdout_with_caps(
         TerminalImageProtocol::Halfblock => {
             let rendered =
                 decode_and_render_halfblocks_with_cell_px(bytes, fit, (0, 0, 0), caps.cell_px)?;
-            let mut out = String::new();
+            let mut out = String::with_capacity(
+                (rendered.cols as usize).saturating_mul(rendered.rows as usize) * 8,
+            );
             for line in &rendered.lines {
+                let mut prev_fg: Option<(u8, u8, u8)> = None;
+                let mut prev_bg: Option<(u8, u8, u8)> = None;
                 for span in &line.spans {
-                    let (tr, tg, tb) = match span.style.fg {
+                    let fg = match span.style.fg {
                         Some(Color::Rgb(r, g, b)) => (r, g, b),
                         _ => (255, 255, 255),
                     };
-                    let (br, bg_c, bb) = match span.style.bg {
+                    let bg = match span.style.bg {
                         Some(Color::Rgb(r, g, b)) => (r, g, b),
                         _ => (0, 0, 0),
                     };
-                    out.push_str(&format!(
-                        "\x1b[38;2;{tr};{tg};{tb}m\x1b[48;2;{br};{bg_c};{bb}m{}",
-                        span.content
-                    ));
+                    if prev_fg != Some(fg) {
+                        let _ = write!(out, "\x1b[38;2;{};{};{}m", fg.0, fg.1, fg.2);
+                        prev_fg = Some(fg);
+                    }
+                    if prev_bg != Some(bg) {
+                        let _ = write!(out, "\x1b[48;2;{};{};{}m", bg.0, bg.1, bg.2);
+                        prev_bg = Some(bg);
+                    }
+                    out.push_str(&span.content);
                 }
                 out.push_str("\x1b[0m\n");
             }
@@ -2474,30 +2652,72 @@ fn format_label_for(fmt: Option<ImageFormat>) -> String {
     }
 }
 
-fn blend_over_bg(px: Rgba<u8>, bg: (u8, u8, u8)) -> (u8, u8, u8) {
-    let a = px[3] as u16;
-    if a == 255 {
-        return (px[0], px[1], px[2]);
-    }
-    if a == 0 {
-        return bg;
-    }
+#[inline(always)]
+fn blend_channel(fg: u8, bg: u8, a: u32) -> u8 {
     let inv = 255 - a;
-    let r = ((px[0] as u16 * a + bg.0 as u16 * inv + 127) / 255) as u8;
-    let g = ((px[1] as u16 * a + bg.1 as u16 * inv + 127) / 255) as u8;
-    let b = ((px[2] as u16 * a + bg.2 as u16 * inv + 127) / 255) as u8;
-    (r, g, b)
+    let v = fg as u32 * a + bg as u32 * inv + 128;
+    ((v + (v >> 8)) >> 8) as u8
+}
+
+#[inline(always)]
+fn blend_over_bg(px: Rgba<u8>, bg: (u8, u8, u8)) -> (u8, u8, u8) {
+    let a = px[3] as u32;
+    (
+        blend_channel(px[0], bg.0, a),
+        blend_channel(px[1], bg.1, a),
+        blend_channel(px[2], bg.2, a),
+    )
+}
+
+fn blend_over_bg_inplace(flat_rgba: &mut [u8], bg: (u8, u8, u8)) {
+    for px in flat_rgba.as_chunks_mut::<4>().0 {
+        let a = px[3] as u32;
+        px[0] = blend_channel(px[0], bg.0, a);
+        px[1] = blend_channel(px[1], bg.1, a);
+        px[2] = blend_channel(px[2], bg.2, a);
+        px[3] = 255;
+    }
 }
 
 fn encode_png(img: &DynamicImage) -> Result<Vec<u8>> {
-    let mut buf = Cursor::new(Vec::new());
-    img.write_to(&mut buf, ImageFormat::Png)
-        .context("Failed to encode PNG")?;
-    Ok(buf.into_inner())
+    let mut out = Vec::new();
+    let encoder =
+        PngEncoder::new_with_quality(&mut out, CompressionType::Fast, PngFilterType::NoFilter);
+    match img {
+        DynamicImage::ImageRgb8(rgb) => {
+            encoder
+                .write_image(rgb.as_raw(), rgb.width(), rgb.height(), ExtendedColorType::Rgb8)
+                .context("Failed to encode PNG")?;
+        }
+        DynamicImage::ImageRgba8(rgba) => {
+            encoder
+                .write_image(
+                    rgba.as_raw(),
+                    rgba.width(),
+                    rgba.height(),
+                    ExtendedColorType::Rgba8,
+                )
+                .context("Failed to encode PNG")?;
+        }
+        other => {
+            let rgba = other.to_rgba8();
+            encoder
+                .write_image(
+                    rgba.as_raw(),
+                    rgba.width(),
+                    rgba.height(),
+                    ExtendedColorType::Rgba8,
+                )
+                .context("Failed to encode PNG")?;
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
     use super::*;
     use image::{ImageBuffer, RgbaImage};
 

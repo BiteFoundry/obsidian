@@ -125,10 +125,7 @@ impl Storage {
         removed: usize,
         elapsed_ms: u64,
     ) -> Result<IndexStats> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| anyhow!("Storage lock poisoned"))?;
+        let conn = self.read_conn()?;
         index_stats_on_conn(&conn, vault, scanned, updated, removed, elapsed_ms)
     }
 
@@ -164,17 +161,14 @@ impl Storage {
 
         // Expand any removed/renamed-away directory prefixes against indexed notes in SQLite.
         if !removed_dir_prefixes.is_empty() {
-            let conn = self
-                .conn
-                .lock()
-                .map_err(|_| anyhow!("Storage lock poisoned"))?;
+            let conn = self.read_conn()?;
             let mut stmt = if cfg!(windows) {
-                conn.prepare(
+                conn.prepare_cached(
                     "SELECT rel_path FROM notes
                      WHERE vault_id = ?1 AND (LOWER(folder) = LOWER(?2) OR LOWER(folder) LIKE LOWER(?3))",
                 )?
             } else {
-                conn.prepare(
+                conn.prepare_cached(
                     "SELECT rel_path FROM notes
                      WHERE vault_id = ?1 AND (folder = ?2 OR folder LIKE ?3)",
                 )?
@@ -540,7 +534,14 @@ impl Storage {
             is_bookmarked: bool,
             prev_aliases: Option<&'a str>,
         }
-        let mut to_upsert: Vec<PreparedNote<'_>> = Vec::new();
+        struct WorkItem<'a> {
+            entry: &'a crate::vault::fs::DiskNoteEntry,
+            stored_hash_to_skip: Option<&'a str>,
+            is_bookmarked: bool,
+            prev_aliases: Option<&'a str>,
+        }
+
+        let mut work: Vec<WorkItem<'_>> = Vec::new();
         for entry in &disk_entries {
             match existing.get(&entry.rel_path) {
                 Some((mt_ms, mt_ns, sz, stored_hash, is_bm, aliases))
@@ -549,44 +550,83 @@ impl Storage {
                         && *sz == entry.size_bytes =>
                 {
                     if force_hash_check {
-                        let Ok(bytes) = fs::read(&entry.abs_path) else {
-                            // Unreadable / locked file: keep last successful index intact.
-                            continue;
-                        };
-                        let disk_hash = content_sha256_hex(&bytes);
-                        if stored_hash.is_empty() || *stored_hash != disk_hash {
-                            let raw = decode_utf8_lossy(bytes);
-                            let parsed = parse_markdown(&entry.rel_path, &entry.title, &raw);
-                            to_upsert.push(PreparedNote {
-                                entry,
-                                parsed,
-                                disk_hash,
-                                is_bookmarked: *is_bm,
-                                prev_aliases: Some(aliases.as_str()),
-                            });
-                        }
+                        work.push(WorkItem {
+                            entry,
+                            stored_hash_to_skip: (!stored_hash.is_empty())
+                                .then_some(stored_hash.as_str()),
+                            is_bookmarked: *is_bm,
+                            prev_aliases: Some(aliases.as_str()),
+                        });
                     }
                 }
                 existing_row => {
-                    let Ok(bytes) = fs::read(&entry.abs_path) else {
-                        // Unreadable / locked file: never poison SQLite with empty content.
-                        continue;
-                    };
-                    let disk_hash = content_sha256_hex(&bytes);
-                    let is_bm = existing_row.map(|t| t.4).unwrap_or(false);
-                    let prev_aliases = existing_row.map(|t| t.5.as_str());
-                    let raw = decode_utf8_lossy(bytes);
-                    let parsed = parse_markdown(&entry.rel_path, &entry.title, &raw);
-                    to_upsert.push(PreparedNote {
+                    work.push(WorkItem {
                         entry,
-                        parsed,
-                        disk_hash,
-                        is_bookmarked: is_bm,
-                        prev_aliases,
+                        stored_hash_to_skip: None,
+                        is_bookmarked: existing_row.map(|t| t.4).unwrap_or(false),
+                        prev_aliases: existing_row.map(|t| t.5.as_str()),
                     });
                 }
             }
         }
+
+        fn prepare_item<'a>(item: &WorkItem<'a>) -> Option<PreparedNote<'a>> {
+            let bytes = fs::read(&item.entry.abs_path).ok()?;
+            let disk_hash = content_sha256_hex(&bytes);
+            if item
+                .stored_hash_to_skip
+                .is_some_and(|stored| stored == disk_hash)
+            {
+                return None;
+            }
+            let raw = decode_utf8_lossy(bytes);
+            let parsed = parse_markdown(&item.entry.rel_path, &item.entry.title, &raw);
+            Some(PreparedNote {
+                entry: item.entry,
+                parsed,
+                disk_hash,
+                is_bookmarked: item.is_bookmarked,
+                prev_aliases: item.prev_aliases,
+            })
+        }
+
+        let to_upsert: Vec<PreparedNote<'_>> = if work.len() >= 8 {
+            let workers = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .min(8)
+                .min(work.len());
+            if workers <= 1 {
+                work.iter().filter_map(prepare_item).collect()
+            } else {
+                let chunk_size = work.len().div_ceil(workers);
+                std::thread::scope(|s| {
+                    let handles: Vec<_> = work
+                        .chunks(chunk_size)
+                        .map(|chunk| {
+                            s.spawn(move || {
+                                let mut local = Vec::with_capacity(chunk.len());
+                                for item in chunk {
+                                    if let Some(prepared) = prepare_item(item) {
+                                        local.push(prepared);
+                                    }
+                                }
+                                local
+                            })
+                        })
+                        .collect();
+                    let mut out = Vec::with_capacity(work.len());
+                    for handle in handles {
+                        if let Ok(local) = handle.join() {
+                            out.extend(local);
+                        }
+                    }
+                    out
+                })
+            }
+        } else {
+            work.iter().filter_map(prepare_item).collect()
+        };
 
         let updated_count = to_upsert.len();
         let removed_count = removed_paths.len();

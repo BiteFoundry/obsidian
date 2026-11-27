@@ -620,30 +620,38 @@ impl GraphSim {
 /// - Distributes outer nodes across a uniform-area golden-angle Fermat spiral (no single-ring pileups!)
 /// - Runs deterministic cooled short-range spring-repulsion relaxation with strict `[0.08, 0.92]` bounds
 pub fn compute_graph_layout(graph: &GraphData) -> HashMap<String, (f64, f64)> {
-    let mut pos: HashMap<String, (f64, f64)> = HashMap::new();
     let n = graph.nodes.len();
+    let mut pos: HashMap<String, (f64, f64)> = HashMap::with_capacity(n);
     if n == 0 {
         return pos;
     }
 
     let sorted = sorted_graph_nodes(graph);
     let focal = sorted[0];
-    pos.insert(focal.id.clone(), (0.50, 0.50));
     if n == 1 {
+        pos.insert(focal.id.clone(), (0.50, 0.50));
         return pos;
     }
 
-    let center_is_local = graph.center.is_some();
-    let mut ring1: Vec<&GraphNode> = Vec::new();
-    let mut outer: Vec<&GraphNode> = Vec::new();
+    let mut id_to_idx: HashMap<&str, usize> = HashMap::with_capacity(n);
+    for (idx, gn) in sorted.iter().enumerate() {
+        id_to_idx.insert(gn.id.as_str(), idx);
+    }
 
-    for &node in &sorted[1..] {
+    let mut xs = vec![0.50_f64; n];
+    let mut ys = vec![0.50_f64; n];
+
+    let center_is_local = graph.center.is_some();
+    let mut ring1: Vec<usize> = Vec::new();
+    let mut outer: Vec<usize> = Vec::new();
+
+    for (idx, &node) in sorted.iter().enumerate().skip(1) {
         if (center_is_local && node.depth <= 1 && ring1.len() < MAX_RING1_NODES)
             || (!center_is_local && ring1.len() < 8)
         {
-            ring1.push(node);
+            ring1.push(idx);
         } else {
-            outer.push(node);
+            outer.push(idx);
         }
     }
 
@@ -652,15 +660,10 @@ pub fn compute_graph_layout(graph: &GraphData) -> HashMap<String, (f64, f64)> {
         let r1_count = ring1.len() as f64;
         let rx = if outer.is_empty() { 0.32 } else { 0.21 };
         let ry = if outer.is_empty() { 0.30 } else { 0.20 };
-        for (i, node) in ring1.iter().enumerate() {
+        for (i, &node_idx) in ring1.iter().enumerate() {
             let angle = -FRAC_PI_2 + (i as f64 / r1_count) * TAU;
-            pos.insert(
-                node.id.clone(),
-                (
-                    (0.50 + rx * angle.cos()).clamp(0.08, 0.92),
-                    (0.50 + ry * angle.sin()).clamp(0.08, 0.92),
-                ),
-            );
+            xs[node_idx] = (0.50 + rx * angle.cos()).clamp(0.08, 0.92);
+            ys[node_idx] = (0.50 + ry * angle.sin()).clamp(0.08, 0.92);
         }
     }
 
@@ -672,127 +675,177 @@ pub fn compute_graph_layout(graph: &GraphData) -> HashMap<String, (f64, f64)> {
         let r_min_sq = r_min * r_min;
         let r_span_sq = r_max * r_max - r_min_sq;
         let m = outer.len() as f64;
-        for (i, node) in outer.iter().enumerate() {
+        for (i, &node_idx) in outer.iter().enumerate() {
             let frac = (i as f64 + 0.5) / m;
             let r = (r_min_sq + r_span_sq * frac).sqrt();
             let theta = -FRAC_PI_2 + (i as f64 + 1.0) * golden_angle;
-            let x = (0.50 + r * theta.cos()).clamp(0.08, 0.92);
-            let y = (0.50 + r * 0.96 * theta.sin()).clamp(0.08, 0.92);
-            pos.insert(node.id.clone(), (x, y));
+            xs[node_idx] = (0.50 + r * theta.cos()).clamp(0.08, 0.92);
+            ys[node_idx] = (0.50 + r * 0.96 * theta.sin()).clamp(0.08, 0.92);
         }
     }
 
-    // Deterministic canonical node & edge ordering for cooled short-range relaxation
-    let ids: Vec<String> = sorted.iter().map(|gn| gn.id.clone()).collect();
-    let pinned_id = ids[0].as_str();
-    let mut canonical_edges: Vec<(&str, &str)> = graph
+    // Deterministic canonical edge index pairs for cooled short-range relaxation
+    let mut edge_pairs: Vec<(usize, usize)> = graph
         .edges
         .iter()
         .filter(|e| e.source != e.target)
-        .map(|e| {
-            if e.source <= e.target {
-                (e.source.as_str(), e.target.as_str())
-            } else {
-                (e.target.as_str(), e.source.as_str())
-            }
+        .filter_map(|e| {
+            let &u = id_to_idx.get(e.source.as_str())?;
+            let &v = id_to_idx.get(e.target.as_str())?;
+            Some(if u < v { (u, v) } else { (v, u) })
         })
         .collect();
-    canonical_edges.sort_unstable();
-    canonical_edges.dedup();
+    edge_pairs.sort_unstable();
+    edge_pairs.dedup();
 
     let ideal = (0.58 / (n as f64).sqrt()).clamp(0.10, 0.26);
     let rep_cutoff = ideal * 1.55;
     let rep_cutoff_sq = rep_cutoff * rep_cutoff;
-    let mut vel: HashMap<&str, (f64, f64)> =
-        ids.iter().map(|id| (id.as_str(), (0.0, 0.0))).collect();
+
+    let mut vx = vec![0.0_f64; n];
+    let mut vy = vec![0.0_f64; n];
+    let mut fx = vec![0.0_f64; n];
+    let mut fy = vec![0.0_f64; n];
+
+    // Uniform spatial grid for O(N) short-range repulsion when n > 64.
+    // Because dy is scaled by 1.25, a pair can interact only if |dx| < rep_cutoff and |dy_raw| < rep_cutoff / 1.25.
+    let use_grid = n > 64;
+    let inv_cell_x = 1.0 / rep_cutoff;
+    let inv_cell_y = 1.25 / rep_cutoff;
+    let grid_w = (((0.84 * inv_cell_x).floor() as usize) + 1).max(1);
+    let grid_h = (((0.84 * inv_cell_y).floor() as usize) + 1).max(1);
+    let mut cell_head = if use_grid {
+        vec![-1i32; grid_w * grid_h]
+    } else {
+        Vec::new()
+    };
+    let mut next_node = if use_grid {
+        vec![-1i32; n]
+    } else {
+        Vec::new()
+    };
+
+    #[derive(Clone, Copy)]
+    struct RepParams {
+        ideal: f64,
+        cutoff: f64,
+        cutoff_sq: f64,
+    }
+    let rep_params = RepParams {
+        ideal,
+        cutoff: rep_cutoff,
+        cutoff_sq: rep_cutoff_sq,
+    };
+
+    #[inline(always)]
+    fn apply_repulsion(
+        i: usize,
+        j: usize,
+        xs: &[f64],
+        ys: &[f64],
+        fx: &mut [f64],
+        fy: &mut [f64],
+        params: RepParams,
+    ) {
+        let dx = xs[i] - xs[j];
+        let dy = (ys[i] - ys[j]) * 1.25;
+        let dist_sq = dx * dx + dy * dy;
+        if dist_sq >= params.cutoff_sq {
+            return;
+        }
+        let dist = dist_sq.max(1e-5).sqrt();
+        let overlap = 1.0 - dist / params.cutoff;
+        let rep = (overlap * overlap * params.ideal * 0.45).min(0.032);
+        let (ux, uy) = if dist > 1e-4 {
+            (dx / dist, dy / dist)
+        } else {
+            let fallback_ang = ((i * 31 + j * 17) as f64) * 0.618;
+            (fallback_ang.cos(), fallback_ang.sin())
+        };
+        let rx = ux * rep;
+        let ry = uy * rep * 0.80;
+        fx[i] += rx;
+        fy[i] += ry;
+        fx[j] -= rx;
+        fy[j] -= ry;
+    }
 
     const ITERS: usize = 30;
     for iter in 0..ITERS {
-        let mut forces: HashMap<&str, (f64, f64)> =
-            ids.iter().map(|id| (id.as_str(), (0.0, 0.0))).collect();
+        fx.fill(0.0);
+        fy.fill(0.0);
 
         // Short-range pairwise repulsion (keeps labels separated without slamming onto borders)
-        for i in 0..ids.len() {
-            for j in (i + 1)..ids.len() {
-                let id_i = ids[i].as_str();
-                let id_j = ids[j].as_str();
-                let Some(&(x1, y1)) = pos.get(id_i) else {
-                    continue;
-                };
-                let Some(&(x2, y2)) = pos.get(id_j) else {
-                    continue;
-                };
-                let dx = x1 - x2;
-                let dy = (y1 - y2) * 1.25;
-                let dist_sq = dx * dx + dy * dy;
-                if dist_sq >= rep_cutoff_sq {
-                    continue;
+        if !use_grid {
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    apply_repulsion(i, j, &xs, &ys, &mut fx, &mut fy, rep_params);
                 }
-                let dist = dist_sq.max(1e-5).sqrt();
-                let overlap = 1.0 - dist / rep_cutoff;
-                let rep = (overlap * overlap * ideal * 0.45).min(0.032);
-                let (ux, uy) = if dist > 1e-4 {
-                    (dx / dist, dy / dist)
-                } else {
-                    let fallback_ang = ((i * 31 + j * 17) as f64) * 0.618;
-                    (fallback_ang.cos(), fallback_ang.sin())
-                };
-                let fx = ux * rep;
-                let fy = uy * rep * 0.80;
-                if let Some(f) = forces.get_mut(id_i) {
-                    f.0 += fx;
-                    f.1 += fy;
-                }
-                if let Some(f) = forces.get_mut(id_j) {
-                    f.0 -= fx;
-                    f.1 -= fy;
+            }
+        } else {
+            cell_head.fill(-1);
+            // Insert in reverse so each cell's linked list iterates in ascending node index order.
+            for i in (0..n).rev() {
+                let cx = (((xs[i] - 0.08) * inv_cell_x) as isize).clamp(0, grid_w as isize - 1)
+                    as usize;
+                let cy = (((ys[i] - 0.08) * inv_cell_y) as isize).clamp(0, grid_h as isize - 1)
+                    as usize;
+                let cell = cy * grid_w + cx;
+                next_node[i] = cell_head[cell];
+                cell_head[cell] = i as i32;
+            }
+            for i in 0..n {
+                let cx = (((xs[i] - 0.08) * inv_cell_x) as isize).clamp(0, grid_w as isize - 1);
+                let cy = (((ys[i] - 0.08) * inv_cell_y) as isize).clamp(0, grid_h as isize - 1);
+                let min_ny = (cy - 1).max(0) as usize;
+                let max_ny = (cy + 1).min(grid_h as isize - 1) as usize;
+                let min_nx = (cx - 1).max(0) as usize;
+                let max_nx = (cx + 1).min(grid_w as isize - 1) as usize;
+                for ny in min_ny..=max_ny {
+                    let row_off = ny * grid_w;
+                    for nx in min_nx..=max_nx {
+                        let mut cur = cell_head[row_off + nx];
+                        while cur >= 0 {
+                            let j = cur as usize;
+                            if i < j {
+                                apply_repulsion(i, j, &xs, &ys, &mut fx, &mut fy, rep_params);
+                            }
+                            cur = next_node[j];
+                        }
+                    }
                 }
             }
         }
 
         // Gentle edge spring attraction toward adaptive ideal distance
-        for &(src, dst) in &canonical_edges {
-            let Some(&(x1, y1)) = pos.get(src) else {
-                continue;
-            };
-            let Some(&(x2, y2)) = pos.get(dst) else {
-                continue;
-            };
-            let dx = x2 - x1;
-            let dy = y2 - y1;
+        for &(u, v) in &edge_pairs {
+            let dx = xs[v] - xs[u];
+            let dy = ys[v] - ys[u];
             let dist = (dx * dx + dy * dy).sqrt().max(0.01);
             let pull = ((dist - ideal) * 0.055).clamp(-0.018, 0.018);
-            let fx = (dx / dist) * pull;
-            let fy = (dy / dist) * pull;
-            if let Some(f) = forces.get_mut(src) {
-                f.0 += fx;
-                f.1 += fy;
-            }
-            if let Some(f) = forces.get_mut(dst) {
-                f.0 -= fx;
-                f.1 -= fy;
-            }
+            let efx = (dx / dist) * pull;
+            let efy = (dy / dist) * pull;
+            fx[u] += efx;
+            fy[u] += efy;
+            fx[v] -= efx;
+            fy[v] -= efy;
         }
 
         let cool = 1.0 - (iter as f64 / ITERS as f64) * 0.72;
         let max_step = 0.028 * cool;
-        for id in &ids {
-            let id_s = id.as_str();
-            if id_s == pinned_id {
-                continue;
-            }
-            let (fx, fy) = forces.get(id_s).copied().unwrap_or((0.0, 0.0));
-            let (vx0, vy0) = vel.get(id_s).copied().unwrap_or((0.0, 0.0));
-            let vx = ((vx0 + fx) * 0.65).clamp(-max_step, max_step);
-            let vy = ((vy0 + fy) * 0.65).clamp(-max_step, max_step);
-            vel.insert(id_s, (vx, vy));
-            if let Some(p) = pos.get_mut(id_s) {
-                p.0 = (p.0 + vx).clamp(0.08, 0.92);
-                p.1 = (p.1 + vy).clamp(0.08, 0.92);
-            }
+        for i in 1..n {
+            let nvx = ((vx[i] + fx[i]) * 0.65).clamp(-max_step, max_step);
+            let nvy = ((vy[i] + fy[i]) * 0.65).clamp(-max_step, max_step);
+            vx[i] = nvx;
+            vy[i] = nvy;
+            xs[i] = (xs[i] + nvx).clamp(0.08, 0.92);
+            ys[i] = (ys[i] + nvy).clamp(0.08, 0.92);
         }
     }
 
+    for (idx, gn) in sorted.iter().enumerate() {
+        pos.insert(gn.id.clone(), (xs[idx], ys[idx]));
+    }
     pos
 }
 

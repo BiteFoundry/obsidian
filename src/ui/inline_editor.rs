@@ -16,7 +16,10 @@
 //!   + vertical scrollbar, UTF-8/Korean input, Tab (2 spaces), clipboard paste, and Undo/Redo
 //! - 250ms debounced auto-save state tracking (`dirty`, `dirty_since`).
 
-use std::time::{Duration, Instant};
+use std::{
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
 use ratatui::{
     layout::{Position, Rect},
@@ -88,6 +91,26 @@ pub enum InlineEditEvent {
     Ignored,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LayoutCacheKey {
+    text_gen: u64,
+    width: usize,
+    mode: EditorMode,
+    cursor_line: usize,
+    selection: Option<(usize, usize)>,
+    theme_key: (
+        ratatui::style::Color,
+        ratatui::style::Color,
+        ratatui::style::Color,
+    ),
+}
+
+#[derive(Debug, Clone)]
+struct CachedVisualLayout {
+    key: LayoutCacheKey,
+    layout: Rc<EditorVisualLayout>,
+}
+
 #[derive(Debug, Clone)]
 pub struct InlineNoteEditor {
     pub note_path: String,
@@ -105,6 +128,7 @@ pub struct InlineNoteEditor {
     pub has_edited: bool,
     pub dirty_since: Option<Instant>,
     pub save_status: InlineSaveStatus,
+    layout_cache: Option<CachedVisualLayout>,
 }
 
 impl InlineNoteEditor {
@@ -152,6 +176,7 @@ impl InlineNoteEditor {
             has_edited: false,
             dirty_since: None,
             save_status: InlineSaveStatus::Saved,
+            layout_cache: None,
         };
         editor.snap_cursor_out_of_block_prefix();
         editor
@@ -707,18 +732,9 @@ impl InlineNoteEditor {
         let cursor = self.composer.cursor();
         let selection = self.composer.selection_range();
 
-        // Probe line count to decide whether to reserve 1 col for the right scrollbar
-        let probe_w = content_area.width.saturating_sub(1).max(1) as usize;
-        let probe_layout = build_visual_layout(
-            self.composer.text(),
-            probe_w,
-            cursor,
-            self.mode,
-            selection,
-            theme,
-        );
-        let show_scrollbar = probe_layout.rows.len() > body_h as usize && content_area.width > 3;
-        let content_w = if show_scrollbar {
+        // Reserve 1 column for the right vertical scrollbar upfront so `draw()` builds
+        // the visual layout at most once per frame (never twice) and caches across frames.
+        let content_w = if content_area.width > 3 {
             content_area.width.saturating_sub(1)
         } else {
             content_area.width
@@ -726,23 +742,43 @@ impl InlineNoteEditor {
         self.last_content_width = content_w;
         self.composer.last_inner_width = content_w;
         let text = self.composer.text();
-
-        let layout = if content_w as usize == probe_w {
-            probe_layout
+        let width_usize = content_w.max(1) as usize;
+        let (cursor_line_1b, _) = self.composer.cursor_line_col();
+        let key_cursor_line = if self.mode == EditorMode::LivePreview {
+            cursor_line_1b
         } else {
-            build_visual_layout(
+            0
+        };
+        let cache_key = LayoutCacheKey {
+            text_gen: self.composer.text_gen(),
+            width: width_usize,
+            mode: self.mode,
+            cursor_line: key_cursor_line,
+            selection,
+            theme_key: (theme.bg_canvas, theme.fg_primary, theme.accent),
+        };
+        let layout = if let Some(cached) = self.layout_cache.as_ref().filter(|c| c.key == cache_key)
+        {
+            Rc::clone(&cached.layout)
+        } else {
+            let built = Rc::new(build_visual_layout(
                 text,
-                content_w.max(1) as usize,
+                width_usize,
                 cursor,
                 self.mode,
                 selection,
                 theme,
-            )
+            ));
+            self.layout_cache = Some(CachedVisualLayout {
+                key: cache_key,
+                layout: Rc::clone(&built),
+            });
+            built
         };
 
+        let show_scrollbar = layout.rows.len() > body_h as usize && content_area.width > 3;
         let total_rows = layout.rows.len();
-        let cursor_row = layout.cursor_row;
-        let cursor_col = layout.cursor_col;
+        let (cursor_row, cursor_col) = project_cursor_in_layout(text, &layout, cursor);
         let view_h = body_h as usize;
         let max_scroll = total_rows.saturating_sub(view_h);
 
@@ -1009,11 +1045,61 @@ struct VisualRow {
     bg_tint: Option<ratatui::style::Color>,
 }
 
+#[derive(Debug, Clone)]
 struct EditorVisualLayout {
     ctx: Vec<LogicalLineInfo>,
     rows: Vec<VisualRow>,
+    /// Prefix row offsets per logical line (`len == ctx.len() + 1`).
+    line_row_starts: Vec<usize>,
+    #[allow(dead_code)]
     cursor_row: usize,
+    #[allow(dead_code)]
     cursor_col: usize,
+}
+
+fn project_cursor_in_layout(
+    text: &str,
+    layout: &EditorVisualLayout,
+    cursor: usize,
+) -> (usize, usize) {
+    if layout.ctx.is_empty() || layout.rows.is_empty() {
+        return (0, 0);
+    }
+    let line_idx = layout
+        .ctx
+        .partition_point(|info| info.end < cursor)
+        .min(layout.ctx.len().saturating_sub(1));
+    let row_start = layout.line_row_starts[line_idx];
+    let row_end = layout.line_row_starts[line_idx + 1];
+    let slice = &layout.rows[row_start..row_end];
+    if slice.is_empty() {
+        return (row_start.min(layout.rows.len().saturating_sub(1)), 0);
+    }
+    if slice[0].raw_slice.is_some() {
+        let mut last_row = row_start;
+        let mut last_col = 0usize;
+        for (rel_row, vrow) in slice.iter().enumerate() {
+            let abs_row = row_start + rel_row;
+            if let Some((start, end)) = vrow.raw_slice {
+                let mut col = 0usize;
+                let seg = text.get(start..end).unwrap_or("");
+                for (rel_idx, ch) in seg.char_indices() {
+                    if start + rel_idx == cursor {
+                        return (abs_row, col);
+                    }
+                    col += char_display_width(ch);
+                }
+                if cursor <= end {
+                    return (abs_row, col);
+                }
+                last_row = abs_row;
+                last_col = col;
+            }
+        }
+        (last_row, last_col)
+    } else {
+        project_cursor_onto_live_rows(slice, row_start, cursor)
+    }
 }
 
 fn byte_at_live_segments(
@@ -1242,9 +1328,11 @@ fn build_visual_layout(
         .min(ctx.len().saturating_sub(1));
 
     let mut rows: Vec<VisualRow> = Vec::with_capacity(ctx.len());
+    let mut line_row_starts: Vec<usize> = Vec::with_capacity(ctx.len() + 1);
     let mut cursor_pos: Option<(usize, usize)> = None;
 
     for (line_idx, info) in ctx.iter().enumerate() {
+        line_row_starts.push(rows.len());
         let sel_overlaps = selection.is_some_and(|(from, to)| from <= info.end && to >= info.start);
         let render_raw = match mode {
             EditorMode::Source => true,
@@ -1300,10 +1388,12 @@ fn build_visual_layout(
         }
     }
 
+    line_row_starts.push(rows.len());
     let (cursor_row, cursor_col) = cursor_pos.unwrap_or((rows.len().saturating_sub(1), 0));
     EditorVisualLayout {
         ctx,
         rows,
+        line_row_starts,
         cursor_row,
         cursor_col,
     }
@@ -2040,6 +2130,7 @@ enum LogicalLineKind {
     CodeBody,
 }
 
+#[derive(Debug, Clone)]
 struct LogicalLineInfo {
     start: usize,
     end: usize,

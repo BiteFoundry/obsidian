@@ -17,8 +17,10 @@
 //! - `POST /api/v1/reindex`
 
 use std::{
+    collections::HashMap,
     net::{IpAddr, Ipv6Addr, SocketAddr},
     sync::Arc,
+    time::Instant,
 };
 
 use anyhow::{bail, Context, Result};
@@ -33,6 +35,7 @@ use axum::{
 use rand::RngCore;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio::sync::Mutex as AsyncMutex;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::{
@@ -54,6 +57,47 @@ pub struct ServeState {
     pub default_vault: VaultProfile,
     pub storage: Storage,
     pub token: Option<String>,
+}
+
+/// Coalesces concurrent `sync_vault` requests per vault so bursty HTTP traffic runs a single
+/// background filesystem scan while sequential requests after disk writes always observe fresh state.
+#[derive(Default)]
+struct VaultSyncGate {
+    slots: std::sync::Mutex<HashMap<String, Arc<AsyncMutex<Option<Instant>>>>>,
+}
+
+impl VaultSyncGate {
+    fn slot(&self, vault_id: &str) -> Arc<AsyncMutex<Option<Instant>>> {
+        let mut map = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        Arc::clone(
+            map.entry(vault_id.to_string())
+                .or_insert_with(|| Arc::new(AsyncMutex::new(None))),
+        )
+    }
+
+    async fn sync_vault_coalesced(&self, storage: Storage, vault: VaultProfile) {
+        let arrived_at = Instant::now();
+        let slot = self.slot(&vault.id);
+        let mut last_started = slot.lock().await;
+        if last_started.is_some_and(|started| started >= arrived_at) {
+            return;
+        }
+        let started_at = Instant::now();
+        let _ = tokio::task::spawn_blocking(move || storage.sync_vault(&vault)).await;
+        *last_started = Some(started_at);
+    }
+
+    async fn record_synced(&self, vault_id: &str, started_at: Instant) {
+        let slot = self.slot(vault_id);
+        let mut last_started = slot.lock().await;
+        *last_started = Some(started_at);
+    }
+}
+
+#[derive(Clone)]
+struct RouterState {
+    serve: Arc<ServeState>,
+    sync_gate: Arc<VaultSyncGate>,
 }
 
 /// Request-origin policy of the HTTP API. The default accepts loopback hosts and origins only.
@@ -230,6 +274,10 @@ pub fn build_router(state: Arc<ServeState>) -> Router {
 /// exact origin; every route, including `/health`, sits behind the Host/Origin guard.
 pub fn build_router_with_policy(state: Arc<ServeState>, policy: ServePolicy) -> Router {
     let guard_policy = Arc::new(GuardPolicy::new(&policy));
+    let router_state = RouterState {
+        serve: state,
+        sync_gate: Arc::new(VaultSyncGate::default()),
+    };
     let mut router = Router::new()
         .route("/health", get(handle_health))
         .route("/api/v1/vaults", get(handle_list_vaults))
@@ -255,7 +303,7 @@ pub fn build_router_with_policy(state: Arc<ServeState>, policy: ServePolicy) -> 
     }
     router
         .layer(middleware::from_fn_with_state(guard_policy, guard))
-        .with_state(state)
+        .with_state(router_state)
 }
 
 /// Generates a 32-byte random Bearer token (64 hex characters) from the OS CSPRNG.
@@ -350,7 +398,9 @@ pub async fn run_http_server_with_options(
     let policy = serve_policy(&addr, &opts)?;
     let (token, generated) = resolve_serve_token(&addr, opts.token.clone(), opts.allow_keyless)?;
 
-    let _ = storage.sync_vault(&vault);
+    let init_storage = storage.clone();
+    let init_vault = vault.clone();
+    let _ = tokio::task::spawn_blocking(move || init_storage.sync_vault(&init_vault)).await;
     let state = Arc::new(ServeState {
         cfg,
         default_vault: vault.clone(),
@@ -412,12 +462,15 @@ fn resolve_req_vault_unsynced(
     }
 }
 
-fn resolve_req_vault(
-    state: &ServeState,
+async fn resolve_req_vault(
+    state: &RouterState,
     vault_param: Option<&str>,
 ) -> Result<VaultProfile, Box<Response>> {
-    let vault = resolve_req_vault_unsynced(state, vault_param)?;
-    let _ = state.storage.sync_vault(&vault);
+    let vault = resolve_req_vault_unsynced(&state.serve, vault_param)?;
+    state
+        .sync_gate
+        .sync_vault_coalesced(state.serve.storage.clone(), vault.clone())
+        .await;
     Ok(vault)
 }
 
@@ -425,47 +478,61 @@ fn err_resp(status: StatusCode, msg: &str) -> Response {
     (status, Json(json!({ "ok": false, "error": msg }))).into_response()
 }
 
-async fn handle_health(State(state): State<Arc<ServeState>>) -> impl IntoResponse {
-    let _ = state.storage.sync_vault(&state.default_vault);
-    let notes = state
-        .storage
-        .note_count(&state.default_vault.id)
+async fn handle_health(State(state): State<RouterState>) -> impl IntoResponse {
+    state
+        .sync_gate
+        .sync_vault_coalesced(
+            state.serve.storage.clone(),
+            state.serve.default_vault.clone(),
+        )
+        .await;
+    let storage = state.serve.storage.clone();
+    let vault_id = state.serve.default_vault.id.clone();
+    let notes = tokio::task::spawn_blocking(move || storage.note_count(&vault_id).unwrap_or(0))
+        .await
         .unwrap_or(0);
     Json(json!({
         "ok": true,
         "service": "obsidian-cli",
         "version": env!("CARGO_PKG_VERSION"),
-        "vault": state.default_vault.display_name(),
-        "vault_id": state.default_vault.id,
+        "vault": state.serve.default_vault.display_name(),
+        "vault_id": state.serve.default_vault.id,
         "notes": notes,
     }))
 }
 
-async fn handle_list_vaults(State(state): State<Arc<ServeState>>, headers: HeaderMap) -> Response {
-    if let Err(r) = check_auth(&state, &headers) {
+async fn handle_list_vaults(State(state): State<RouterState>, headers: HeaderMap) -> Response {
+    if let Err(r) = check_auth(&state.serve, &headers) {
         return *r;
     }
-    let vaults: Vec<VaultSummary> = merged_vaults(&state.cfg)
-        .into_iter()
-        .map(|v| {
-            let exists = v.path.is_dir();
-            if exists {
-                let _ = state.storage.sync_vault(&v);
-            }
-            let active = v.id == state.default_vault.id;
-            let count = state.storage.note_count(&v.id).unwrap_or(0);
-            VaultSummary {
-                id: v.id,
-                name: v.name,
-                exists,
-                path: v.path,
-                active,
-                discovered: v.discovered,
-                open_in_obsidian: v.open_in_obsidian,
-                note_count: count,
-            }
-        })
-        .collect();
+    let cfg = state.serve.cfg.clone();
+    let default_id = state.serve.default_vault.id.clone();
+    let storage = state.serve.storage.clone();
+    let vaults = tokio::task::spawn_blocking(move || {
+        merged_vaults(&cfg)
+            .into_iter()
+            .map(|v| {
+                let exists = v.path.is_dir();
+                if exists {
+                    let _ = storage.sync_vault(&v);
+                }
+                let active = v.id == default_id;
+                let count = storage.note_count(&v.id).unwrap_or(0);
+                VaultSummary {
+                    id: v.id,
+                    name: v.name,
+                    exists,
+                    path: v.path,
+                    active,
+                    discovered: v.discovered,
+                    open_in_obsidian: v.open_in_obsidian,
+                    note_count: count,
+                }
+            })
+            .collect::<Vec<VaultSummary>>()
+    })
+    .await
+    .unwrap_or_default();
     Json(json!({ "ok": true, "vaults": vaults })).into_response()
 }
 
@@ -477,24 +544,31 @@ struct SearchQuery {
 }
 
 async fn handle_search(
-    State(state): State<Arc<ServeState>>,
+    State(state): State<RouterState>,
     headers: HeaderMap,
     Query(q): Query<SearchQuery>,
 ) -> Response {
-    if let Err(r) = check_auth(&state, &headers) {
+    if let Err(r) = check_auth(&state.serve, &headers) {
         return *r;
     }
-    let vault = match resolve_req_vault(&state, q.vault.as_deref()) {
+    let vault = match resolve_req_vault(&state, q.vault.as_deref()).await {
         Ok(v) => v,
         Err(r) => return *r,
     };
     let query = q.q.unwrap_or_default();
     let limit = q.limit.unwrap_or(25).clamp(1, 200);
-    match state.storage.search_notes(&vault.id, &query, limit) {
-        Ok(hits) => {
+    let storage = state.serve.storage.clone();
+    let q_for_task = query.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        storage.search_notes(&vault.id, &q_for_task, limit)
+    })
+    .await;
+    match res {
+        Ok(Ok(hits)) => {
             Json(json!({ "ok": true, "query": query, "count": hits.len(), "results": hits }))
                 .into_response()
         }
+        Ok(Err(e)) => err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
         Err(e) => err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
@@ -506,21 +580,28 @@ struct ListNotesQuery {
 }
 
 async fn handle_list_notes(
-    State(state): State<Arc<ServeState>>,
+    State(state): State<RouterState>,
     headers: HeaderMap,
     Query(q): Query<ListNotesQuery>,
 ) -> Response {
-    if let Err(r) = check_auth(&state, &headers) {
+    if let Err(r) = check_auth(&state.serve, &headers) {
         return *r;
     }
-    let vault = match resolve_req_vault(&state, q.vault.as_deref()) {
+    let vault = match resolve_req_vault(&state, q.vault.as_deref()).await {
         Ok(v) => v,
         Err(r) => return *r,
     };
-    match state.storage.list_notes(&vault.id, q.folder.as_deref()) {
-        Ok(notes) => {
+    let storage = state.serve.storage.clone();
+    let folder = q.folder;
+    let res = tokio::task::spawn_blocking(move || {
+        storage.list_notes(&vault.id, folder.as_deref())
+    })
+    .await;
+    match res {
+        Ok(Ok(notes)) => {
             Json(json!({ "ok": true, "count": notes.len(), "notes": notes })).into_response()
         }
+        Ok(Err(e)) => err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
         Err(e) => err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
@@ -531,38 +612,43 @@ struct VaultOnlyQuery {
 }
 
 async fn handle_read_append_note(
-    State(state): State<Arc<ServeState>>,
+    State(state): State<RouterState>,
     headers: HeaderMap,
     Query(q): Query<VaultOnlyQuery>,
 ) -> Response {
-    read_note_response(&state, &headers, "append", q.vault.as_deref())
+    read_note_response(&state, &headers, "append", q.vault.as_deref()).await
 }
 
 async fn handle_read_note(
-    State(state): State<Arc<ServeState>>,
+    State(state): State<RouterState>,
     headers: HeaderMap,
     AxumPath(path): AxumPath<String>,
     Query(q): Query<VaultOnlyQuery>,
 ) -> Response {
-    read_note_response(&state, &headers, &path, q.vault.as_deref())
+    read_note_response(&state, &headers, &path, q.vault.as_deref()).await
 }
 
-fn read_note_response(
-    state: &ServeState,
+async fn read_note_response(
+    state: &RouterState,
     headers: &HeaderMap,
     note_ref: &str,
     vault_param: Option<&str>,
 ) -> Response {
-    if let Err(r) = check_auth(state, headers) {
+    if let Err(r) = check_auth(&state.serve, headers) {
         return *r;
     }
-    let vault = match resolve_req_vault(state, vault_param) {
+    let vault = match resolve_req_vault(state, vault_param).await {
         Ok(v) => v,
         Err(r) => return *r,
     };
-    match state.storage.load_note_detail(&vault, note_ref) {
-        Ok(detail) => Json(json!({ "ok": true, "note": detail })).into_response(),
-        Err(e) => err_resp(StatusCode::NOT_FOUND, &e.to_string()),
+    let storage = state.serve.storage.clone();
+    let note_ref = note_ref.to_string();
+    let res =
+        tokio::task::spawn_blocking(move || storage.load_note_detail(&vault, &note_ref)).await;
+    match res {
+        Ok(Ok(detail)) => Json(json!({ "ok": true, "note": detail })).into_response(),
+        Ok(Err(e)) => err_resp(StatusCode::NOT_FOUND, &e.to_string()),
+        Err(e) => err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
 
@@ -577,36 +663,39 @@ struct CreateNoteReq {
 }
 
 async fn handle_create_note(
-    State(state): State<Arc<ServeState>>,
+    State(state): State<RouterState>,
     headers: HeaderMap,
     Json(req): Json<CreateNoteReq>,
 ) -> Response {
-    if let Err(r) = check_auth(&state, &headers) {
+    if let Err(r) = check_auth(&state.serve, &headers) {
         return *r;
     }
-    let vault = match resolve_req_vault(&state, req.vault.as_deref()) {
+    let vault = match resolve_req_vault(&state, req.vault.as_deref()).await {
         Ok(v) => v,
         Err(r) => return *r,
     };
-    match create_note(
-        &vault.path,
-        &req.title,
-        req.folder.as_deref(),
-        req.content.as_deref(),
-        &req.tags,
-    ) {
-        Ok((rel_path, _)) => {
-            let _ = state
-                .storage
-                .sync_paths(&vault, std::slice::from_ref(&rel_path), &[]);
-            let detail = state.storage.load_note_detail(&vault, &rel_path).ok();
-            (
-                StatusCode::CREATED,
-                Json(json!({ "ok": true, "rel_path": rel_path, "note": detail })),
-            )
-                .into_response()
-        }
-        Err(e) => err_resp(StatusCode::BAD_REQUEST, &e.to_string()),
+    let storage = state.serve.storage.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        let (rel_path, _) = create_note(
+            &vault.path,
+            &req.title,
+            req.folder.as_deref(),
+            req.content.as_deref(),
+            &req.tags,
+        )?;
+        let _ = storage.sync_paths(&vault, std::slice::from_ref(&rel_path), &[]);
+        let detail = storage.load_note_detail(&vault, &rel_path).ok();
+        Ok::<_, anyhow::Error>((rel_path, detail))
+    })
+    .await;
+    match res {
+        Ok(Ok((rel_path, detail))) => (
+            StatusCode::CREATED,
+            Json(json!({ "ok": true, "rel_path": rel_path, "note": detail })),
+        )
+            .into_response(),
+        Ok(Err(e)) => err_resp(StatusCode::BAD_REQUEST, &e.to_string()),
+        Err(e) => err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
 
@@ -618,32 +707,35 @@ struct AppendNoteReq {
 }
 
 async fn handle_append_note(
-    State(state): State<Arc<ServeState>>,
+    State(state): State<RouterState>,
     headers: HeaderMap,
     Json(req): Json<AppendNoteReq>,
 ) -> Response {
-    if let Err(r) = check_auth(&state, &headers) {
+    if let Err(r) = check_auth(&state.serve, &headers) {
         return *r;
     }
-    let vault = match resolve_req_vault(&state, req.vault.as_deref()) {
+    let vault = match resolve_req_vault(&state, req.vault.as_deref()).await {
         Ok(v) => v,
         Err(r) => return *r,
     };
-    let rel_path = match state.storage.resolve_note_path(&vault.id, &req.note) {
-        Ok(p) => p,
-        Err(e) => return err_resp(StatusCode::NOT_FOUND, &e.to_string()),
-    };
-    let abs = match safe_vault_path(&vault.path, &rel_path) {
-        Ok(p) => p,
-        Err(e) => return err_resp(StatusCode::BAD_REQUEST, &e.to_string()),
-    };
-    if let Err(e) = append_to_note(&abs, &req.text) {
-        return err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
+    let storage = state.serve.storage.clone();
+    let res = tokio::task::spawn_blocking(move || -> Result<String, (StatusCode, String)> {
+        let rel_path = storage
+            .resolve_note_path(&vault.id, &req.note)
+            .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+        let abs = safe_vault_path(&vault.path, &rel_path)
+            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        append_to_note(&abs, &req.text)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let _ = storage.sync_paths(&vault, std::slice::from_ref(&rel_path), &[]);
+        Ok(rel_path)
+    })
+    .await;
+    match res {
+        Ok(Ok(rel_path)) => Json(json!({ "ok": true, "rel_path": rel_path })).into_response(),
+        Ok(Err((status, msg))) => err_resp(status, &msg),
+        Err(e) => err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
-    let _ = state
-        .storage
-        .sync_paths(&vault, std::slice::from_ref(&rel_path), &[]);
-    Json(json!({ "ok": true, "rel_path": rel_path })).into_response()
 }
 
 #[derive(Deserialize)]
@@ -654,11 +746,11 @@ struct DailyReq {
 }
 
 async fn handle_daily_note(
-    State(state): State<Arc<ServeState>>,
+    State(state): State<RouterState>,
     headers: HeaderMap,
     body: Option<Json<DailyReq>>,
 ) -> Response {
-    if let Err(r) = check_auth(&state, &headers) {
+    if let Err(r) = check_auth(&state.serve, &headers) {
         return *r;
     }
     let req = body.map(|b| b.0).unwrap_or(DailyReq {
@@ -666,40 +758,46 @@ async fn handle_daily_note(
         append: None,
         vault: None,
     });
-    let vault = match resolve_req_vault(&state, req.vault.as_deref()) {
+    let vault = match resolve_req_vault(&state, req.vault.as_deref()).await {
         Ok(v) => v,
         Err(r) => return *r,
     };
-    match ensure_daily_note(&vault, req.date.as_deref()) {
-        Ok((rel_path, abs_path, created)) => {
-            if let Some(text) = req.append.as_deref().filter(|s| !s.trim().is_empty()) {
-                if let Err(e) = append_to_note(&abs_path, text) {
-                    return err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
+    let storage = state.serve.storage.clone();
+    let res = tokio::task::spawn_blocking(move || -> Response {
+        match ensure_daily_note(&vault, req.date.as_deref()) {
+            Ok((rel_path, abs_path, created)) => {
+                if let Some(text) = req.append.as_deref().filter(|s| !s.trim().is_empty()) {
+                    if let Err(e) = append_to_note(&abs_path, text) {
+                        return err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
+                    }
                 }
+                let _ = storage.sync_paths(&vault, std::slice::from_ref(&rel_path), &[]);
+                let detail = storage.load_note_detail(&vault, &rel_path).ok();
+                Json(json!({
+                    "ok": true,
+                    "rel_path": rel_path,
+                    "created": created,
+                    "note": detail,
+                }))
+                .into_response()
             }
-            let _ = state
-                .storage
-                .sync_paths(&vault, std::slice::from_ref(&rel_path), &[]);
-            let detail = state.storage.load_note_detail(&vault, &rel_path).ok();
-            Json(json!({
-                "ok": true,
-                "rel_path": rel_path,
-                "created": created,
-                "note": detail,
-            }))
-            .into_response()
+            Err(e) => {
+                let invalid = e
+                    .downcast_ref::<CodedError>()
+                    .is_some_and(|c| c.code == "invalid_argument");
+                let status = if invalid {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                };
+                err_resp(status, &e.to_string())
+            }
         }
-        Err(e) => {
-            let invalid = e
-                .downcast_ref::<CodedError>()
-                .is_some_and(|c| c.code == "invalid_argument");
-            let status = if invalid {
-                StatusCode::BAD_REQUEST
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            };
-            err_resp(status, &e.to_string())
-        }
+    })
+    .await;
+    match res {
+        Ok(resp) => resp,
+        Err(e) => err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
 
@@ -710,29 +808,37 @@ struct BacklinksQuery {
 }
 
 async fn handle_backlinks(
-    State(state): State<Arc<ServeState>>,
+    State(state): State<RouterState>,
     headers: HeaderMap,
     Query(q): Query<BacklinksQuery>,
 ) -> Response {
-    if let Err(r) = check_auth(&state, &headers) {
+    if let Err(r) = check_auth(&state.serve, &headers) {
         return *r;
     }
-    let vault = match resolve_req_vault(&state, q.vault.as_deref()) {
+    let vault = match resolve_req_vault(&state, q.vault.as_deref()).await {
         Ok(v) => v,
         Err(r) => return *r,
     };
-    let rel_path = match state.storage.resolve_note_path(&vault.id, &q.note) {
-        Ok(p) => p,
-        Err(e) => return err_resp(StatusCode::NOT_FOUND, &e.to_string()),
-    };
-    match state.storage.get_backlinks(&vault.id, &rel_path) {
-        Ok(backlinks) => Json(json!({
-            "ok": true,
-            "note": rel_path,
-            "count": backlinks.len(),
-            "backlinks": backlinks,
-        }))
-        .into_response(),
+    let storage = state.serve.storage.clone();
+    let res = tokio::task::spawn_blocking(move || -> Response {
+        let rel_path = match storage.resolve_note_path(&vault.id, &q.note) {
+            Ok(p) => p,
+            Err(e) => return err_resp(StatusCode::NOT_FOUND, &e.to_string()),
+        };
+        match storage.get_backlinks(&vault.id, &rel_path) {
+            Ok(backlinks) => Json(json!({
+                "ok": true,
+                "note": rel_path,
+                "count": backlinks.len(),
+                "backlinks": backlinks,
+            }))
+            .into_response(),
+            Err(e) => err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        }
+    })
+    .await;
+    match res {
+        Ok(resp) => resp,
         Err(e) => err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
@@ -745,27 +851,35 @@ struct GraphQuery {
 }
 
 async fn handle_graph(
-    State(state): State<Arc<ServeState>>,
+    State(state): State<RouterState>,
     headers: HeaderMap,
     Query(q): Query<GraphQuery>,
 ) -> Response {
-    if let Err(r) = check_auth(&state, &headers) {
+    if let Err(r) = check_auth(&state.serve, &headers) {
         return *r;
     }
-    let vault = match resolve_req_vault(&state, q.vault.as_deref()) {
+    let vault = match resolve_req_vault(&state, q.vault.as_deref()).await {
         Ok(v) => v,
         Err(r) => return *r,
     };
-    let center = match q.note.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        Some(n) => match state.storage.resolve_note_path(&vault.id, n) {
-            Ok(p) => Some(p),
-            Err(e) => return err_resp(StatusCode::NOT_FOUND, &e.to_string()),
-        },
-        None => None,
-    };
     let depth = q.depth.unwrap_or(2).clamp(1, 5);
-    match state.storage.get_graph(&vault, center.as_deref(), depth) {
-        Ok(graph) => Json(json!({ "ok": true, "graph": graph })).into_response(),
+    let storage = state.serve.storage.clone();
+    let res = tokio::task::spawn_blocking(move || -> Response {
+        let center = match q.note.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(n) => match storage.resolve_note_path(&vault.id, n) {
+                Ok(p) => Some(p),
+                Err(e) => return err_resp(StatusCode::NOT_FOUND, &e.to_string()),
+            },
+            None => None,
+        };
+        match storage.get_graph(&vault, center.as_deref(), depth) {
+            Ok(graph) => Json(json!({ "ok": true, "graph": graph })).into_response(),
+            Err(e) => err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        }
+    })
+    .await;
+    match res {
+        Ok(resp) => resp,
         Err(e) => err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
@@ -777,35 +891,43 @@ struct TagsQuery {
 }
 
 async fn handle_tags(
-    State(state): State<Arc<ServeState>>,
+    State(state): State<RouterState>,
     headers: HeaderMap,
     Query(q): Query<TagsQuery>,
 ) -> Response {
-    if let Err(r) = check_auth(&state, &headers) {
+    if let Err(r) = check_auth(&state.serve, &headers) {
         return *r;
     }
-    let vault = match resolve_req_vault(&state, q.vault.as_deref()) {
+    let vault = match resolve_req_vault(&state, q.vault.as_deref()).await {
         Ok(v) => v,
         Err(r) => return *r,
     };
-    if let Some(tag) = q.tag.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        match state.storage.find_by_tag(&vault.id, tag) {
-            Ok(notes) => Json(json!({
-                "ok": true,
-                "tag": tag.trim_start_matches('#'),
-                "count": notes.len(),
-                "notes": notes,
-            }))
-            .into_response(),
-            Err(e) => err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-        }
-    } else {
-        match state.storage.list_tags(&vault.id) {
-            Ok(tags) => {
-                Json(json!({ "ok": true, "count": tags.len(), "tags": tags })).into_response()
+    let storage = state.serve.storage.clone();
+    let res = tokio::task::spawn_blocking(move || -> Response {
+        if let Some(tag) = q.tag.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            match storage.find_by_tag(&vault.id, tag) {
+                Ok(notes) => Json(json!({
+                    "ok": true,
+                    "tag": tag.trim_start_matches('#'),
+                    "count": notes.len(),
+                    "notes": notes,
+                }))
+                .into_response(),
+                Err(e) => err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
             }
-            Err(e) => err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        } else {
+            match storage.list_tags(&vault.id) {
+                Ok(tags) => {
+                    Json(json!({ "ok": true, "count": tags.len(), "tags": tags })).into_response()
+                }
+                Err(e) => err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+            }
         }
+    })
+    .await;
+    match res {
+        Ok(resp) => resp,
+        Err(e) => err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
 
@@ -817,14 +939,14 @@ struct TasksQuery {
 }
 
 async fn handle_tasks(
-    State(state): State<Arc<ServeState>>,
+    State(state): State<RouterState>,
     headers: HeaderMap,
     Query(q): Query<TasksQuery>,
 ) -> Response {
-    if let Err(r) = check_auth(&state, &headers) {
+    if let Err(r) = check_auth(&state.serve, &headers) {
         return *r;
     }
-    let vault = match resolve_req_vault(&state, q.vault.as_deref()) {
+    let vault = match resolve_req_vault(&state, q.vault.as_deref()).await {
         Ok(v) => v,
         Err(r) => return *r,
     };
@@ -838,20 +960,25 @@ async fn handle_tasks(
         Some("done") => TaskFilter::Done,
         _ => TaskFilter::All,
     };
-    let note_path = match q.note.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        Some(n) => match state.storage.resolve_note_path(&vault.id, n) {
-            Ok(p) => Some(p),
-            Err(e) => return err_resp(StatusCode::NOT_FOUND, &e.to_string()),
-        },
-        None => None,
-    };
-    match state
-        .storage
-        .list_tasks(&vault.id, filter, note_path.as_deref())
-    {
-        Ok(tasks) => {
-            Json(json!({ "ok": true, "count": tasks.len(), "tasks": tasks })).into_response()
+    let storage = state.serve.storage.clone();
+    let res = tokio::task::spawn_blocking(move || -> Response {
+        let note_path = match q.note.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(n) => match storage.resolve_note_path(&vault.id, n) {
+                Ok(p) => Some(p),
+                Err(e) => return err_resp(StatusCode::NOT_FOUND, &e.to_string()),
+            },
+            None => None,
+        };
+        match storage.list_tasks(&vault.id, filter, note_path.as_deref()) {
+            Ok(tasks) => {
+                Json(json!({ "ok": true, "count": tasks.len(), "tasks": tasks })).into_response()
+            }
+            Err(e) => err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
         }
+    })
+    .await;
+    match res {
+        Ok(resp) => resp,
         Err(e) => err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
@@ -867,84 +994,96 @@ struct ToggleTaskReq {
 }
 
 async fn handle_toggle_task(
-    State(state): State<Arc<ServeState>>,
+    State(state): State<RouterState>,
     headers: HeaderMap,
     Json(req): Json<ToggleTaskReq>,
 ) -> Response {
-    if let Err(r) = check_auth(&state, &headers) {
+    if let Err(r) = check_auth(&state.serve, &headers) {
         return *r;
     }
-    let vault = match resolve_req_vault(&state, req.vault.as_deref()) {
+    let vault = match resolve_req_vault(&state, req.vault.as_deref()).await {
         Ok(v) => v,
         Err(r) => return *r,
     };
-    let rel_path = match state.storage.resolve_note_path(&vault.id, &req.note) {
-        Ok(p) => p,
-        Err(e) => return err_resp(StatusCode::NOT_FOUND, &e.to_string()),
-    };
-    let abs = match safe_vault_path(&vault.path, &rel_path) {
-        Ok(p) => p,
-        Err(e) => return err_resp(StatusCode::BAD_REQUEST, &e.to_string()),
-    };
-    if let Some(expected_mtime) = req.expected_mtime_ms {
-        let (actual_mtime, _) = file_mtime_and_size(&abs);
-        if actual_mtime != expected_mtime {
-            return err_resp(
-                StatusCode::CONFLICT,
-                &format!(
-                    "Task conflict: note '{rel_path}' modified externally (expected mtime_ms {expected_mtime}, found {actual_mtime})"
-                ),
-            );
+    let storage = state.serve.storage.clone();
+    let res = tokio::task::spawn_blocking(move || -> Response {
+        let rel_path = match storage.resolve_note_path(&vault.id, &req.note) {
+            Ok(p) => p,
+            Err(e) => return err_resp(StatusCode::NOT_FOUND, &e.to_string()),
+        };
+        let abs = match safe_vault_path(&vault.path, &rel_path) {
+            Ok(p) => p,
+            Err(e) => return err_resp(StatusCode::BAD_REQUEST, &e.to_string()),
+        };
+        if let Some(expected_mtime) = req.expected_mtime_ms {
+            let (actual_mtime, _) = file_mtime_and_size(&abs);
+            if actual_mtime != expected_mtime {
+                return err_resp(
+                    StatusCode::CONFLICT,
+                    &format!(
+                        "Task conflict: note '{rel_path}' modified externally (expected mtime_ms {expected_mtime}, found {actual_mtime})"
+                    ),
+                );
+            }
         }
-    }
-    match toggle_task_at_line_verified(
-        &abs,
-        req.line,
-        req.expected_text.as_deref(),
-        req.expected_checked,
-    ) {
-        Ok(checked) => {
-            let _ = state
-                .storage
-                .sync_paths(&vault, std::slice::from_ref(&rel_path), &[]);
-            Json(json!({
-                "ok": true,
-                "rel_path": rel_path,
-                "line": req.line,
-                "checked": checked,
-            }))
-            .into_response()
+        match toggle_task_at_line_verified(
+            &abs,
+            req.line,
+            req.expected_text.as_deref(),
+            req.expected_checked,
+        ) {
+            Ok(checked) => {
+                let _ = storage.sync_paths(&vault, std::slice::from_ref(&rel_path), &[]);
+                Json(json!({
+                    "ok": true,
+                    "rel_path": rel_path,
+                    "line": req.line,
+                    "checked": checked,
+                }))
+                .into_response()
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                let status = if msg.starts_with("Task conflict") {
+                    StatusCode::CONFLICT
+                } else {
+                    StatusCode::BAD_REQUEST
+                };
+                err_resp(status, &msg)
+            }
         }
-        Err(e) => {
-            let msg = e.to_string();
-            let status = if msg.starts_with("Task conflict") {
-                StatusCode::CONFLICT
-            } else {
-                StatusCode::BAD_REQUEST
-            };
-            err_resp(status, &msg)
-        }
+    })
+    .await;
+    match res {
+        Ok(resp) => resp,
+        Err(e) => err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
 
 async fn handle_reindex(
-    State(state): State<Arc<ServeState>>,
+    State(state): State<RouterState>,
     headers: HeaderMap,
     body: Option<Json<Value>>,
 ) -> Response {
-    if let Err(r) = check_auth(&state, &headers) {
+    if let Err(r) = check_auth(&state.serve, &headers) {
         return *r;
     }
     let vault_spec = body
         .as_ref()
         .and_then(|v| v.0.get("vault"))
         .and_then(|v| v.as_str());
-    let vault = match resolve_req_vault_unsynced(&state, vault_spec) {
+    let vault = match resolve_req_vault_unsynced(&state.serve, vault_spec) {
         Ok(v) => v,
         Err(r) => return *r,
     };
-    match state.storage.reindex_vault(&vault) {
-        Ok(stats) => Json(json!({ "ok": true, "stats": stats })).into_response(),
+    let started_at = Instant::now();
+    let storage = state.serve.storage.clone();
+    let vault_id = vault.id.clone();
+    let res = tokio::task::spawn_blocking(move || storage.reindex_vault(&vault)).await;
+    state.sync_gate.record_synced(&vault_id, started_at).await;
+    match res {
+        Ok(Ok(stats)) => Json(json!({ "ok": true, "stats": stats })).into_response(),
+        Ok(Err(e)) => err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
         Err(e) => err_resp(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }

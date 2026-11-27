@@ -8,6 +8,8 @@
 //!   styled wrapped Markdown Tables (`bitefoundry_html::layout::render_wrapped_table`),
 //!   sanitized `HtmlEmbed` cards (`[H: HTML]`), Math, Footnotes, Blockquotes, and Dividers.
 
+use std::rc::Rc;
+
 use bitefoundry_html::{
     render_wrapped_table, wrap_styled_spans, TableAlign, TableBorder, TableSpec, WrapPrefix,
 };
@@ -42,6 +44,81 @@ struct RenderedLine {
     html_pill: Option<(u16, u16, usize)>,
     action_pills: Vec<(u16, u16, ButtonId)>,
     bg_override: Option<Color>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CanvasLinesCacheKey {
+    data_gen: u64,
+    rel_path: String,
+    mtime_ms: i64,
+    is_bookmarked: bool,
+    blocks_len: usize,
+    raw_len: usize,
+    images_len: usize,
+    width: usize,
+    selected_block: usize,
+    focused: bool,
+    page_width: PageWidthMode,
+    show_inline_hrefs: bool,
+    inline_images: bool,
+    preview_cache_len: usize,
+    html_files_len: usize,
+    cell_px: (u16, u16),
+    theme_key: (Color, Color, Color),
+}
+
+pub(crate) struct CanvasLinesCache {
+    key: CanvasLinesCacheKey,
+    lines: Rc<Vec<RenderedLine>>,
+}
+
+fn cached_canvas_lines(
+    detail: &NoteDetail,
+    app: &AppState,
+    ui: &UiState,
+    theme: &Theme,
+    width: usize,
+    selected_block: usize,
+    focused: bool,
+) -> Rc<Vec<RenderedLine>> {
+    let key = CanvasLinesCacheKey {
+        data_gen: app.data_gen,
+        rel_path: detail.summary.rel_path.clone(),
+        mtime_ms: detail.summary.mtime_ms,
+        is_bookmarked: detail.summary.is_bookmarked,
+        blocks_len: detail.parsed.blocks.len(),
+        raw_len: detail.raw_markdown.len(),
+        images_len: detail.images.len(),
+        width,
+        selected_block,
+        focused,
+        page_width: ui.page_width,
+        show_inline_hrefs: ui.show_inline_hrefs,
+        inline_images: app.cfg.inline_images,
+        preview_cache_len: app.preview_cache.len(),
+        html_files_len: app.html_files.len(),
+        cell_px: app.graphics_caps.cell_px,
+        theme_key: (theme.bg_canvas, theme.fg_primary, theme.accent),
+    };
+    if let Some(cache) = ui.canvas_lines_cache.borrow().as_ref() {
+        if cache.key == key {
+            return Rc::clone(&cache.lines);
+        }
+    }
+    let lines = Rc::new(build_canvas_lines(
+        detail,
+        app,
+        ui,
+        theme,
+        width,
+        selected_block,
+        focused,
+    ));
+    *ui.canvas_lines_cache.borrow_mut() = Some(CanvasLinesCache {
+        key,
+        lines: Rc::clone(&lines),
+    });
+    lines
 }
 
 pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiState, hitmap: &mut HitMap) {
@@ -104,7 +181,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &AppState, ui: &mut UiState, hit
         .canvas_selected_block
         .min(detail.parsed.blocks.len().saturating_sub(1));
 
-    let lines = build_canvas_lines(detail, app, ui, &theme, width, selected_block, focused);
+    let lines = cached_canvas_lines(detail, app, ui, &theme, width, selected_block, focused);
 
     // Find visual line of the selected block so scrolling follows selection smoothly
     let total_lines = lines.len();

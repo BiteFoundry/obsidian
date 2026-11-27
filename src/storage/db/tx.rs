@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::{
     config::VaultProfile,
@@ -18,8 +18,10 @@ pub(super) fn decode_utf8_lossy(bytes: Vec<u8>) -> String {
 }
 
 pub(super) fn delete_note_in_tx(tx: &rusqlite::Transaction<'_>, vault_id: &str, rel_path: &str) -> Result<()> {
-    tx.prepare_cached("DELETE FROM notes WHERE vault_id = ?1 AND rel_path = ?2")?
-        .execute(params![vault_id, rel_path])?;
+    let deleted_rowid: Option<i64> = tx
+        .prepare_cached("DELETE FROM notes WHERE vault_id = ?1 AND rel_path = ?2 RETURNING rowid")?
+        .query_row(params![vault_id, rel_path], |r| r.get(0))
+        .optional()?;
     tx.prepare_cached("DELETE FROM links WHERE vault_id = ?1 AND source_path = ?2")?
         .execute(params![vault_id, rel_path])?;
     tx.prepare_cached("DELETE FROM tags WHERE vault_id = ?1 AND note_path = ?2")?
@@ -28,8 +30,10 @@ pub(super) fn delete_note_in_tx(tx: &rusqlite::Transaction<'_>, vault_id: &str, 
         .execute(params![vault_id, rel_path])?;
     tx.prepare_cached("DELETE FROM tasks WHERE vault_id = ?1 AND note_path = ?2")?
         .execute(params![vault_id, rel_path])?;
-    tx.prepare_cached("DELETE FROM notes_fts WHERE vault_id = ?1 AND rel_path = ?2")?
-        .execute(params![vault_id, rel_path])?;
+    if let Some(rowid) = deleted_rowid {
+        tx.prepare_cached("DELETE FROM notes_fts WHERE rowid = ?1")?
+            .execute(params![rowid])?;
+    }
     Ok(())
 }
 
@@ -43,32 +47,20 @@ pub(super) fn index_stats_on_conn(
 ) -> Result<IndexStats> {
     let vault_id = vault.id.as_str();
     let total_notes: usize = conn
-        .query_row(
-            "SELECT COUNT(*) FROM notes WHERE vault_id = ?1",
-            params![vault_id],
-            |r| r.get::<_, i64>(0),
-        )?
+        .prepare_cached("SELECT COUNT(*) FROM notes WHERE vault_id = ?1")?
+        .query_row(params![vault_id], |r| r.get::<_, i64>(0))?
         .max(0) as usize;
     let total_links: usize = conn
-        .query_row(
-            "SELECT COUNT(*) FROM links WHERE vault_id = ?1",
-            params![vault_id],
-            |r| r.get::<_, i64>(0),
-        )?
+        .prepare_cached("SELECT COUNT(*) FROM links WHERE vault_id = ?1")?
+        .query_row(params![vault_id], |r| r.get::<_, i64>(0))?
         .max(0) as usize;
     let total_tags: usize = conn
-        .query_row(
-            "SELECT COUNT(DISTINCT tag) FROM tags WHERE vault_id = ?1",
-            params![vault_id],
-            |r| r.get::<_, i64>(0),
-        )?
+        .prepare_cached("SELECT COUNT(DISTINCT tag) FROM tags WHERE vault_id = ?1")?
+        .query_row(params![vault_id], |r| r.get::<_, i64>(0))?
         .max(0) as usize;
     let total_tasks: usize = conn
-        .query_row(
-            "SELECT COUNT(*) FROM tasks WHERE vault_id = ?1",
-            params![vault_id],
-            |r| r.get::<_, i64>(0),
-        )?
+        .prepare_cached("SELECT COUNT(*) FROM tasks WHERE vault_id = ?1")?
+        .query_row(params![vault_id], |r| r.get::<_, i64>(0))?
         .max(0) as usize;
     Ok(IndexStats {
         vault_id: vault.id.clone(),
@@ -363,38 +355,43 @@ pub(super) fn upsert_note_in_tx(
     let aliases_text = parsed.aliases.join(" ");
     let tags_text = parsed.tags.join(" ");
 
-    tx.prepare_cached(
-        "INSERT INTO notes (
-            vault_id, rel_path, title, folder, frontmatter_json, aliases_json,
-            body_plain, word_count, mtime_ms, mtime_ns, size_bytes, content_hash, is_bookmarked
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-         ON CONFLICT(vault_id, rel_path) DO UPDATE SET
-            title = excluded.title,
-            folder = excluded.folder,
-            frontmatter_json = excluded.frontmatter_json,
-            aliases_json = excluded.aliases_json,
-            body_plain = excluded.body_plain,
-            word_count = excluded.word_count,
-            mtime_ms = excluded.mtime_ms,
-            mtime_ns = excluded.mtime_ns,
-            size_bytes = excluded.size_bytes,
-            content_hash = excluded.content_hash",
-    )?
-    .execute(params![
-        vault_id,
-        rel_path,
-        title,
-        folder,
-        fm_json,
-        aliases_json,
-        parsed.body_plain,
-        parsed.word_count as i64,
-        mtime_ms,
-        mtime_ns,
-        size_bytes,
-        content_hash,
-        i64::from(is_bookmarked),
-    ])?;
+    let note_rowid: i64 = tx
+        .prepare_cached(
+            "INSERT INTO notes (
+                vault_id, rel_path, title, folder, frontmatter_json, aliases_json,
+                body_plain, word_count, mtime_ms, mtime_ns, size_bytes, content_hash, is_bookmarked
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+             ON CONFLICT(vault_id, rel_path) DO UPDATE SET
+                title = excluded.title,
+                folder = excluded.folder,
+                frontmatter_json = excluded.frontmatter_json,
+                aliases_json = excluded.aliases_json,
+                body_plain = excluded.body_plain,
+                word_count = excluded.word_count,
+                mtime_ms = excluded.mtime_ms,
+                mtime_ns = excluded.mtime_ns,
+                size_bytes = excluded.size_bytes,
+                content_hash = excluded.content_hash
+             RETURNING rowid",
+        )?
+        .query_row(
+            params![
+                vault_id,
+                rel_path,
+                title,
+                folder,
+                fm_json,
+                aliases_json,
+                parsed.body_plain,
+                parsed.word_count as i64,
+                mtime_ms,
+                mtime_ns,
+                size_bytes,
+                content_hash,
+                i64::from(is_bookmarked),
+            ],
+            |r| r.get(0),
+        )?;
 
     tx.prepare_cached("DELETE FROM links WHERE vault_id = ?1 AND source_path = ?2")?
         .execute(params![vault_id, rel_path])?;
@@ -480,14 +477,15 @@ pub(super) fn upsert_note_in_tx(
     }
 
     if replace_fts {
-        tx.prepare_cached("DELETE FROM notes_fts WHERE vault_id = ?1 AND rel_path = ?2")?
-            .execute(params![vault_id, rel_path])?;
+        tx.prepare_cached("DELETE FROM notes_fts WHERE rowid = ?1")?
+            .execute(params![note_rowid])?;
     }
     tx.prepare_cached(
-        "INSERT INTO notes_fts (vault_id, rel_path, title, rel_path_text, aliases, tags, body_plain)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO notes_fts (rowid, vault_id, rel_path, title, rel_path_text, aliases, tags, body_plain)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
     )?
     .execute(params![
+        note_rowid,
         vault_id,
         rel_path,
         title,

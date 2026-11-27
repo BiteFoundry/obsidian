@@ -1,17 +1,14 @@
-//! Full-text FTS5 search and Korean/CJK substring LIKE fallback.
+//! Full-text FTS5 trigram search and `< 3`-char substring LIKE fallback.
 
-use std::collections::{HashMap, HashSet};
-
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use rusqlite::{params, Connection};
 
-use super::{notes::load_tags_map, Storage};
+use super::{notes::load_tags_for_note, Storage};
 use crate::models::{SearchHit, SearchPage};
 
 impl Storage {
-    /// Full-text search via SQLite FTS5. Korean/CJK queries also run a substring `LIKE` scan
-    /// (alone below 3 characters, merged after the FTS hits otherwise), so they match inside
-    /// longer words such as `주간회의록` for `회의록`.
+    /// Full-text search via SQLite FTS5 (`trigram` tokenizer), falling back to a `LIKE`
+    /// scan only when a query contains `< 3`-char tokens (or when FTS5 yields no hits).
     pub fn search_notes(
         &self,
         vault_id: &str,
@@ -48,55 +45,57 @@ impl Storage {
         query: &str,
         fetch: usize,
     ) -> Result<Vec<SearchHit>> {
+        let conn = self.read_conn()?;
         let q = query.trim();
         if q.is_empty() {
-            let notes = self.list_notes(vault_id, None)?;
-            return Ok(notes
-                .into_iter()
-                .take(fetch)
-                .map(|n| SearchHit {
-                    rel_path: n.rel_path,
-                    title: n.title,
-                    folder: n.folder,
+            let mut stmt = conn.prepare_cached(
+                "SELECT rel_path, title, folder, word_count, mtime_ms
+                 FROM notes
+                 WHERE vault_id = ?1
+                 ORDER BY LOWER(folder) ASC, LOWER(title) ASC, rel_path ASC
+                 LIMIT ?2",
+            )?;
+            let rows: Vec<(String, String, String, usize, i64)> = stmt
+                .query_map(params![vault_id, fetch as i64], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, i64>(3)?.max(0) as usize,
+                        r.get::<_, i64>(4)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+
+            let mut out = Vec::with_capacity(rows.len());
+            for (rel_path, title, folder, word_count, mtime_ms) in rows {
+                let tags = load_tags_for_note(&conn, vault_id, &rel_path)?;
+                out.push(SearchHit {
+                    rel_path,
+                    title,
+                    folder,
                     snippet: String::new(),
-                    tags: n.tags,
-                    word_count: n.word_count,
-                    mtime_ms: n.mtime_ms,
-                })
-                .collect());
+                    tags,
+                    word_count,
+                    mtime_ms,
+                });
+            }
+            return Ok(out);
         }
 
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| anyhow!("Storage lock poisoned"))?;
-        let tags_map = load_tags_map(&conn, vault_id)?;
+        let tokens = extract_query_tokens(q);
+        // Trigram FTS5 requires >= 3 characters per token; only fall back to LIKE directly
+        // when the query has `< 3`-char tokens (or contains literal LIKE-wildcard chars with CJK
+        // that trigram still matches verbatim).
+        let has_short_token =
+            tokens.is_empty() || tokens.iter().any(|tok| tok.chars().count() < 3);
 
-        // Use LIKE fallback when query has <3 chars with Hangul/CJK or very short token
-        let use_like_first = should_use_short_cjk_like(q);
-        // `unicode61` indexes a run of Hangul/CJK as one token and FTS5 only matches token
-        // prefixes, so a CJK query misses words that merely contain it. Longer CJK queries
-        // therefore merge the substring scan in after the ranked FTS hits.
-        let merge_like = !use_like_first && contains_cjk(q);
-        if !use_like_first {
-            let fts_query = build_fts5_query(q);
+        if !has_short_token {
+            let fts_query = build_trigram_fts5_query(&tokens);
             if !fts_query.is_empty() {
-                let fts_res = run_fts5_search(&conn, vault_id, &fts_query, fetch, &tags_map);
-                if let Ok(hits) = fts_res {
-                    if merge_like {
-                        let mut merged = hits;
-                        let mut seen: HashSet<String> =
-                            merged.iter().map(|h| h.rel_path.clone()).collect();
-                        for hit in run_like_search(&conn, vault_id, q, fetch, &tags_map)? {
-                            if merged.len() >= fetch {
-                                break;
-                            }
-                            if seen.insert(hit.rel_path.clone()) {
-                                merged.push(hit);
-                            }
-                        }
-                        return Ok(merged);
-                    }
+                if let Ok(hits) =
+                    run_fts5_search(&conn, vault_id, &fts_query, &tokens, contains_cjk(q), fetch)
+                {
                     if !hits.is_empty() {
                         return Ok(hits);
                     }
@@ -105,9 +104,8 @@ impl Storage {
         }
 
         // Fallback: case-insensitive LIKE over title, rel_path, aliases, tags, body_plain
-        run_like_search(&conn, vault_id, q, fetch, &tags_map)
+        run_like_search(&conn, vault_id, q, fetch)
     }
-
 }
 
 pub fn should_use_short_cjk_like(query: &str) -> bool {
@@ -130,68 +128,183 @@ fn contains_cjk(s: &str) -> bool {
     })
 }
 
-fn build_fts5_query(raw: &str) -> String {
-    let tokens: Vec<String> = raw
-        .split_whitespace()
+fn extract_query_tokens(raw: &str) -> Vec<String> {
+    raw.split_whitespace()
         .filter_map(|tok| {
             let clean = tok
                 .trim_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '-' && c != '/');
-            if clean.is_empty() {
-                None
-            } else {
-                let escaped = clean.replace('"', "\"\"");
-                Some(format!("\"{escaped}\"*"))
-            }
+            (!clean.is_empty()).then(|| clean.to_string())
         })
-        .collect();
-    tokens.join(" AND ")
+        .collect()
+}
+
+fn build_trigram_fts5_query(tokens: &[String]) -> String {
+    tokens
+        .iter()
+        .map(|tok| {
+            let escaped = tok.replace('"', "\"\"");
+            format!("\"{escaped}\"")
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ")
+}
+
+/// Returns `true` if `haystack` contains `needle_lower` starting at a word boundary
+/// (start of string or preceded by a non-alphanumeric character).
+fn contains_at_word_boundary(haystack_lower: &str, needle_lower: &str) -> bool {
+    if needle_lower.is_empty() {
+        return true;
+    }
+    let mut start = 0;
+    while let Some(rel) = haystack_lower[start..].find(needle_lower) {
+        let abs = start + rel;
+        let prev_ok = haystack_lower[..abs]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric());
+        if prev_ok {
+            return true;
+        }
+        let step = haystack_lower[abs..]
+            .chars()
+            .next()
+            .map_or(1, char::len_utf8);
+        start = abs + step;
+    }
+    false
+}
+
+fn row_matches_word_boundaries(
+    tokens_lower: &[String],
+    title: &str,
+    rel_path: &str,
+    aliases_json: &str,
+    tags: &[String],
+    body_plain: &str,
+) -> bool {
+    let title_low = title.to_lowercase();
+    let rp_low = rel_path.to_lowercase();
+    let aliases_low = aliases_json.to_lowercase();
+    let body_low = body_plain.to_lowercase();
+    tokens_lower.iter().all(|tok| {
+        contains_at_word_boundary(&title_low, tok)
+            || contains_at_word_boundary(&rp_low, tok)
+            || contains_at_word_boundary(&aliases_low, tok)
+            || contains_at_word_boundary(&body_low, tok)
+            || tags
+                .iter()
+                .any(|t| contains_at_word_boundary(&t.to_lowercase(), tok))
+    })
 }
 
 fn run_fts5_search(
     conn: &Connection,
     vault_id: &str,
     fts_query: &str,
+    tokens: &[String],
+    is_cjk: bool,
     limit: usize,
-    tags_map: &HashMap<String, Vec<String>>,
 ) -> Result<Vec<SearchHit>> {
-    let mut stmt = conn.prepare(
+    // Over-fetch slightly so word-boundary ranking/filtering never truncates exact hits prematurely.
+    let candidate_limit = limit.saturating_mul(4).clamp(limit, 400);
+    let mut stmt = conn.prepare_cached(
         "SELECT f.rel_path, n.title, n.folder,
                 snippet(notes_fts, 6, '[', ']', '...', 14) AS snip,
-                n.word_count, n.mtime_ms
+                n.word_count, n.mtime_ms, n.aliases_json, n.body_plain
          FROM notes_fts f
-         JOIN notes n ON n.vault_id = f.vault_id AND n.rel_path = f.rel_path
+         JOIN notes n ON n.rowid = f.rowid
          WHERE f.vault_id = ?1 AND notes_fts MATCH ?2
          ORDER BY bm25(notes_fts, 0.0, 0.0, 6.0, 2.0, 4.0, 3.0, 1.0) ASC, f.rel_path ASC
          LIMIT ?3",
     )?;
-    let rows = stmt.query_map(params![vault_id, fts_query, limit as i64], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-            r.get::<_, Option<String>>(3)?.unwrap_or_default(),
-            r.get::<_, i64>(4)?.max(0) as usize,
-            r.get::<_, i64>(5)?,
-        ))
-    })?;
+    struct FtsCandidateRow {
+        rel_path: String,
+        title: String,
+        folder: String,
+        snippet: String,
+        word_count: usize,
+        mtime_ms: i64,
+        aliases_json: String,
+        body_plain: String,
+    }
 
-    let mut out = Vec::new();
-    for r in rows {
-        let (rel_path, title, folder, snippet, word_count, mtime_ms) = r?;
-        out.push(SearchHit {
-            tags: tags_map.get(&rel_path).cloned().unwrap_or_default(),
+    let raw_rows: Vec<FtsCandidateRow> = stmt
+        .query_map(params![vault_id, fts_query, candidate_limit as i64], |r| {
+            Ok(FtsCandidateRow {
+                rel_path: r.get(0)?,
+                title: r.get(1)?,
+                folder: r.get(2)?,
+                snippet: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                word_count: r.get::<_, i64>(4)?.max(0) as usize,
+                mtime_ms: r.get(5)?,
+                aliases_json: r.get(6)?,
+                body_plain: r.get(7)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    if raw_rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let tokens_lower: Vec<String> = tokens.iter().map(|t| t.to_lowercase()).collect();
+    let mut boundary_hits = Vec::new();
+    let mut substring_hits = Vec::new();
+
+    for FtsCandidateRow {
+        rel_path,
+        title,
+        folder,
+        snippet,
+        word_count,
+        mtime_ms,
+        aliases_json,
+        body_plain,
+    } in raw_rows
+    {
+        let tags = load_tags_for_note(conn, vault_id, &rel_path)?;
+        let is_boundary = row_matches_word_boundaries(
+            &tokens_lower,
+            &title,
+            &rel_path,
+            &aliases_json,
+            &tags,
+            &body_plain,
+        );
+        let hit = SearchHit {
             rel_path,
             title,
             folder,
             snippet: snippet.replace('\n', " "),
+            tags,
             word_count,
             mtime_ms,
-        });
+        };
+        if is_boundary {
+            boundary_hits.push(hit);
+        } else {
+            substring_hits.push(hit);
+        }
     }
-    Ok(out)
+
+    if is_cjk {
+        // CJK keeps word-boundary matches ranked first, followed by mid-word substring matches
+        // (e.g. `회의록 작성` before `주간회의록`, both via O(log N) trigram index).
+        boundary_hits.extend(substring_hits);
+        boundary_hits.truncate(limit);
+        Ok(boundary_hits)
+    } else if !boundary_hits.is_empty() {
+        // Non-CJK preserves word-prefix FTS semantics when boundary matches exist
+        // (e.g. `meeting` matches `meeting notes` without pulling in `premeeting`).
+        boundary_hits.truncate(limit);
+        Ok(boundary_hits)
+    } else {
+        substring_hits.truncate(limit);
+        Ok(substring_hits)
+    }
 }
 
-fn escape_like_pattern(raw: &str) -> String {
+pub(super) fn escape_like_pattern(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     for ch in raw.chars() {
         match ch {
@@ -210,10 +323,9 @@ fn run_like_search(
     vault_id: &str,
     query: &str,
     limit: usize,
-    tags_map: &HashMap<String, Vec<String>>,
 ) -> Result<Vec<SearchHit>> {
     let pattern = format!("%{}%", escape_like_pattern(&query.to_lowercase()));
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT n.rel_path, n.title, n.folder, n.body_plain, n.word_count, n.mtime_ms
          FROM notes n
          WHERE n.vault_id = ?1
@@ -233,24 +345,26 @@ fn run_like_search(
            n.rel_path ASC
          LIMIT ?3",
     )?;
-    let rows = stmt.query_map(params![vault_id, pattern, limit as i64], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-            r.get::<_, String>(3)?,
-            r.get::<_, i64>(4)?.max(0) as usize,
-            r.get::<_, i64>(5)?,
-        ))
-    })?;
+    let rows: Vec<(String, String, String, String, usize, i64)> = stmt
+        .query_map(params![vault_id, pattern, limit as i64], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?.max(0) as usize,
+                r.get::<_, i64>(5)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
 
-    let mut out = Vec::new();
-    for r in rows {
-        let (rel_path, title, folder, body_plain, word_count, mtime_ms) = r?;
+    let mut out = Vec::with_capacity(rows.len());
+    for (rel_path, title, folder, body_plain, word_count, mtime_ms) in rows {
         let snippet = extract_context_snippet(&body_plain, query)
             .unwrap_or_else(|| first_line_preview(&body_plain, 96));
+        let tags = load_tags_for_note(conn, vault_id, &rel_path)?;
         out.push(SearchHit {
-            tags: tags_map.get(&rel_path).cloned().unwrap_or_default(),
+            tags,
             rel_path,
             title,
             folder,

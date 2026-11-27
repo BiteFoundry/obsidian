@@ -98,6 +98,7 @@ impl AppState {
                     self.graphics_caps.cell_px,
                 ) {
                     self.preview_cache.insert(key, rendered);
+                    self.bump_data_gen();
                 }
             }
         }

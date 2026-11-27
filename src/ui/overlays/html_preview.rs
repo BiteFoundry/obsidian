@@ -789,36 +789,59 @@ impl HtmlPreviewOverlay {
 
         let html_theme = html_theme_from_ui(&theme);
 
-        // First render at full inner width to check whether a vertical scrollbar is needed.
-        let initial_lines = self
-            .session
-            .render(inner.width, &html_theme, ui.show_inline_hrefs)
-            .lines
-            .len();
-        let show_scrollbar = initial_lines > visible && inner.width > 2;
-        let content_w = if show_scrollbar {
+        // Reserve 1 column for the vertical scrollbar upfront so `HtmlViewSession`'s
+        // 1-slot width cache never thrashes between `inner.width` and `inner.width - 1`.
+        let content_w = if inner.width > 2 {
             inner.width.saturating_sub(1)
         } else {
             inner.width
         };
 
-        let (mut lines, total_lines, control_count, focused_line, graphics) = {
+        let (total_lines, control_count, focused_line, graphics, mut visible_lines, vp_start) = {
             let focused_idx = self.session.focused_control;
+            let initial_scroll_y = self.session.scroll_y;
+            let raw_mode = self.session.raw_mode;
             let rendered = self
                 .session
                 .render(content_w, &html_theme, ui.show_inline_hrefs);
+            let total_lines = rendered.lines.len();
+            let control_count = rendered.controls.len();
             let focused_line = focused_idx
                 .and_then(|idx| rendered.controls.get(idx))
                 .map(|c| c.line);
+
+            let max_scroll = total_lines.saturating_sub(visible) as u16;
+            let mut scroll_y = initial_scroll_y;
+            if self.pending_scroll_to_focus {
+                if let Some(fl) = focused_line {
+                    let sy = scroll_y as usize;
+                    if fl < sy {
+                        scroll_y = fl.min(u16::MAX as usize) as u16;
+                    } else if fl >= sy + visible && visible > 0 {
+                        scroll_y = fl.saturating_sub(visible - 1).min(u16::MAX as usize) as u16;
+                    }
+                }
+            }
+            scroll_y = scroll_y.min(max_scroll);
+            let vp_start = scroll_y as usize;
+            let vp_end = vp_start.saturating_add(visible).min(total_lines);
+            let visible_lines: Vec<Line<'static>> = rendered.lines[vp_start..vp_end].to_vec();
+            let graphics = if !raw_mode && !rendered.graphics.is_empty() {
+                rendered.graphics.clone()
+            } else {
+                Vec::new()
+            };
             (
-                rendered.lines.clone(),
-                rendered.lines.len(),
-                rendered.controls.len(),
+                total_lines,
+                control_count,
                 focused_line,
-                rendered.graphics.clone(),
+                graphics,
+                visible_lines,
+                vp_start,
             )
         };
 
+        let show_scrollbar = total_lines > visible && inner.width > 2;
         let max_scroll = total_lines.saturating_sub(visible) as u16;
         if self.pending_scroll_to_focus {
             if let Some(fl) = focused_line {
@@ -848,7 +871,6 @@ impl HtmlPreviewOverlay {
                 self.graphic_cache_bg = bg_rgb;
             }
 
-            let vp_start = self.session.scroll_y as usize;
             let vp_end = vp_start.saturating_add(visible);
 
             for g in &graphics {
@@ -898,8 +920,10 @@ impl HtmlPreviewOverlay {
                         .enumerate()
                     {
                         let dst_idx = g.line_start + offset;
-                        if let Some(slot) = lines.get_mut(dst_idx) {
-                            *slot = img_line.clone();
+                        if dst_idx >= vp_start && dst_idx < vp_end {
+                            if let Some(slot) = visible_lines.get_mut(dst_idx - vp_start) {
+                                *slot = img_line.clone();
+                            }
                         }
                     }
                 } else {
@@ -942,9 +966,8 @@ impl HtmlPreviewOverlay {
         }
 
         frame.render_widget(
-            Paragraph::new(lines)
-                .style(Style::default().bg(theme.bg_elevated).fg(theme.fg_primary))
-                .scroll((self.session.scroll_y, 0)),
+            Paragraph::new(visible_lines)
+                .style(Style::default().bg(theme.bg_elevated).fg(theme.fg_primary)),
             content_rect,
         );
 

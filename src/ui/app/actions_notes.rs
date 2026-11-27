@@ -37,6 +37,7 @@ impl AppState {
                         if let Some(slot) = self.notes.iter_mut().find(|n| n.rel_path == rp) {
                             slot.is_bookmarked = bm;
                         }
+                        self.bump_data_gen();
                         self.clamp_selections(ui);
                         ui.toasts.success(if bm {
                             "Bookmarked note"

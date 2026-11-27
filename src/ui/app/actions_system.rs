@@ -48,6 +48,7 @@ impl AppState {
             }
             Action::RefreshAll => {
                 self.preview_cache.clear();
+                self.bump_data_gen();
                 if self.sync_ctrl.try_reindex_now() {
                     ui.toasts.info("Reindexing vault...");
                 } else if let Ok(stats) = self.storage.reindex_vault(&self.active_vault) {
@@ -95,6 +96,7 @@ impl AppState {
                 self.cfg.theme = preset;
                 ui.theme = Theme::detect(preset);
                 self.preview_cache.clear();
+                self.bump_data_gen();
                 if let Some(images) = self.active_note.as_ref().map(|d| d.images.clone()) {
                     self.cache_inline_images_list(&images, ui);
                 }
