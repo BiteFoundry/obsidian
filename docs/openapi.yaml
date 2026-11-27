@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: "@bitefoundry/obsidian Local HTTP API"
-  version: "0.4.10"
+  version: "0.4.11"
   description: >-
     Local HTTP JSON API for Obsidian vaults, FTS5 search, backlinks, knowledge graph, tasks, and daily notes
     (`bitefoundry-obsidian serve`, default `:8792`). Every `/api/v1/*` request needs a Bearer token: the one
