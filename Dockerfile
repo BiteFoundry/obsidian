@@ -5,13 +5,13 @@
 # seconds and match the published release artifact.
 #
 # Examples:
-#   docker run -i --rm -v ~/MyVault:/data/vault ghcr.io/bitefoundry/obsidian:0.4.9
+#   docker run -i --rm -v ~/MyVault:/data/vault ghcr.io/bitefoundry/obsidian:0.4.10
 #
 #   docker run -i --rm -v ~/MyVault:/vault -e OBSIDIAN_VAULT=/vault \
-#     ghcr.io/bitefoundry/obsidian:0.4.9
+#     ghcr.io/bitefoundry/obsidian:0.4.10
 FROM debian:bookworm-slim
 
-ARG OBSIDIAN_VERSION=0.4.9
+ARG OBSIDIAN_VERSION=0.4.10
 ARG TARGETARCH
 
 LABEL org.opencontainers.image.title="obsidian" \
