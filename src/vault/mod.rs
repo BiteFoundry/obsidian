@@ -127,7 +127,7 @@ pub fn discover_native_vaults_from(config_path: &Path) -> Vec<VaultProfile> {
 pub fn derive_vault_id(path: &Path) -> String {
     let key = normalize_path_key(path);
     let digest = Sha256::digest(key.as_bytes());
-    hex::encode(&digest[..8])
+    crate::hex_encode(&digest[..8])
 }
 
 /// Merges manually registered vaults in `cfg` with auto-discovered vaults from `obsidian.json`.

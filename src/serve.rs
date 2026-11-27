@@ -262,7 +262,7 @@ pub fn build_router_with_policy(state: Arc<ServeState>, policy: ServePolicy) -> 
 pub fn generate_serve_token() -> String {
     let mut bytes = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
-    hex::encode(bytes)
+    crate::hex_encode(bytes)
 }
 
 /// Decides the Bearer token for a bind address. Returns `(token, generated)`.

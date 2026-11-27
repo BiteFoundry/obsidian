@@ -750,7 +750,9 @@ fn cli_and_mcp_move_rewrites_inline_markdown_links_and_preserves_bytes() {
             .unwrap()
             .strip_suffix(')')
             .unwrap();
-        let md_decoded = urlencoding::decode(md_dest).unwrap();
+        let md_decoded = percent_encoding::percent_decode_str(md_dest)
+            .decode_utf8()
+            .unwrap();
         assert_eq!(
             fs::read_to_string(root.join(md_decoded.as_ref())).unwrap(),
             plan_body

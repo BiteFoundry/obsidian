@@ -471,11 +471,59 @@ pub(crate) fn verify_sha256_sums(
         bail!("Checksum entry for '{asset_name}' not found in SHA256SUMS.txt");
     };
 
-    let actual = hex::encode(Sha256::digest(asset_bytes));
+    let actual = crate::hex_encode(Sha256::digest(asset_bytes));
     if !actual.eq_ignore_ascii_case(&expected) {
         bail!("SHA-256 verification failed ({asset_name}): expected {expected}, actual {actual}");
     }
     Ok(())
+}
+
+struct TempExtractDir(PathBuf);
+
+impl TempExtractDir {
+    fn create() -> std::io::Result<Self> {
+        use rand::RngCore;
+        let base = std::env::temp_dir();
+        let pid = std::process::id();
+        for _ in 0..32 {
+            let mut nonce = [0u8; 8];
+            rand::rngs::OsRng.fill_bytes(&mut nonce);
+            let dir = base.join(format!(
+                "bitefoundry-obsidian-update-{pid}-{}",
+                crate::hex_encode(nonce)
+            ));
+            let create_res = {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::DirBuilderExt;
+                    std::fs::DirBuilder::new().mode(0o700).create(&dir)
+                }
+                #[cfg(not(unix))]
+                {
+                    std::fs::create_dir(&dir)
+                }
+            };
+            match create_res {
+                Ok(()) => return Ok(Self(dir)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "failed to allocate unique temporary extraction directory",
+        ))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempExtractDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 fn extract_binary_from_asset(asset_name: &str, asset_bytes: &[u8]) -> Result<Vec<u8>> {
@@ -484,7 +532,7 @@ fn extract_binary_from_asset(asset_name: &str, asset_bytes: &[u8]) -> Result<Vec
         return Ok(asset_bytes.to_vec());
     }
 
-    let tmp = tempfile::tempdir()
+    let tmp = TempExtractDir::create()
         .context("Failed to create temporary directory for update extraction")?;
     let archive_path = tmp.path().join(asset_name);
     std::fs::write(&archive_path, asset_bytes).with_context(|| {
@@ -665,7 +713,7 @@ mod tests {
     #[test]
     fn test_sha256_verification_success_and_mismatch() {
         let payload = b"obsidian-binary-content-v0.2.0";
-        let digest = hex::encode(Sha256::digest(payload));
+        let digest = crate::hex_encode(Sha256::digest(payload));
         let sums = format!("{digest}  bitefoundry-obsidian.exe\n0000000000000000000000000000000000000000000000000000000000000000  other.tar.gz\n");
         verify_sha256_sums(&sums, "bitefoundry-obsidian.exe", payload).unwrap();
 
@@ -814,7 +862,7 @@ mod tests {
             "bitefoundry-obsidian"
         }
         .to_string();
-        let digest = hex::encode(Sha256::digest(&new_binary));
+        let digest = crate::hex_encode(Sha256::digest(&new_binary));
         let sums_text = format!("{digest}  {asset_name}\n");
 
         let state = MockReleaseState {
@@ -1120,5 +1168,18 @@ mod tests {
             );
             assert_eq!(std::fs::read(&decoy).unwrap(), b"DO-NOT-TOUCH");
         }
+    }
+
+    #[test]
+    fn test_temp_extract_dir_creates_and_cleans_up() {
+        let dir_path = {
+            let tmp = TempExtractDir::create().unwrap();
+            assert!(tmp.path().is_dir());
+            let probe = tmp.path().join("probe.bin");
+            std::fs::write(&probe, b"payload").unwrap();
+            assert!(probe.is_file());
+            tmp.path().to_path_buf()
+        };
+        assert!(!dir_path.exists());
     }
 }

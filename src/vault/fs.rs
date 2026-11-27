@@ -143,7 +143,7 @@ pub fn content_sha256_bytes(bytes: &[u8]) -> [u8; 32] {
 
 /// Computes lowercase hex SHA-256 digest for content comparison.
 pub fn content_sha256_hex(bytes: &[u8]) -> String {
-    hex::encode(content_sha256_bytes(bytes))
+    crate::hex_encode(content_sha256_bytes(bytes))
 }
 
 /// Metadata of a discovered `.md` note on disk.
@@ -923,7 +923,8 @@ fn decode_markdown_link_path(path_raw: &str) -> Option<String> {
         }
         unescaped.push(ch);
     }
-    urlencoding::decode(&unescaped)
+    percent_encoding::percent_decode_str(&unescaped)
+        .decode_utf8()
         .ok()
         .map(std::borrow::Cow::into_owned)
 }

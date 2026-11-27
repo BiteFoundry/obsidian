@@ -257,7 +257,7 @@ pub async fn run_daemon_foreground(cfg: AppConfig, vault_override: Option<String
 
     let mut secret_bytes = [0u8; 24];
     rand::thread_rng().fill_bytes(&mut secret_bytes);
-    let secret = hex::encode(secret_bytes);
+    let secret = crate::hex_encode(secret_bytes);
     let started_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
