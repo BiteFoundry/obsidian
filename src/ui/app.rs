@@ -3045,8 +3045,10 @@ mod tests {
 
     fn make_harness(root: &std::path::Path, name: &str) -> (AppState, UiState) {
         let vault = vault_from_dir(root, Some(name));
-        let mut cfg = AppConfig::default();
-        cfg.load_failed = true; // prevent tests from touching real user config.toml
+        let cfg = AppConfig {
+            load_failed: true, // prevent tests from touching real user config.toml
+            ..AppConfig::default()
+        };
         let storage = Storage::open_in_memory().unwrap();
         storage.sync_vault(&vault).unwrap();
         let (focus_tx, _focus_rx) = watch::channel(FocusTarget::default());
@@ -3607,8 +3609,10 @@ mod tests {
 
         let v1 = vault_from_dir(&v1_dir, Some("V1"));
         let v2 = vault_from_dir(&v2_dir, Some("V2"));
-        let mut cfg = AppConfig::default();
-        cfg.load_failed = true;
+        let cfg = AppConfig {
+            load_failed: true,
+            ..AppConfig::default()
+        };
         let storage = Storage::open_in_memory().unwrap();
         let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
         let (sync_ctrl, diag) = crate::sync::spawn_vault_watcher_with_options(

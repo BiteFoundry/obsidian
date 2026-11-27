@@ -18,7 +18,6 @@ pub mod inline_editor;
 pub mod inspector;
 pub mod keymap;
 pub mod note_view;
-pub mod notification;
 pub mod overlays;
 pub mod sidebar;
 pub mod theme;

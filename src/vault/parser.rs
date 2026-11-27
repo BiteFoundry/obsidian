@@ -662,7 +662,10 @@ fn parse_body_events(
                     continue;
                 }
                 Event::End(TagEnd::CodeBlock) => {
-                    let (language, is_indented, line_no, mut code) = active_code.take().unwrap();
+                    let Some((language, is_indented, line_no, mut code)) = active_code.take()
+                    else {
+                        continue;
+                    };
                     if code.ends_with('\n') {
                         code.pop();
                     }
@@ -757,8 +760,9 @@ fn parse_body_events(
                     continue;
                 }
                 Event::End(TagEnd::HtmlBlock) => {
-                    let (line_no, raw_html) = active_html.take().unwrap();
-                    push_html_embed_block(raw_html, line_no, &mut containers, plain_parts);
+                    if let Some((line_no, raw_html)) = active_html.take() {
+                        push_html_embed_block(raw_html, line_no, &mut containers, plain_parts);
+                    }
                     continue;
                 }
                 _ => continue,
@@ -1079,8 +1083,7 @@ fn parse_body_events(
                                 &mut containers,
                                 plain_parts,
                             );
-                        } else if !line_has_other && embed_cand.is_some() {
-                            let embed = embed_cand.unwrap();
+                        } else if let Some(embed) = embed_cand.filter(|_| !line_has_other) {
                             let embed_block = build_standalone_embed_block(embed);
                             if let Some(eb) = embed_block {
                                 // Emit any preceding paragraph lines before this standalone embed line.
@@ -1378,13 +1381,11 @@ fn parse_body_events(
                     img.alt_buf.push(' ');
                 } else if let Some(link) = active_link.as_mut() {
                     link.label_buf.push(' ');
-                } else if active_para.is_some()
-                    && !para_line_has_other
-                    && para_line_embed.is_some()
+                } else if let Some(embed) = para_line_embed
+                    .take_if(|_| active_para.is_some() && !para_line_has_other)
                 {
                     // Previous line inside this tight paragraph was a standalone embed (`![[...]]` / `![alt](img)`):
                     // flush any preceding text, emit the embed block, and start a fresh paragraph line.
-                    let embed = para_line_embed.take().unwrap();
                     if let Some(eb) = build_standalone_embed_block(embed) {
                         let prefix_spans = trim_trailing_space_spans(&cur_spans[..para_line_start_idx]);
                         if !prefix_spans.is_empty() {
@@ -2535,8 +2536,6 @@ pub(crate) fn find_matching_bracket(line: &str, open_bracket: usize) -> Option<u
 pub(crate) struct MarkdownLinkDest {
     pub dest_start: usize,
     pub dest_end: usize,
-    #[allow(dead_code)]
-    pub title: Option<String>,
     pub angle_bracketed: bool,
     pub close_end: usize,
 }
@@ -2615,7 +2614,6 @@ pub(crate) fn parse_inline_markdown_link_dest(
         return Some(MarkdownLinkDest {
             dest_start,
             dest_end,
-            title: None,
             angle_bracketed,
             close_end: j + 1,
         });
@@ -2629,10 +2627,8 @@ pub(crate) fn parse_inline_markdown_link_dest(
             _ => unreachable!(),
         };
         let is_paren_title = bytes[j] == b'(';
-        let title_start = j + 1;
         j += 1;
         let mut closed = false;
-        let mut title_end = title_start;
         while j < len {
             if bytes[j] == b'\\' && j + 1 < len {
                 j += 2;
@@ -2642,7 +2638,6 @@ pub(crate) fn parse_inline_markdown_link_dest(
                 return None;
             }
             if bytes[j] == close_delim {
-                title_end = j;
                 j += 1;
                 closed = true;
                 break;
@@ -2659,7 +2654,6 @@ pub(crate) fn parse_inline_markdown_link_dest(
             return Some(MarkdownLinkDest {
                 dest_start,
                 dest_end,
-                title: Some(line[title_start..title_end].to_string()),
                 angle_bracketed,
                 close_end: j + 1,
             });

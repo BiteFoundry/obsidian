@@ -2247,17 +2247,6 @@ pub fn daily_note_settings(vault: &VaultProfile) -> (String, String) {
     (folder, format)
 }
 
-/// Converts Obsidian Moment.js date format (e.g. `YYYY-MM-DD`) to `chrono` strftime format.
-///
-/// Handles only `YYYY`, `YY`, `MM` and `DD`, and mangles formats such as `MMM`.
-#[deprecated(note = "use format_moment_date, which understands the Moment tokens Obsidian uses")]
-pub fn obsidian_date_format_to_chrono(fmt: &str) -> String {
-    fmt.replace("YYYY", "%Y")
-        .replace("YY", "%y")
-        .replace("MM", "%m")
-        .replace("DD", "%d")
-}
-
 const MOMENT_MONTHS: [&str; 12] = [
     "January",
     "February",

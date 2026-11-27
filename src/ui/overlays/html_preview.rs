@@ -305,6 +305,9 @@ pub fn html_theme_from_ui(theme: &Theme) -> HtmlTheme {
     }
 }
 
+type GraphicCacheKey = (usize, u16, TerminalImageProtocol);
+type GraphicCacheEntry = (Arc<[u8]>, RenderedTerminalImage);
+
 /// Interactive modal HTML preview overlay backed by `bitefoundry_html::HtmlViewSession`.
 pub struct HtmlPreviewOverlay {
     pub session: Box<HtmlViewSession>,
@@ -317,7 +320,7 @@ pub struct HtmlPreviewOverlay {
     pub last_visible_lines: usize,
     pending_scroll_to_focus: bool,
     /// Rendered inline graphics keyed by `(node_id, width, protocol)` (cleared on `Drop`).
-    graphic_cache: HashMap<(usize, u16, TerminalImageProtocol), (Arc<[u8]>, RenderedTerminalImage)>,
+    graphic_cache: HashMap<GraphicCacheKey, GraphicCacheEntry>,
     graphic_cache_cell_px: (u16, u16),
     graphic_cache_bg: (u8, u8, u8),
 }

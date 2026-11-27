@@ -18,6 +18,7 @@ use ratatui::{
 
 use crate::config::ImageProtocolPreference;
 
+// `TEAMS_*` env vars are retained as tested backwards-compatible fallbacks behind `OBSIDIAN_*`.
 const ENV_PROTOCOL_KEYS: &[&str] = &["OBSIDIAN_IMAGE_PROTOCOL", "TEAMS_IMAGE_PROTOCOL"];
 const ENV_CELL_PX_KEYS: &[&str] = &["OBSIDIAN_CELL_PIXEL_SIZE", "TEAMS_CELL_PIXEL_SIZE"];
 
@@ -589,7 +590,7 @@ pub fn refresh_cell_pixel_size(caps: &mut TerminalGraphicsCaps) -> bool {
         let reply = write_and_read_terminal_probe("\x1b[16t\x1b[14t\x1b[c", PROBE_TIMEOUT);
         let term_size = crossterm::terminal::size().ok();
         apply_terminal_probe_reply(caps, &reply, true, false, term_size);
-        return (caps.cell_px, caps.cell_px_exact) != prev;
+        (caps.cell_px, caps.cell_px_exact) != prev
     }
 
     #[cfg(not(windows))]

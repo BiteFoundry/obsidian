@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Sync the version from Cargo.toml to the root and platform package.json files.
+// Sync the version from Cargo.toml to package.json files and docs/openapi.yaml.
 //
 // Usage:
 //   node scripts/sync-version.mjs           # update files in place
@@ -87,6 +87,31 @@ function main() {
       console.log(
         `[sync-version] ${path.relative(ROOT, file)}: ${previous ?? '(none)'} -> ${version}`,
       );
+      changed += 1;
+    }
+  }
+
+  const openApiFile = path.join(ROOT, 'docs', 'openapi.yaml');
+  if (fs.existsSync(openApiFile)) {
+    const current = fs.readFileSync(openApiFile, 'utf8');
+    const pattern = /^(info:\r?\n(?:[ \t]+[^\r\n]+\r?\n)*?[ \t]+version:\s*")([^"]+)(")/m;
+    const match = current.match(pattern);
+    if (!match) {
+      throw new Error(`could not find info.version in ${openApiFile}`);
+    }
+    const previous = match[2];
+    const next = current.replace(pattern, `$1${version}$3`);
+
+    if (previous !== version) stale += 1;
+
+    if (CHECK) {
+      if (current !== next) {
+        console.error(`[sync-version] out of date: ${path.relative(ROOT, openApiFile)}`);
+        changed += 1;
+      }
+    } else if (current !== next) {
+      fs.writeFileSync(openApiFile, next);
+      console.log(`[sync-version] ${path.relative(ROOT, openApiFile)}: ${previous} -> ${version}`);
       changed += 1;
     }
   }

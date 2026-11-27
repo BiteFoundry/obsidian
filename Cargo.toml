@@ -22,25 +22,22 @@ base64 = "0.22"
 bitefoundry-html = { git = "https://github.com/BiteFoundry/bitefoundry-html", rev = "4d9f94b14c8a8b9a8775b630af4510483e0efe45" }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 clap = { version = "4", features = ["derive"] }
-crossterm = { version = "0.28", features = ["event-stream"] }
+crossterm = "0.28"
 dirs = "5"
-futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 hex = "0.4"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 notify = "8"
-notify-rust = "4"
 open = "5"
 rand = "0.8"
 ratatui = "0.28"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "http2", "gzip"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2", "gzip"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml_ng = "0.10"
 sha2 = "0.10"
 tempfile = "3"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 toml = "0.8"
 tower-http = { version = "0.6", features = ["cors"] }
 tree-sitter = "0.26"
@@ -48,7 +45,6 @@ tree-sitter-yaml = "0.7.2"
 unicode-width = "0.2"
 url = "2"
 urlencoding = "2"
-uuid = { version = "1", features = ["v4"] }
 
 [profile.release]
 lto = "fat"

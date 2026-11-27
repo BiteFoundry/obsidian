@@ -293,6 +293,8 @@ fn parse_pixel_key(key: &str) -> (&str, Option<(u16, u16, u16, u16)>) {
     (key, None)
 }
 
+type TuiTerminal = Terminal<CrosstermBackend<BufWriter<Stdout>>>;
+
 struct TerminalGuard {
     keyboard_enhanced: bool,
     kitty_used: bool,
@@ -304,11 +306,7 @@ struct TerminalGuard {
 impl TerminalGuard {
     fn enter(
         image_protocol: ImageProtocolPreference,
-    ) -> Result<(
-        Self,
-        Terminal<CrosstermBackend<BufWriter<Stdout>>>,
-        TerminalGraphicsCaps,
-    )> {
+    ) -> Result<(Self, TuiTerminal, TerminalGraphicsCaps)> {
         #[cfg(windows)]
         let orig_conin_mode = win_console::snapshot_console_mode();
 
@@ -1205,8 +1203,10 @@ mod tests {
         std::fs::write(&img_path, png_buf.into_inner()).unwrap();
 
         let vault = vault_from_dir(tmp.path(), Some("ResizeVault"));
-        let mut cfg = AppConfig::default();
-        cfg.load_failed = true;
+        let cfg = AppConfig {
+            load_failed: true,
+            ..AppConfig::default()
+        };
         let storage = Storage::open_in_memory().unwrap();
         let (focus_tx, _focus_rx) = watch::channel(FocusTarget::default());
         let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel::<SyncCommand>();

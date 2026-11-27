@@ -684,31 +684,34 @@ impl McpServer {
                     obj.insert("outgoing_links".into(), outgoing);
                 }
                 "headings" => {
-                    obj.insert(
-                        "headings".into(),
-                        json!(detail.as_ref().unwrap().parsed.headings),
-                    );
+                    let d = detail.as_ref().ok_or_else(|| {
+                        anyhow!("Note detail unavailable for projected field 'headings'")
+                    })?;
+                    obj.insert("headings".into(), json!(d.parsed.headings));
                 }
                 "md_links" => {
-                    obj.insert(
-                        "md_links".into(),
-                        json!(detail.as_ref().unwrap().parsed.md_links),
-                    );
+                    let d = detail.as_ref().ok_or_else(|| {
+                        anyhow!("Note detail unavailable for projected field 'md_links'")
+                    })?;
+                    obj.insert("md_links".into(), json!(d.parsed.md_links));
                 }
                 "images" => {
-                    obj.insert("images".into(), json!(detail.as_ref().unwrap().images));
+                    let d = detail.as_ref().ok_or_else(|| {
+                        anyhow!("Note detail unavailable for projected field 'images'")
+                    })?;
+                    obj.insert("images".into(), json!(d.images));
                 }
                 "raw_markdown" => {
-                    obj.insert(
-                        "raw_markdown".into(),
-                        json!(detail.as_ref().unwrap().raw_markdown),
-                    );
+                    let d = detail.as_ref().ok_or_else(|| {
+                        anyhow!("Note detail unavailable for projected field 'raw_markdown'")
+                    })?;
+                    obj.insert("raw_markdown".into(), json!(d.raw_markdown));
                 }
                 "body" => {
-                    obj.insert(
-                        "body".into(),
-                        json!(detail.as_ref().unwrap().parsed.body_markdown),
-                    );
+                    let d = detail.as_ref().ok_or_else(|| {
+                        anyhow!("Note detail unavailable for projected field 'body'")
+                    })?;
+                    obj.insert("body".into(), json!(d.parsed.body_markdown));
                 }
                 other => {
                     if !missing_fields.iter().any(|m| m == other) {
