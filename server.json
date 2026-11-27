@@ -3,7 +3,7 @@
   "name": "io.github.BiteFoundry/obsidian",
   "title": "Obsidian Vault (TUI, CLI & MCP)",
   "description": "Local Obsidian vault MCP server, CLI, and TUI in Rust with Braille graph & safe edits.",
-  "version": "0.4.8",
+  "version": "0.4.9",
   "websiteUrl": "https://bitefoundry.dev/#app-obsidian",
   "repository": {
     "url": "https://github.com/BiteFoundry/obsidian",
@@ -12,7 +12,7 @@
   "packages": [
     {
       "registryType": "oci",
-      "identifier": "ghcr.io/bitefoundry/obsidian:0.4.8",
+      "identifier": "ghcr.io/bitefoundry/obsidian:0.4.9",
       "transport": {
         "type": "stdio"
       },
