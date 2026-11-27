@@ -6,6 +6,17 @@ description = "Obsidian-native terminal workspace, interactive knowledge graph &
 license = "MIT"
 repository = "https://github.com/BiteFoundry/obsidian"
 
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/bitefoundry-obsidian-{ version }-{ target }.{ archive-format }"
+pkg-fmt = "tgz"
+bin-dir = "bitefoundry-obsidian{ binary-ext }"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
+
+[package.metadata.binstall.overrides.aarch64-pc-windows-msvc]
+pkg-fmt = "zip"
+
 [lib]
 name = "obsidian_cli"
 path = "src/lib.rs"
