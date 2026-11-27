@@ -14,22 +14,27 @@ path = "src/lib.rs"
 name = "bitefoundry-obsidian"
 path = "src/main.rs"
 
+[features]
+default = ["html-js", "svg-graphics"]
+html-js = ["bitefoundry-html/js"]
+svg-graphics = ["bitefoundry-html/graphics"]
+
 [dependencies]
 anyhow = "1"
 arboard = { version = "3", features = ["image-data"] }
 axum = "0.8"
 base64 = "0.22"
-bitefoundry-html = { git = "https://github.com/BiteFoundry/bitefoundry-html", rev = "4d9f94b14c8a8b9a8775b630af4510483e0efe45" }
+bitefoundry-html = { git = "https://github.com/BiteFoundry/bitefoundry-html", rev = "72273560cd5b689e66d37c81fc957e422855842d", default-features = false, features = ["serve"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"
-dirs = "5"
+dirs = "6"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 notify = "8"
 open = "5"
 percent-encoding = "2"
 rand = "0.8"
-ratatui = "0.28"
+ratatui = "0.29"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2", "gzip"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

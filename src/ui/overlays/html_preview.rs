@@ -1046,6 +1046,7 @@ mod tests {
         vault::parser::parse_markdown,
     };
 
+    #[cfg(feature = "html-js")]
     fn render_overlay_text(
         overlay: &mut HtmlPreviewOverlay,
         ui: &mut UiState,
@@ -1077,6 +1078,7 @@ mod tests {
         (text, hitmap)
     }
 
+    #[cfg(feature = "html-js")]
     #[test]
     fn test_html_preview_button_onclick_click_at_raw_toggle_and_serve_action() {
         let html = r#"<!DOCTYPE html>
@@ -1246,6 +1248,7 @@ mod tests {
         assert_eq!(overlay.session.scroll_y, expected_max);
     }
 
+    #[cfg(all(feature = "html-js", feature = "svg-graphics"))]
     #[test]
     fn test_html_preview_inline_svg_renders_halfblocks_and_preserves_button_click_coords() {
         let html = r##"<!DOCTYPE html>

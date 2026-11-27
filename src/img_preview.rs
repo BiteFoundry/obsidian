@@ -1354,6 +1354,7 @@ fn reject_html_bytes(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "svg-graphics")]
 fn svg_raster_bounds(fit: FitBox, cell_px: (u16, u16)) -> (u32, u32) {
     let zoom = fit.zoom_pct.clamp(25, 300) as u32;
     let max_w = (fit.view_cols.max(4) as u32)
@@ -1369,6 +1370,21 @@ fn svg_raster_bounds(fit: FitBox, cell_px: (u16, u16)) -> (u32, u32) {
             / 100
     };
     (max_w.clamp(64, 2048), max_h.clamp(64, 2048))
+}
+
+#[cfg(feature = "svg-graphics")]
+fn rasterize_svg_png(bytes: &[u8], fit: FitBox, cell_px: (u16, u16)) -> Result<Arc<[u8]>> {
+    let (max_px_w, max_px_h) = svg_raster_bounds(fit, cell_px);
+    let raster = bitefoundry_html::graphics::rasterize_svg_to_png(bytes, max_px_w, max_px_h, None)
+        .context("Failed to rasterize SVG image")?;
+    Ok(raster.png_bytes)
+}
+
+#[cfg(not(feature = "svg-graphics"))]
+fn rasterize_svg_png(_bytes: &[u8], _fit: FitBox, _cell_px: (u16, u16)) -> Result<Arc<[u8]>> {
+    bail!(
+        "SVG image preview requires the `svg-graphics` feature (rebuild with `--features svg-graphics`)"
+    )
 }
 
 /// Returns true if a MIME type or filename looks like a supported image (`png`, `jpeg`, `jpg`, `gif`, `webp`, `bmp`, `svg`).
@@ -1443,16 +1459,12 @@ pub fn decode_and_render_halfblocks_with_cell_px(
 ) -> Result<RenderedTerminalImage> {
     reject_html_bytes(bytes)?;
     let svg_rasterized = if looks_like_svg_bytes(bytes) {
-        let (max_px_w, max_px_h) = svg_raster_bounds(fit, cell_px);
-        Some(
-            bitefoundry_html::graphics::rasterize_svg_to_png(bytes, max_px_w, max_px_h, None)
-                .context("Failed to rasterize SVG image")?,
-        )
+        Some(rasterize_svg_png(bytes, fit, cell_px)?)
     } else {
         None
     };
-    let (decode_bytes, format_label) = match svg_rasterized.as_ref() {
-        Some(raster) => (raster.png_bytes.as_ref(), "SVG".to_string()),
+    let (decode_bytes, format_label) = match svg_rasterized.as_deref() {
+        Some(png_bytes) => (png_bytes, "SVG".to_string()),
         None => {
             let guessed = image::guess_format(bytes).ok();
             (bytes, format_label_for(guessed))
@@ -1536,20 +1548,12 @@ pub fn decode_and_render_for_protocol(
     }
 
     let svg_rasterized = if looks_like_svg_bytes(bytes) {
-        let (max_px_w, max_px_h) = svg_raster_bounds(fit, caps.cell_px);
-        Some(
-            bitefoundry_html::graphics::rasterize_svg_to_png(bytes, max_px_w, max_px_h, None)
-                .context("Failed to rasterize SVG image")?,
-        )
+        Some(rasterize_svg_png(bytes, fit, caps.cell_px)?)
     } else {
         None
     };
-    let (decode_bytes, guessed, format_label) = match svg_rasterized.as_ref() {
-        Some(raster) => (
-            raster.png_bytes.as_ref(),
-            Some(ImageFormat::Png),
-            "SVG".to_string(),
-        ),
+    let (decode_bytes, guessed, format_label) = match svg_rasterized.as_deref() {
+        Some(png_bytes) => (png_bytes, Some(ImageFormat::Png), "SVG".to_string()),
         None => {
             let guessed = image::guess_format(bytes).ok();
             (bytes, guessed, format_label_for(guessed))
@@ -2356,18 +2360,11 @@ fn render_ansi_stdout_with_caps(
     reject_html_bytes(bytes)?;
     let fit = FitBox::fit_to_box(max_cols, max_rows);
     let svg_rasterized = if looks_like_svg_bytes(bytes) {
-        let (max_px_w, max_px_h) = svg_raster_bounds(fit, caps.cell_px);
-        Some(
-            bitefoundry_html::graphics::rasterize_svg_to_png(bytes, max_px_w, max_px_h, None)
-                .context("Failed to rasterize SVG image")?,
-        )
+        Some(rasterize_svg_png(bytes, fit, caps.cell_px)?)
     } else {
         None
     };
-    let decode_bytes = svg_rasterized
-        .as_ref()
-        .map(|r| r.png_bytes.as_ref())
-        .unwrap_or(bytes);
+    let decode_bytes = svg_rasterized.as_deref().unwrap_or(bytes);
     match caps.protocol {
         TerminalImageProtocol::ITerm2 => {
             let guessed = image::guess_format(decode_bytes).ok();
@@ -3158,9 +3155,22 @@ mod tests {
             "unexpected error: {html_hb_err}"
         );
 
-        let svg_hb = decode_and_render_halfblocks(svg, 20, 10, (0, 0, 0)).unwrap();
-        assert_eq!(svg_hb.format_label, "SVG");
-        assert!(!svg_hb.lines.is_empty());
+        #[cfg(feature = "svg-graphics")]
+        {
+            let svg_hb = decode_and_render_halfblocks(svg, 20, 10, (0, 0, 0)).unwrap();
+            assert_eq!(svg_hb.format_label, "SVG");
+            assert!(!svg_hb.lines.is_empty());
+        }
+        #[cfg(not(feature = "svg-graphics"))]
+        {
+            let svg_hb_err = decode_and_render_halfblocks(svg, 20, 10, (0, 0, 0))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                svg_hb_err.contains("svg-graphics"),
+                "unexpected error: {svg_hb_err}"
+            );
+        }
 
         let html_proto_err = decode_and_render_for_protocol(
             html,
@@ -3175,20 +3185,39 @@ mod tests {
             "unexpected error: {html_proto_err}"
         );
 
-        let svg_proto = decode_and_render_for_protocol(
-            svg,
-            FitBox::fit_to_box(20, 10),
-            (0, 0, 0),
-            sixel_caps,
-        )
-        .unwrap();
-        assert_eq!(svg_proto.format_label, "SVG");
-        assert!(svg_proto
-            .pixel_payload
-            .as_deref()
-            .is_some_and(|p| p.starts_with("\x1bP0;1;q")));
+        #[cfg(feature = "svg-graphics")]
+        {
+            let svg_proto = decode_and_render_for_protocol(
+                svg,
+                FitBox::fit_to_box(20, 10),
+                (0, 0, 0),
+                sixel_caps,
+            )
+            .unwrap();
+            assert_eq!(svg_proto.format_label, "SVG");
+            assert!(svg_proto
+                .pixel_payload
+                .as_deref()
+                .is_some_and(|p| p.starts_with("\x1bP0;1;q")));
+        }
+        #[cfg(not(feature = "svg-graphics"))]
+        {
+            let svg_proto_err = decode_and_render_for_protocol(
+                svg,
+                FitBox::fit_to_box(20, 10),
+                (0, 0, 0),
+                sixel_caps,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                svg_proto_err.contains("svg-graphics"),
+                "unexpected error: {svg_proto_err}"
+            );
+        }
     }
 
+    #[cfg(feature = "svg-graphics")]
     #[test]
     fn test_standalone_svg_native_halfblock_and_pixel_rendering() {
         let svg = br##"<svg width="80" height="40"><rect width="80" height="40" fill="#e11d48"/></svg>"##;

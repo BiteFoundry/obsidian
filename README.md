@@ -14,7 +14,7 @@
 
 <br />
 
-![Obsidian TUI Demo](https://raw.githubusercontent.com/BiteFoundry/obsidian/master/assets/demo.gif)
+![Obsidian TUI Demo](https://bitefoundry.dev/assets/demos/obsidian.gif)
 
 </div>
 
